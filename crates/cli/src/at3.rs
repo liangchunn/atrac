@@ -1,48 +1,15 @@
-use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
 
 use at3::encoder::stream::{Atrac3StreamConfig, Atrac3StreamEncoder, PCM_BLOCK_FRAMES};
-use clap::Parser;
 use hound::SampleFormat;
 
+use crate::args::EncodeArgs;
 use crate::output::create_pending_output;
 use crate::pcm::PcmWaveStream;
 
-#[derive(Parser, Debug)]
-#[command(name = "atrac at3", version, about = "ATRAC3 encoder")]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(clap::Subcommand, Debug)]
-enum Commands {
-    /// Encode 16-bit 44.1 kHz PCM WAV.
-    Encode {
-        /// Bitrate in kbps.
-        #[arg(short = 'b', long, default_value = "132")]
-        bitrate: u32,
-        /// Input WAV file (16-bit, 44.1 kHz, mono or stereo).
-        input: String,
-        /// Output ATRAC3 WAV file.
-        output: String,
-    },
-}
-
-pub fn run_args(args: &[OsString]) -> anyhow::Result<()> {
-    let cli = Cli::try_parse_from(args)?;
-    match cli.command {
-        Some(Commands::Encode {
-            bitrate,
-            input,
-            output,
-        }) => encode(bitrate, Path::new(&input), Path::new(&output)),
-        None => {
-            println!("atrac3: classic ATRAC3 encoder. Use --help for commands.");
-            Ok(())
-        }
-    }
+pub fn run(args: EncodeArgs) -> anyhow::Result<()> {
+    encode(args.bitrate, &args.input, &args.output)
 }
 
 fn encode(bitrate: u32, input: &Path, output: &Path) -> anyhow::Result<()> {

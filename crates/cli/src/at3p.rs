@@ -1,17 +1,15 @@
-use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, IsTerminal, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use at3p::encoder::payload::{ComputedFileError, ComputedWriteError, EncodePhase, EncodeProgress};
 use at3p::encoder::profile::{EncodeProfile, profile_by_bitrate_and_channels};
 use at3p::encoder::stream::{Atrac3plusStreamEncoder, PCM_BLOCK_FRAMES};
 use at3p::riff::read::{RiffReadError, inspect_target_pcm_wave_for_channels, inspect_wave_format};
 
+use crate::args::EncodeArgs;
 use crate::output::create_pending_output;
 use crate::pcm::PcmWaveStream;
-
-const USAGE: &str = "usage: atrac at3p encode -b <kbps> <input.wav> <output.wav>";
 
 /// The nine native ATRAC3plus stereo 44.1 kHz bitrates (gAtracCodecParam stereo
 /// rows 10-18). All nine encode end-to-end via the computed pipeline.
@@ -24,17 +22,6 @@ const SUPPORTED_BITRATES_KBPS: [u32; 9] = [48, 64, 96, 128, 160, 192, 256, 320, 
 /// end-to-end through the computed pipeline and writes output. 32 kbps is also
 /// landed (docs/14 §5.1), closing all five native mono rows.
 const SUPPORTED_MONO_BITRATES_KBPS: [u32; 5] = [32, 48, 64, 96, 128];
-
-/// A parsed CLI invocation, BEFORE channel-aware profile resolution. The bitrate
-/// is validated numerically; the profile is resolved in [`run`] once the input's
-/// channel count is known (native at3tool matches `getAtracEncodeSetting` on
-/// `(bitrate, channels, sample_rate)`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EncodeCommand {
-    bitrate: u32,
-    input: PathBuf,
-    output: PathBuf,
-}
 
 /// Interactive CLI renderer for the library's exact native-schedule progress.
 /// Redirected stderr stays clean; callers embedding the library receive every
@@ -83,9 +70,7 @@ impl CliProgress {
     }
 }
 
-pub fn run_args(args: &[OsString]) -> Result<(), String> {
-    let command = parse_args(&args)?;
-
+pub fn run(command: EncodeArgs) -> Result<(), String> {
     // Preserve the native-style validation precedence: permissive format/channel
     // peek, profile resolution, then strict channel-aware PCM validation.
     let mut input = File::open(&command.input).map_err(|err| {
@@ -120,44 +105,6 @@ pub fn run_args(args: &[OsString]) -> Result<(), String> {
     pcm.validate_strict_info(&info)
         .map_err(|error| format!("unsupported input WAV: {error}"))?;
     encode_computed(&profile, pcm, &command.output)
-}
-
-fn parse_args(args: &[OsString]) -> Result<EncodeCommand, String> {
-    if args.len() < 2 {
-        return Err(USAGE.to_owned());
-    }
-
-    if args[1].as_os_str() != OsStr::new("encode") {
-        return Err(format!(
-            "unsupported mode `{}`; only `encode` is supported\n{USAGE}",
-            display_arg(&args[1])
-        ));
-    }
-
-    if args.len() != 6 {
-        return Err(format!("malformed encode command\n{USAGE}"));
-    }
-
-    if args[2].as_os_str() != OsStr::new("-b") && args[2].as_os_str() != OsStr::new("--bitrate") {
-        return Err(format!(
-            "unsupported encode options; expected `-b <kbps>`\n{USAGE}"
-        ));
-    }
-
-    let bitrate_text = args[3]
-        .to_str()
-        .ok_or_else(|| format!("invalid bitrate: expected UTF-8 numeric kbps value\n{USAGE}"))?;
-    let bitrate = bitrate_text.parse::<u32>().map_err(|_| {
-        format!("invalid bitrate `{bitrate_text}`: expected numeric kbps value\n{USAGE}")
-    })?;
-
-    // Bitrate is validated numerically here; the channel-aware profile match
-    // happens in `run` once the input's channel count is known.
-    Ok(EncodeCommand {
-        bitrate,
-        input: PathBuf::from(&args[4]),
-        output: PathBuf::from(&args[5]),
-    })
 }
 
 /// Classify a `(bitrate, channels)` pair with no gAtracCodecParam ATRAC3plus row
@@ -399,8 +346,4 @@ fn fourcc_text(id: &[u8; 4]) -> String {
             }
         })
         .collect()
-}
-
-fn display_arg(arg: &OsString) -> String {
-    arg.to_string_lossy().into_owned()
 }
