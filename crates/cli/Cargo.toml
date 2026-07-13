@@ -1,0 +1,26 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+bit-perfect = ["at3/bit-perfect"]
+mdct-disasm = ["at3/mdct-disasm"]
+
+[[bin]]
+name = "atrac"
+path = "src/main.rs"
+
+[dependencies]
+at3 = { path = "../at3" }
+at3p = { path = "../at3p" }
+anyhow.workspace = true
+clap.workspace = true
+hound.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
