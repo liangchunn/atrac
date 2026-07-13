@@ -1,22 +1,17 @@
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, IsTerminal, Write};
+use std::fs::File;
+use std::io::{self, IsTerminal, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use at3p::encoder::payload::{
-    ComputedFileError, ComputedWriteError, EncodePhase, EncodeProgress,
-    write_computed_atracx_file_for_mono_profile_with_progress,
-    write_computed_atracx_file_for_profile_with_progress,
-};
+use at3p::encoder::payload::{ComputedFileError, ComputedWriteError, EncodePhase, EncodeProgress};
 use at3p::encoder::profile::{EncodeProfile, profile_by_bitrate_and_channels};
-use at3p::riff::read::{
-    PcmChannels, RiffReadError, load_target_pcm_wave_for_channels, parse_wave_format,
-};
+use at3p::encoder::stream::{Atrac3plusStreamEncoder, PCM_BLOCK_FRAMES};
+use at3p::riff::read::{RiffReadError, inspect_target_pcm_wave_for_channels, inspect_wave_format};
+
+use crate::output::create_pending_output;
+use crate::pcm::PcmWaveStream;
 
 const USAGE: &str = "usage: atrac at3p encode -b <kbps> <input.wav> <output.wav>";
-const TEMP_CREATE_ATTEMPTS: u64 = 128;
-static TEMP_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The nine native ATRAC3plus stereo 44.1 kHz bitrates (gAtracCodecParam stereo
 /// rows 10-18). All nine encode end-to-end via the computed pipeline.
@@ -91,16 +86,15 @@ impl CliProgress {
 pub fn run_args(args: &[OsString]) -> Result<(), String> {
     let command = parse_args(&args)?;
 
-    // Read the input once and peek its channel count WITHOUT the strict
-    // stereo-only gates, then resolve the profile by (bitrate, channels) —
-    // mirroring the native at3tool `getAtracEncodeSetting` match (docs/14 §0.1).
-    let input = fs::read(&command.input).map_err(|err| {
+    // Preserve the native-style validation precedence: permissive format/channel
+    // peek, profile resolution, then strict channel-aware PCM validation.
+    let mut input = File::open(&command.input).map_err(|err| {
         format!(
             "failed to read input WAV `{}`: {err}",
             command.input.display()
         )
     })?;
-    let format = parse_wave_format(&input)
+    let format = inspect_wave_format(&mut input)
         .map_err(|err| format!("unsupported input WAV: {}", describe_riff_error(&err)))?;
     let channels = match format.channels {
         1 | 2 => format.channels,
@@ -113,10 +107,18 @@ pub fn run_args(args: &[OsString]) -> Result<(), String> {
     };
     let profile = profile_by_bitrate_and_channels(command.bitrate, channels)
         .ok_or_else(|| classify_rejected_bitrate(command.bitrate, channels))?;
-
-    let pcm = load_target_pcm_wave_for_channels(&input, channels)
+    let info = inspect_target_pcm_wave_for_channels(&mut input, channels)
         .map_err(|err| format!("unsupported input WAV: {}", describe_riff_error(&err)))?;
-    drop(input);
+    input.seek(SeekFrom::Start(0)).map_err(|error| {
+        format!(
+            "failed to rewind input WAV `{}`: {error}",
+            command.input.display()
+        )
+    })?;
+    let pcm = PcmWaveStream::from_file(input)
+        .map_err(|error| format!("unsupported input WAV: {error}"))?;
+    pcm.validate_strict_info(&info)
+        .map_err(|error| format!("unsupported input WAV: {error}"))?;
     encode_computed(&profile, pcm, &command.output)
 }
 
@@ -233,37 +235,48 @@ fn mono_bitrates_list() -> String {
         .join(", ")
 }
 
-fn encode_computed(profile: &EncodeProfile, pcm: PcmChannels, output: &Path) -> Result<(), String> {
-    // The raw WAV has already been released, but the strict decoder's one
-    // complete channel-aware i16 carrier remains retained. Streaming input is
-    // a separate RIFF-reader boundary; docs/16 S5 removes compressed-output
-    // buffering without claiming bounded input memory.
-    let (mut file, pending) = create_pending_output(output)?;
+fn encode_computed(
+    profile: &EncodeProfile,
+    mut pcm: PcmWaveStream,
+    output: &Path,
+) -> Result<(), String> {
+    let input_sample_frames = pcm.metadata().sample_frames;
+    let (file, pending) = create_pending_output(output, "at3p")?;
     let mut progress = CliProgress::new();
-    let result = match profile.channels {
-        1 => write_computed_atracx_file_for_mono_profile_with_progress(
-            &mut file,
-            profile,
-            pcm.info.sample_frames,
-            pcm.channels(),
-            |update| progress.update(update),
-        ),
-        2 => write_computed_atracx_file_for_profile_with_progress(
-            &mut file,
-            profile,
-            pcm.info.sample_frames,
-            pcm.channel(0).expect("strict stereo decode has channel 0"),
-            pcm.channel(1).expect("strict stereo decode has channel 1"),
-            |update| progress.update(update),
-        ),
-        channels => unreachable!("validated ATRAC3plus profile has {channels} channels"),
-    };
-    progress.finish();
-    if let Err(error) = result {
-        drop(file);
-        return Err(describe_computed_write_error(output, &error));
+    let mut encoder = Atrac3plusStreamEncoder::new(file, profile, input_sample_frames)
+        .map_err(|error| describe_computed_write_error(output, &error))?;
+    let mut blocks: Vec<Vec<i16>> = (0..profile.channels)
+        .map(|_| Vec::with_capacity(PCM_BLOCK_FRAMES))
+        .collect();
+    loop {
+        let frames = match pcm.read_block(&mut blocks, PCM_BLOCK_FRAMES) {
+            Ok(frames) => frames,
+            Err(error) => {
+                progress.finish();
+                return Err(format!("failed to read input WAV: {error}"));
+            }
+        };
+        if frames == 0 {
+            break;
+        }
+        let result = match profile.channels {
+            1 => encoder.push_pcm(&[blocks[0].as_slice()]),
+            2 => encoder.push_pcm(&[blocks[0].as_slice(), blocks[1].as_slice()]),
+            channels => unreachable!("validated ATRAC3plus profile has {channels} channels"),
+        };
+        match result {
+            Ok(update) => progress.update(update),
+            Err(error) => {
+                progress.finish();
+                return Err(describe_computed_write_error(output, &error));
+            }
+        }
     }
-
+    drop(pcm);
+    let (mut file, _) = encoder
+        .finish_with_progress(|update| progress.update(update))
+        .map_err(|error| describe_computed_write_error(output, &error))?;
+    progress.finish();
     if let Err(error) = file.flush() {
         drop(file);
         return Err(format!(
@@ -279,63 +292,6 @@ fn encode_computed(profile: &EncodeProfile, pcm: PcmChannels, output: &Path) -> 
             output.display()
         )
     })
-}
-
-struct PendingOutput {
-    path: PathBuf,
-    committed: bool,
-}
-
-impl PendingOutput {
-    fn commit(mut self, output: &Path) -> io::Result<()> {
-        fs::rename(&self.path, output)?;
-        self.committed = true;
-        Ok(())
-    }
-}
-
-impl Drop for PendingOutput {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn create_pending_output(output: &Path) -> Result<(File, PendingOutput), String> {
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    let output_name = output.file_name().unwrap_or_else(|| OsStr::new("output"));
-
-    for _ in 0..TEMP_CREATE_ATTEMPTS {
-        let sequence = TEMP_OUTPUT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut temp_name = OsString::from(".");
-        temp_name.push(output_name);
-        temp_name.push(format!(".at3p-{}-{sequence}.tmp", std::process::id()));
-        let path = parent.join(temp_name);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => {
-                return Ok((
-                    file,
-                    PendingOutput {
-                        path,
-                        committed: false,
-                    },
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "failed to create temporary output beside `{}`: {error}",
-                    output.display()
-                ));
-            }
-        }
-    }
-
-    Err(format!(
-        "failed to create a unique temporary output beside `{}` after {TEMP_CREATE_ATTEMPTS} attempts",
-        output.display()
-    ))
 }
 
 fn describe_computed_write_error(output: &Path, error: &ComputedWriteError) -> String {
@@ -386,6 +342,7 @@ fn describe_computed_file_error(error: &ComputedFileError) -> String {
 
 fn describe_riff_error(error: &RiffReadError) -> String {
     match error {
+        RiffReadError::Io(kind) => format!("I/O error while reading WAV header: {kind:?}"),
         RiffReadError::TooShort => "file is too short to contain a RIFF/WAVE header".to_owned(),
         RiffReadError::InvalidRiffId(id) => {
             format!("expected RIFF chunk id, found `{}`", fourcc_text(id))

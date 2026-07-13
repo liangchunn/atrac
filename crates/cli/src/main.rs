@@ -1,5 +1,7 @@
 mod at3;
 mod at3p;
+mod output;
+mod pcm;
 
 use std::ffi::{OsStr, OsString};
 use std::process::ExitCode;

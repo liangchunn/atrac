@@ -12,3 +12,4 @@ pub mod packer_bridge;
 pub mod payload;
 pub mod profile;
 pub mod state;
+pub mod stream;

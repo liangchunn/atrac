@@ -279,6 +279,26 @@ pub enum ComputedFileError {
         channel_count: usize,
         channel_len: usize,
     },
+    UnexpectedInputChannelCount {
+        expected: usize,
+        actual: usize,
+    },
+    UnexpectedInputChunkFrames {
+        core_call_index: u32,
+        expected: usize,
+        actual: usize,
+    },
+    MismatchedInputChunkFrames {
+        core_call_index: u32,
+        channel: usize,
+        expected: usize,
+        actual: usize,
+    },
+    StreamInputAlreadyComplete,
+    IncompleteStreamInput {
+        expected_sample_frames: u32,
+        actual_sample_frames: u32,
+    },
     Header(RiffWriteError),
     Payload(ComputedPayloadError),
     FinalFileLength {
@@ -854,33 +874,21 @@ where
     let schedule = ComputedSchedule352::new(input_sample_frames)
         .map_err(ComputedFileError::from)
         .map_err(ComputedWriteError::from)?;
-    let (header, params) = if profile.bitrate_kbps == 352 {
-        (
-            write_atracx_header(input_sample_frames, schedule.total_output_frames())
-                .map_err(ComputedFileError::from)?,
-            CodingParams::for_profile(&crate::encoder::profile::ATRAC3PLUS_352),
-        )
-    } else {
-        (
-            write_atracx_header_for_rate(
-                input_sample_frames,
-                schedule.total_output_frames(),
-                profile.frame_bytes as u16,
-                profile.codec_info,
-            )
-            .map_err(ComputedFileError::from)?,
-            CodingParams::for_profile(profile),
-        )
-    };
-
-    write_computed_pcm_channels_with_progress(
-        writer,
-        &schedule,
-        &[left, right],
-        params,
-        header,
-        on_progress,
-    )
+    let mut stream =
+        super::stream::Atrac3plusStreamEncoder::new(writer, profile, input_sample_frames)?;
+    let mut on_progress = on_progress;
+    for core_call_index in 0..schedule.encode_calls() {
+        let offset = core_call_index as usize * super::frontend::FRONTEND_FRAME_SAMPLES;
+        let frames = schedule.expected_encode_sample_frames(core_call_index) as usize;
+        stream.push_pcm_with_progress(
+            &[
+                &left[offset..offset + frames],
+                &right[offset..offset + frames],
+            ],
+            &mut on_progress,
+        )?;
+    }
+    stream.finish_with_progress(on_progress).map(|_| ())
 }
 
 /// Mono entry point (docs/14 §0.1, §0.4, §1.3, §2.1) — the channel-aware sibling of
@@ -1019,23 +1027,16 @@ where
     let schedule = ComputedSchedule352::new(input_sample_frames)
         .map_err(ComputedFileError::from)
         .map_err(ComputedWriteError::from)?;
-    let header = write_atracx_header_for_rate_channels(
-        1,
-        input_sample_frames,
-        schedule.total_output_frames(),
-        profile.frame_bytes as u16,
-        profile.codec_info,
-    )
-    .map_err(ComputedFileError::from)?;
-
-    write_computed_pcm_channels_with_progress(
-        writer,
-        &schedule,
-        &[channels[0].as_slice()],
-        CodingParams::for_profile(profile),
-        header,
-        on_progress,
-    )
+    let mut stream =
+        super::stream::Atrac3plusStreamEncoder::new(writer, profile, input_sample_frames)?;
+    let mut on_progress = on_progress;
+    for core_call_index in 0..schedule.encode_calls() {
+        let offset = core_call_index as usize * super::frontend::FRONTEND_FRAME_SAMPLES;
+        let frames = schedule.expected_encode_sample_frames(core_call_index) as usize;
+        stream
+            .push_pcm_with_progress(&[&channels[0][offset..offset + frames]], &mut on_progress)?;
+    }
+    stream.finish_with_progress(on_progress).map(|_| ())
 }
 
 /// Assemble the full MONO ATRACX file for a LANDED mono rate (128 kbps docs/14
@@ -1177,128 +1178,7 @@ where
     Ok(bytes)
 }
 
-/// S4 streaming driver: the schedule fixes the header and final byte count up
-/// front, so the sink needs only `Write`, never `Seek`. The only length-scaled
-/// owner is the caller's decoded PCM; this function owns one prepared PCM frame
-/// and at most one encoded output frame at a time.
-fn write_computed_pcm_channels_with_progress<W, F>(
-    writer: &mut W,
-    schedule: &ComputedSchedule352,
-    channels: &[&[i16]],
-    params: CodingParams,
-    header: Vec<u8>,
-    mut on_progress: F,
-) -> Result<(), ComputedWriteError>
-where
-    W: Write,
-    F: FnMut(EncodeProgress),
-{
-    let frame_bytes = params.frame_bytes as usize;
-    let total_output_frames = schedule.total_output_frames() as usize;
-    let total_steps = schedule.encode_calls() + schedule.flush_wrapper_calls();
-    let expected_payload_bytes = total_output_frames * frame_bytes;
-    let expected_file_bytes = ATRACX_HEADER_LEN as usize + expected_payload_bytes;
-    let mut scheduler =
-        IncrementalComputedFlushScheduler::new(schedule.input_sample_frames(), params)
-            .map_err(ComputedPayloadError::from)
-            .map_err(ComputedFileError::from)?;
-    let mut next_output_frame_index = 0u32;
-    let mut written_payload_bytes = 0usize;
-
-    writer
-        .write_all(&header)
-        .map_err(|source| ComputedWriteError::Io {
-            stage: ComputedWriteStage::Header,
-            source,
-        })?;
-
-    for core_call_index in 0..schedule.encode_calls() {
-        let valid_sample_frames = schedule.expected_encode_sample_frames(core_call_index);
-        let source_offset = core_call_index as usize * super::frontend::FRONTEND_FRAME_SAMPLES;
-        let frame =
-            prepare_current_pcm_frame(channels, source_offset, valid_sample_frames as usize)
-                .map_err(ComputedPayloadError::from)
-                .map_err(ComputedFileError::from)?;
-        let result = scheduler
-            .encode_chunk(valid_sample_frames, &frame)
-            .map_err(ComputedPayloadError::from)
-            .map_err(ComputedFileError::from)?;
-        write_computed_output_frame(
-            writer,
-            &mut next_output_frame_index,
-            &mut written_payload_bytes,
-            result,
-            frame_bytes,
-        )?;
-        on_progress(EncodeProgress {
-            phase: EncodePhase::Encoding,
-            completed_steps: core_call_index + 1,
-            total_steps,
-            completed_output_frames: next_output_frame_index,
-            total_output_frames: schedule.total_output_frames(),
-        });
-    }
-
-    for flush_call_index in 0..schedule.flush_wrapper_calls() {
-        let result = scheduler
-            .flush()
-            .map_err(ComputedPayloadError::from)
-            .map_err(ComputedFileError::from)?;
-        write_computed_output_frame(
-            writer,
-            &mut next_output_frame_index,
-            &mut written_payload_bytes,
-            result,
-            frame_bytes,
-        )?;
-        on_progress(EncodeProgress {
-            phase: EncodePhase::Flushing,
-            completed_steps: schedule.encode_calls() + flush_call_index + 1,
-            total_steps,
-            completed_output_frames: next_output_frame_index,
-            total_output_frames: schedule.total_output_frames(),
-        });
-    }
-
-    if next_output_frame_index as usize != total_output_frames {
-        return Err(
-            ComputedFileError::Payload(ComputedPayloadError::IncompleteOutputFrames {
-                expected: total_output_frames,
-                actual: next_output_frame_index as usize,
-            })
-            .into(),
-        );
-    }
-    if !scheduler.is_done() {
-        return Err(
-            ComputedFileError::Payload(ComputedPayloadError::SchedulerNotDone {
-                flush_calls: scheduler.flush_calls(),
-            })
-            .into(),
-        );
-    }
-    if written_payload_bytes != expected_payload_bytes {
-        return Err(
-            ComputedFileError::Payload(ComputedPayloadError::FinalPayloadLength {
-                expected: expected_payload_bytes,
-                actual: written_payload_bytes,
-            })
-            .into(),
-        );
-    }
-    let actual_file_bytes = header.len() + written_payload_bytes;
-    if actual_file_bytes != expected_file_bytes {
-        return Err(ComputedFileError::FinalFileLength {
-            expected: expected_file_bytes,
-            actual: actual_file_bytes,
-        }
-        .into());
-    }
-
-    Ok(())
-}
-
-fn write_computed_output_frame<W>(
+pub(crate) fn write_computed_output_frame<W>(
     writer: &mut W,
     next_output_frame_index: &mut u32,
     written_payload_bytes: &mut usize,

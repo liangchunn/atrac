@@ -73,6 +73,7 @@ impl PcmChannels {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RiffReadError {
+    Io(io::ErrorKind),
     TooShort,
     InvalidRiffId([u8; 4]),
     InvalidWaveForm([u8; 4]),
@@ -89,6 +90,169 @@ pub enum RiffReadError {
     UnsupportedBitsPerSample(u16),
     DataSizeNotAligned { data_size: u32, block_align: u16 },
     SampleDataTooLarge(u32),
+}
+
+impl From<io::Error> for RiffReadError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value.kind())
+    }
+}
+
+/// Seek-based counterpart to [`walk_wave_chunks`]. Only RIFF headers and the
+/// fixed-width `fmt ` prefix are read; chunk payloads (including `data`) are
+/// skipped with `Seek`, so memory use is independent of the WAV length.
+pub fn inspect_wave_chunks<R: Read + Seek>(
+    reader: &mut R,
+) -> Result<RiffWaveChunks, RiffReadError> {
+    let file_len_u64 = reader.seek(SeekFrom::End(0))?;
+    let file_len =
+        usize::try_from(file_len_u64).map_err(|_| RiffReadError::ChunkOffsetOverflow {
+            offset: usize::MAX,
+            size: u32::MAX,
+        })?;
+    if file_len < 12 {
+        return Err(RiffReadError::TooShort);
+    }
+
+    reader.seek(SeekFrom::Start(0))?;
+    let mut riff_header = [0u8; 12];
+    reader.read_exact(&mut riff_header)?;
+    let riff_id: [u8; 4] = riff_header[0..4].try_into().unwrap();
+    if &riff_id != b"RIFF" {
+        return Err(RiffReadError::InvalidRiffId(riff_id));
+    }
+    let form: [u8; 4] = riff_header[8..12].try_into().unwrap();
+    if &form != b"WAVE" {
+        return Err(RiffReadError::InvalidWaveForm(form));
+    }
+    let riff_size = u32::from_le_bytes(riff_header[4..8].try_into().unwrap());
+
+    let mut chunks = Vec::new();
+    let mut fmt = None;
+    let mut data = None;
+    let mut offset = 12usize;
+    while offset < file_len {
+        if file_len - offset < 8 {
+            return Err(RiffReadError::TruncatedChunkHeader { offset });
+        }
+
+        reader.seek(SeekFrom::Start(offset as u64))?;
+        let mut chunk_header = [0u8; 8];
+        reader.read_exact(&mut chunk_header)?;
+        let id: [u8; 4] = chunk_header[0..4].try_into().unwrap();
+        let size = u32::from_le_bytes(chunk_header[4..8].try_into().unwrap());
+        let payload_offset = offset
+            .checked_add(8)
+            .ok_or(RiffReadError::ChunkOffsetOverflow { offset, size })?;
+        let size_usize = usize::try_from(size)
+            .map_err(|_| RiffReadError::ChunkOffsetOverflow { offset, size })?;
+        let payload_end = payload_offset
+            .checked_add(size_usize)
+            .ok_or(RiffReadError::ChunkOffsetOverflow { offset, size })?;
+        if payload_end > file_len {
+            return Err(RiffReadError::TruncatedChunkPayload { offset, size });
+        }
+
+        let chunk = Chunk {
+            id,
+            offset,
+            payload_offset,
+            size,
+        };
+        chunks.push(chunk);
+        if &id == b"fmt " {
+            fmt = Some(chunk);
+        } else if &id == b"data" {
+            data = Some(chunk);
+        }
+        if fmt.is_some() && data.is_some() {
+            break;
+        }
+
+        let padded_size = size_usize
+            .checked_add(size_usize & 1)
+            .ok_or(RiffReadError::ChunkOffsetOverflow { offset, size })?;
+        offset = payload_offset
+            .checked_add(padded_size)
+            .ok_or(RiffReadError::ChunkOffsetOverflow { offset, size })?;
+    }
+
+    Ok(RiffWaveChunks {
+        riff_size,
+        form,
+        chunks,
+        fmt: fmt.ok_or(RiffReadError::MissingFmtChunk)?,
+        data: data.ok_or(RiffReadError::MissingDataChunk)?,
+    })
+}
+
+fn inspect_format<R: Read + Seek>(
+    reader: &mut R,
+    chunks: &RiffWaveChunks,
+) -> Result<PcmFormat, RiffReadError> {
+    if chunks.fmt.size < 16 {
+        return Err(RiffReadError::FmtChunkTooShort {
+            size: chunks.fmt.size,
+        });
+    }
+    reader.seek(SeekFrom::Start(chunks.fmt.payload_offset as u64))?;
+    let mut fmt = [0u8; 16];
+    reader.read_exact(&mut fmt)?;
+    let format = PcmFormat {
+        format_tag: u16::from_le_bytes(fmt[0..2].try_into().unwrap()),
+        channels: u16::from_le_bytes(fmt[2..4].try_into().unwrap()),
+        sample_rate: u32::from_le_bytes(fmt[4..8].try_into().unwrap()),
+        avg_bytes_per_sec: u32::from_le_bytes(fmt[8..12].try_into().unwrap()),
+        block_align: u16::from_le_bytes(fmt[12..14].try_into().unwrap()),
+        bits_per_sample: u16::from_le_bytes(fmt[14..16].try_into().unwrap()),
+    };
+    if format.format_tag != 1 {
+        return Err(RiffReadError::UnsupportedFormatTag(format.format_tag));
+    }
+    Ok(format)
+}
+
+/// Header-only counterpart to [`parse_wave_format`].
+pub fn inspect_wave_format<R: Read + Seek>(reader: &mut R) -> Result<PcmFormat, RiffReadError> {
+    let chunks = inspect_wave_chunks(reader)?;
+    inspect_format(reader, &chunks)
+}
+
+/// Header-only counterpart to [`parse_target_pcm_wave_for_channels`].
+pub fn inspect_target_pcm_wave_for_channels<R: Read + Seek>(
+    reader: &mut R,
+    channels: u16,
+) -> Result<PcmWaveInfo, RiffReadError> {
+    if channels != 1 && channels != 2 {
+        return Err(RiffReadError::UnsupportedChannelCount(channels));
+    }
+    let chunks = inspect_wave_chunks(reader)?;
+    let format = inspect_format(reader, &chunks)?;
+    if format.channels != channels {
+        return Err(RiffReadError::UnsupportedChannelCount(format.channels));
+    }
+    if format.sample_rate != 44_100 {
+        return Err(RiffReadError::UnsupportedSampleRate(format.sample_rate));
+    }
+    if format.block_align != channels * 2 {
+        return Err(RiffReadError::UnsupportedBlockAlign(format.block_align));
+    }
+    if format.bits_per_sample != 16 {
+        return Err(RiffReadError::UnsupportedBitsPerSample(
+            format.bits_per_sample,
+        ));
+    }
+    if chunks.data.size % u32::from(format.block_align) != 0 {
+        return Err(RiffReadError::DataSizeNotAligned {
+            data_size: chunks.data.size,
+            block_align: format.block_align,
+        });
+    }
+    Ok(PcmWaveInfo {
+        sample_frames: chunks.data.size / u32::from(format.block_align),
+        chunks,
+        format,
+    })
 }
 
 pub fn walk_wave_chunks(bytes: &[u8]) -> Result<RiffWaveChunks, RiffReadError> {
@@ -344,3 +508,61 @@ fn read_u16_le(bytes: &[u8], offset: usize) -> u16 {
 fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    fn pcm_wave(format_tag: u16, channels: u16, frames: usize) -> Vec<u8> {
+        let block_align = channels * 2;
+        let data_size = frames as u32 * u32::from(block_align);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_size).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&format_tag.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&44_100u32.to_le_bytes());
+        bytes.extend_from_slice(&(44_100u32 * u32::from(block_align)).to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_size.to_le_bytes());
+        bytes.resize(bytes.len() + data_size as usize, 0);
+        bytes
+    }
+
+    #[test]
+    fn seek_inspector_matches_slice_parser() {
+        for channels in [1, 2] {
+            let bytes = pcm_wave(1, channels, 2051);
+            let expected = parse_target_pcm_wave_for_channels(&bytes, channels).unwrap();
+            let actual =
+                inspect_target_pcm_wave_for_channels(&mut Cursor::new(bytes), channels).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn seek_inspector_preserves_strict_format_and_truncation_errors() {
+        let extensible = pcm_wave(0xfffe, 2, 1);
+        assert_eq!(
+            inspect_wave_format(&mut Cursor::new(extensible)),
+            Err(RiffReadError::UnsupportedFormatTag(0xfffe))
+        );
+
+        let mut truncated = pcm_wave(1, 2, 2);
+        truncated.pop();
+        assert_eq!(
+            inspect_target_pcm_wave_for_channels(&mut Cursor::new(truncated), 2),
+            Err(RiffReadError::TruncatedChunkPayload {
+                offset: 36,
+                size: 8,
+            })
+        );
+    }
+}
+use std::io::{self, Read, Seek, SeekFrom};
