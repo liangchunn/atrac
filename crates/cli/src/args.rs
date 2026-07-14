@@ -37,9 +37,6 @@ pub struct EncodeArgs {
     pub output: PathBuf,
 }
 
-pub const AT3_BITRATES_KBPS: [u32; 4] = [52, 66, 105, 132];
-pub const AT3P_BITRATES_KBPS: [u32; 10] = [32, 48, 64, 96, 128, 160, 192, 256, 320, 352];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Codec {
     At3,
@@ -48,14 +45,38 @@ pub enum Codec {
 
 impl Codec {
     pub fn for_bitrate(bitrate: u32) -> Option<Self> {
-        if AT3_BITRATES_KBPS.contains(&bitrate) {
+        if at3::ATRAC3_PROFILES
+            .iter()
+            .any(|profile| profile.bitrate_kbps() == bitrate)
+        {
             Some(Self::At3)
-        } else if AT3P_BITRATES_KBPS.contains(&bitrate) {
+        } else if at3p::ATRAC3PLUS_MONO_PROFILES
+            .iter()
+            .chain(at3p::ATRAC3PLUS_STEREO_PROFILES.iter())
+            .any(|profile| profile.bitrate_kbps() == bitrate)
+        {
             Some(Self::At3p)
         } else {
             None
         }
     }
+}
+
+pub fn supported_bitrates(codec: Codec) -> Vec<u32> {
+    let mut bitrates = match codec {
+        Codec::At3 => at3::ATRAC3_PROFILES
+            .iter()
+            .map(|profile| profile.bitrate_kbps())
+            .collect::<Vec<_>>(),
+        Codec::At3p => at3p::ATRAC3PLUS_MONO_PROFILES
+            .iter()
+            .chain(at3p::ATRAC3PLUS_STEREO_PROFILES.iter())
+            .map(|profile| profile.bitrate_kbps())
+            .collect::<Vec<_>>(),
+    };
+    bitrates.sort_unstable();
+    bitrates.dedup();
+    bitrates
 }
 
 #[cfg(test)]
@@ -64,7 +85,7 @@ mod tests {
 
     use clap::{CommandFactory, Parser};
 
-    use super::{AT3_BITRATES_KBPS, AT3P_BITRATES_KBPS, Cli, Codec, Command};
+    use super::{Cli, Codec, Command, supported_bitrates};
 
     #[test]
     fn command_tree_is_valid() {
@@ -91,10 +112,10 @@ mod tests {
 
     #[test]
     fn bitrate_selects_the_codec() {
-        for bitrate in AT3_BITRATES_KBPS {
+        for bitrate in supported_bitrates(Codec::At3) {
             assert_eq!(Codec::for_bitrate(bitrate), Some(Codec::At3));
         }
-        for bitrate in AT3P_BITRATES_KBPS {
+        for bitrate in supported_bitrates(Codec::At3p) {
             assert_eq!(Codec::for_bitrate(bitrate), Some(Codec::At3p));
         }
         assert_eq!(Codec::for_bitrate(384), None);
@@ -102,9 +123,9 @@ mod tests {
 
     #[test]
     fn codec_bitrate_sets_do_not_overlap() {
-        for bitrate in AT3_BITRATES_KBPS {
+        for bitrate in supported_bitrates(Codec::At3) {
             assert!(
-                !AT3P_BITRATES_KBPS.contains(&bitrate),
+                !supported_bitrates(Codec::At3p).contains(&bitrate),
                 "{bitrate} kbps belongs to both codecs"
             );
         }

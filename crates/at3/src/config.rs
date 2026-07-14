@@ -172,6 +172,15 @@ impl Atrac3Profile {
     }
 }
 
+/// Every supported ATRAC3 bitrate/channel profile.
+pub const ATRAC3_PROFILES: [Atrac3Profile; 5] = [
+    Atrac3Profile::mono(52, 152, 105, 304, EncoderStrategy::Dba, 1),
+    Atrac3Profile::mono(66, 192, 132, 384, EncoderStrategy::Clean, 2),
+    Atrac3Profile::stereo(66, 192, true, EncoderStrategy::Dba, 1),
+    Atrac3Profile::stereo(105, 304, false, EncoderStrategy::Dba, 1),
+    Atrac3Profile::stereo(132, 384, false, EncoderStrategy::Clean, 2),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +203,7 @@ mod tests {
             assert_eq!(profile.strategy(), strategy);
             assert_eq!(profile.priming_sound_units(), priming);
         }
+        assert_eq!(ATRAC3_PROFILES.len(), cases.len());
     }
 
     #[test]

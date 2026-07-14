@@ -7,7 +7,7 @@ mod progress;
 
 use std::process::ExitCode;
 
-use args::{AT3_BITRATES_KBPS, AT3P_BITRATES_KBPS, Cli, Codec, Command};
+use args::{Cli, Codec, Command, supported_bitrates};
 
 fn main() -> ExitCode {
     match run(Cli::parse_env()) {
@@ -27,8 +27,8 @@ fn run(cli: Cli) -> Result<(), String> {
         None => Err(format!(
             "unsupported bitrate {} kbps; supported ATRAC3 rates are {} and supported ATRAC3plus rates are {}",
             args.bitrate,
-            bitrate_list(&AT3_BITRATES_KBPS),
-            bitrate_list(&AT3P_BITRATES_KBPS),
+            bitrate_list(&supported_bitrates(Codec::At3)),
+            bitrate_list(&supported_bitrates(Codec::At3p)),
         )),
     }
 }

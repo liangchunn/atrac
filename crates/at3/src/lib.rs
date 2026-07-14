@@ -36,7 +36,7 @@ mod encoder;
 #[allow(dead_code, unused_imports)]
 mod tables;
 
-pub use config::{Atrac3Profile, ChannelMode, UnsupportedProfile};
+pub use config::{ATRAC3_PROFILES, Atrac3Profile, ChannelMode, UnsupportedProfile};
 pub use encoder::stream::{
     Atrac3StreamEncoder as Atrac3Encoder, Atrac3StreamError as EncodeError,
     Atrac3StreamSummary as EncodeSummary, EncodePhase, EncodeProgress, PCM_BLOCK_FRAMES,
