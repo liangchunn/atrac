@@ -17,6 +17,7 @@ pub const GAIN_WINDOW_POINTS: usize = 7;
 pub const GAIN_WINDOW_LEVEL_SLOTS: usize = 64;
 pub const GAIN_WINDOW_VALUES: usize = 256;
 
+#[allow(clippy::approx_constant)]
 const LOG2_E_AT5: f32 = 1.442695;
 const GC_LOG_BIAS_8_AT5: f32 = f32::from_bits(0x3d978d9e);
 const GC_LOG_BIAS_16_AT5: f32 = f32::from_bits(0x3e4544c0);

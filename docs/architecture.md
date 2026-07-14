@@ -44,6 +44,17 @@ pipeline. The boundary rules are the same:
 Integration tests in each codec crate scan these source boundaries so a reverse
 dependency fails the normal workspace test command.
 
+The selected architecture-focused clippy gate is:
+
+```sh
+cargo clippy --workspace --all-targets -- \
+  -D clippy::large_enum_variant -D clippy::type_complexity
+```
+
+The recovered codec arithmetic intentionally retains a broader backlog of
+style-level clippy findings; those are outside this structural refactor unless
+they identify a layer or representation problem.
+
 ## Reference infrastructure
 
 ATRAC3plus retains native function names when they help trace recovered

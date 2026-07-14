@@ -221,7 +221,7 @@ pub fn second_bit_allocation_frame_at5(
         state.budget_limit,
     );
     let mut totals = vec![0i16; channel_count];
-    let mut extended = state.base_total_12a;
+    let mut extended: i16;
     let mut iterations = 0usize;
     loop {
         let first_iteration = iterations == 0;

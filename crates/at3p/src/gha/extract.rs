@@ -819,12 +819,14 @@ pub fn extract_ghwave_channel_mode_flags_at5(
 /// `db >= 20.0` gives (1, 0), `-11.0 <= db < 20.0` gives (0, 0), and
 /// `db < -11.0` (or NaN) gives (1, 1). Rows that differ give (0, 0).
 /// Mono clears both rows.
+pub type PreviousGhaRows<'a> = (
+    &'a [[u32; EXTRACT_GHA_ROW_WORD_COUNT_AT5]],
+    &'a [[u32; EXTRACT_GHA_ROW_WORD_COUNT_AT5]],
+);
+
 pub fn extract_ghwave_stereo_share_gates_at5(
     correlation_db: &[f32],
-    previous_rows: Option<(
-        &[[u32; EXTRACT_GHA_ROW_WORD_COUNT_AT5]],
-        &[[u32; EXTRACT_GHA_ROW_WORD_COUNT_AT5]],
-    )>,
+    previous_rows: Option<PreviousGhaRows<'_>>,
     band_count: usize,
 ) -> Result<(Vec<u32>, Vec<u32>), GhaExtractError> {
     if band_count > MAX_EXTRACT_BANDS_AT5 {

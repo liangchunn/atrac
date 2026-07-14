@@ -59,18 +59,18 @@ impl FrameEncodeError {
 
 /// The sole strategy switch for classic ATRAC3 frame encoding.
 pub(crate) enum EncoderCore {
-    Clean(clean::CleanEncoder),
-    Dba(dba::DbaFrameEncoder),
+    Clean(Box<clean::CleanEncoder>),
+    Dba(Box<dba::DbaFrameEncoder>),
 }
 
 impl EncoderCore {
     pub(crate) fn new(profile: Atrac3Profile) -> Self {
         match profile.strategy() {
-            EncoderStrategy::Clean => Self::Clean(clean::CleanEncoder::new(profile)),
-            EncoderStrategy::Dba => Self::Dba(
+            EncoderStrategy::Clean => Self::Clean(Box::new(clean::CleanEncoder::new(profile))),
+            EncoderStrategy::Dba => Self::Dba(Box::new(
                 dba::DbaFrameEncoder::for_profile(profile)
                     .expect("validated DBA profile must have a core configuration"),
-            ),
+            )),
         }
     }
 

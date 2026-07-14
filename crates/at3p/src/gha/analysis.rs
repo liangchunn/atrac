@@ -487,7 +487,7 @@ pub fn analysis_general_wave_budgets_at5(
         let energy = energy_tables
             .iter()
             .fold(0.0_f32, |sum, table| sum + table[group]);
-        let db = if energy >= 1.0 && energy > 0.0 {
+        let db = if energy >= 1.0 {
             ((energy as f64).ln() as f32) * 8.685_889
         } else {
             0.0

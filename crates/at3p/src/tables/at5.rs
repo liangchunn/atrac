@@ -469,12 +469,14 @@ pub fn tlev_thred_096_at5() -> [f32; TLEV_THRED_AT5_ENTRIES] {
     f32_table(&SA_TLEV_THRED_096).expect("generated sa_tlev_thred_096 length should be 16 f32s")
 }
 
+#[allow(clippy::approx_constant)]
 pub fn sin_at5() -> [f32; SIN_AT5_ENTRIES] {
     std::array::from_fn(|index| {
         ((index as f64) * 6.283185307179586_f64 * 0.00048828125_f64).sin() as f32
     })
 }
 
+#[allow(clippy::approx_constant)]
 pub fn win_at5() -> [f32; WIN_AT5_ENTRIES] {
     std::array::from_fn(|index| {
         let cosine = ((index as f64) * 0.00390625_f64 * 6.283185307179586_f64).cos() as f32;
