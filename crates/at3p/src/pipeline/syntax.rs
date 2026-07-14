@@ -5,7 +5,7 @@
 //! temporary parity adapter; payload-family fields move out of it section by
 //! section before production packing switches to this type.
 
-use crate::bitstream::frame::{FrameAssemblyError, FramePrepackerState};
+use crate::bitstream::frame::{BlockGroup, FrameAssemblyError, FramePrepackerState, ObjectState};
 use crate::tables::at5::{isps_at5, nsps_at5};
 use crate::tables::generated::{G_A_IDSPCBANDS_AT5, G_A_IDSPCQUS_AT5};
 use crate::tables::spectral::SPECTRAL_DESCRIPTOR_SLOTS;
@@ -47,9 +47,92 @@ pub(crate) struct ChannelSyntax {
     pub idct: IdctSyntax,
     pub spectral: SpectralSyntax,
     pub gainb: GatedFlagsSyntax,
-    pub gain_present: bool,
+    pub gain: GainSyntax,
     pub gha_present: bool,
     pub gha_idam_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GainSyntax {
+    Absent,
+    Present(GainPayloadSyntax),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GainPayloadSyntax {
+    pub band_count: Option<usize>,
+    pub rows: Vec<GainRowSyntax>,
+    pub ngc: GainNgcSyntax,
+    pub idlev: GainIdlevSyntax,
+    pub idloc: GainIdlocSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GainRowSyntax {
+    pub count: u32,
+    pub locations: Vec<u32>,
+    pub levels: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GainNgcSyntax {
+    pub mode: u32,
+    pub encoding: GainNgcEncodingSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GainNgcEncodingSyntax {
+    Raw,
+    Huffman,
+    Delta,
+    Direct { bit_width: u8, base: i32 },
+    Previous { counts: Vec<u32> },
+    Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GainIdlevSyntax {
+    pub mode: u32,
+    pub encoding: GainIdlevEncodingSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GainIdlevEncodingSyntax {
+    Raw,
+    Delta,
+    RowDelta,
+    Direct { bit_width: u8, base: i32 },
+    Previous { levels: Vec<Vec<u32>> },
+    Flagged { flags: Vec<u32> },
+    Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GainIdlocSyntax {
+    pub mode: u32,
+    pub encoding: GainIdlocEncodingSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GainIdlocEncodingSyntax {
+    Raw,
+    LevelAdaptive,
+    RowAdaptive,
+    Direct {
+        bit_width: u8,
+        base: i32,
+    },
+    Previous {
+        locations: Vec<Vec<u32>>,
+    },
+    PreviousFlagged {
+        locations: Vec<Vec<u32>>,
+        flags: Vec<u32>,
+    },
+    PreviousRawFlagged {
+        locations: Vec<Vec<u32>>,
+        flags: Vec<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +378,11 @@ pub enum FrameSyntaxError {
         detail: &'static str,
     },
     InvalidGainbPayload {
+        group: usize,
+        channel: usize,
+        detail: &'static str,
+    },
+    InvalidGainPayload {
         group: usize,
         channel: usize,
         detail: &'static str,
@@ -617,7 +705,12 @@ impl FrameSyntax {
                             tail_values,
                         },
                         gainb: gated_flags_from_gainb(object, header.gainb_count)?,
-                        gain_present: object.u32(0x1b484)? != 0,
+                        gain: gain_syntax_from_reference(
+                            group,
+                            object,
+                            group_index,
+                            channel_index,
+                        )?,
                         gha_present: object.arena_u32(0)? != 0,
                         gha_idam_enabled: object.arena_u32(1)? == 0,
                     })
@@ -889,6 +982,13 @@ impl FrameSyntax {
                         detail,
                     });
                 }
+                if let Err(detail) = channel.gain.validate(channel.channel_index) {
+                    return Err(FrameSyntaxError::InvalidGainPayload {
+                        group: group_index,
+                        channel: channel_index,
+                        detail,
+                    });
+                }
             }
         }
         Ok(())
@@ -946,6 +1046,193 @@ impl ChannelSyntax {
     pub(crate) fn gainb(&self) -> &GatedFlagsSyntax {
         &self.gainb
     }
+
+    pub(crate) fn gain(&self) -> &GainSyntax {
+        &self.gain
+    }
+}
+
+impl GainSyntax {
+    fn validate(&self, channel_index: u32) -> Result<(), &'static str> {
+        let Self::Present(payload) = self else {
+            return Ok(());
+        };
+        if !(1..=16).contains(&payload.rows.len()) {
+            return Err("row count");
+        }
+        if payload
+            .band_count
+            .is_some_and(|count| !(1..=16).contains(&count))
+        {
+            return Err("band count");
+        }
+        for row in &payload.rows {
+            let points = row.count.min(7) as usize;
+            if row.locations.len() != points || row.levels.len() != points {
+                return Err("gain-point count");
+            }
+            if row.count > 7 {
+                return Err("gain-point limit");
+            }
+            if row.locations.iter().any(|value| *value > 31) {
+                return Err("gain location width");
+            }
+            if row.levels.iter().any(|value| *value > 15) {
+                return Err("gain level width");
+            }
+        }
+        for (section, mode) in [
+            ("NGC", payload.ngc.mode),
+            ("IDLEV", payload.idlev.mode),
+            ("IDLOC", payload.idloc.mode),
+        ] {
+            if mode > 3 {
+                return Err(section);
+            }
+        }
+        if payload.ngc.encoding.kind()
+            != GainNgcEncodingSyntax::kind_for_dispatch(payload.ngc.mode, channel_index)
+        {
+            return Err("NGC mode/payload agreement");
+        }
+        if payload.idlev.encoding.kind()
+            != GainIdlevEncodingSyntax::kind_for_dispatch(payload.idlev.mode, channel_index)
+        {
+            return Err("IDLEV mode/payload agreement");
+        }
+        if payload.idloc.encoding.kind()
+            != GainIdlocEncodingSyntax::kind_for_dispatch(payload.idloc.mode, channel_index)
+        {
+            return Err("IDLOC mode/payload agreement");
+        }
+        let row_count = payload.rows.len();
+        if let GainNgcEncodingSyntax::Previous { counts } = &payload.ngc.encoding
+            && counts.len() != row_count
+        {
+            return Err("NGC predictor count");
+        }
+        if let GainNgcEncodingSyntax::Direct { bit_width, .. } = &payload.ngc.encoding
+            && *bit_width > 3
+        {
+            return Err("NGC direct width");
+        }
+        match &payload.idlev.encoding {
+            GainIdlevEncodingSyntax::Previous { levels } if levels.len() != row_count => {
+                return Err("IDLEV predictor rows");
+            }
+            GainIdlevEncodingSyntax::Flagged { flags } if flags.len() != row_count => {
+                return Err("IDLEV flag count");
+            }
+            GainIdlevEncodingSyntax::Flagged { flags } if flags.iter().any(|flag| *flag > 1) => {
+                return Err("IDLEV flag width");
+            }
+            GainIdlevEncodingSyntax::Direct { bit_width, .. } if *bit_width > 3 => {
+                return Err("IDLEV direct width");
+            }
+            _ => {}
+        }
+        match &payload.idloc.encoding {
+            GainIdlocEncodingSyntax::Previous { locations } if locations.len() != row_count => {
+                return Err("IDLOC predictor rows");
+            }
+            GainIdlocEncodingSyntax::PreviousFlagged { locations, flags }
+            | GainIdlocEncodingSyntax::PreviousRawFlagged { locations, flags }
+                if locations.len() != row_count || flags.len() != row_count =>
+            {
+                return Err("IDLOC predictor/flag rows");
+            }
+            GainIdlocEncodingSyntax::PreviousFlagged { flags, .. }
+            | GainIdlocEncodingSyntax::PreviousRawFlagged { flags, .. }
+                if flags.iter().any(|flag| *flag > 1) =>
+            {
+                return Err("IDLOC flag width");
+            }
+            GainIdlocEncodingSyntax::Direct { bit_width, .. } if !(1..=4).contains(bit_width) => {
+                return Err("IDLOC direct width");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl GainNgcEncodingSyntax {
+    fn kind_for_dispatch(mode: u32, channel_index: u32) -> &'static str {
+        match (mode & 3) + ((channel_index & 1) << 2) {
+            0 | 4 => "raw",
+            1 | 5 => "huffman",
+            2 => "delta",
+            3 => "direct",
+            6 => "previous",
+            7 => "empty",
+            _ => unreachable!("masked gain NGC dispatch index"),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Huffman => "huffman",
+            Self::Delta => "delta",
+            Self::Direct { .. } => "direct",
+            Self::Previous { .. } => "previous",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+impl GainIdlevEncodingSyntax {
+    fn kind_for_dispatch(mode: u32, channel_index: u32) -> &'static str {
+        match (mode & 3) + ((channel_index & 1) << 2) {
+            0 | 4 => "raw",
+            1 => "delta",
+            2 => "row-delta",
+            3 => "direct",
+            5 => "previous",
+            6 => "flagged",
+            7 => "empty",
+            _ => unreachable!("masked gain IDLEV dispatch index"),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Delta => "delta",
+            Self::RowDelta => "row-delta",
+            Self::Direct { .. } => "direct",
+            Self::Previous { .. } => "previous",
+            Self::Flagged { .. } => "flagged",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+impl GainIdlocEncodingSyntax {
+    fn kind_for_dispatch(mode: u32, channel_index: u32) -> &'static str {
+        match (mode & 3) + ((channel_index & 1) << 2) {
+            0 | 4 => "raw",
+            1 => "level-adaptive",
+            2 => "row-adaptive",
+            3 => "direct",
+            5 => "previous",
+            6 => "previous-flagged",
+            7 => "previous-raw-flagged",
+            _ => unreachable!("masked gain IDLOC dispatch index"),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::LevelAdaptive => "level-adaptive",
+            Self::RowAdaptive => "row-adaptive",
+            Self::Direct { .. } => "direct",
+            Self::Previous { .. } => "previous",
+            Self::PreviousFlagged { .. } => "previous-flagged",
+            Self::PreviousRawFlagged { .. } => "previous-raw-flagged",
+        }
+    }
 }
 
 impl GatedFlagsSyntax {
@@ -995,6 +1282,145 @@ fn gated_flags_from_gainb(
         .map(|index| object.gainb_u32(0x988 + index * 4).map(|value| value != 0))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(GatedFlagsSyntax::Present { flags })
+}
+
+fn gain_syntax_from_reference(
+    group: &BlockGroup,
+    object: &ObjectState,
+    group_index: usize,
+    channel_index: usize,
+) -> Result<GainSyntax, FrameSyntaxError> {
+    if object.u32(0x1b484)? == 0 {
+        return Ok(GainSyntax::Absent);
+    }
+
+    let row_count = object.u32(0x1b490)? as usize;
+    let rows = gain_rows_from_reference(object, row_count)?;
+    let previous_rows = || -> Result<Vec<GainRowSyntax>, FrameSyntaxError> {
+        let previous = object
+            .previous_index
+            .and_then(|index| group.objects.get(index))
+            .ok_or(FrameSyntaxError::MissingPreviousChannel {
+                group: group_index,
+                channel: channel_index,
+            })?;
+        Ok(gain_rows_from_reference(previous, row_count)?)
+    };
+    let parity = object.channel_index & 1;
+
+    let ngc_mode = object.u32(0x1b494)?;
+    let ngc_dispatch = (ngc_mode & 3) + (parity << 2);
+    let ngc_encoding = match ngc_dispatch {
+        0 | 4 => GainNgcEncodingSyntax::Raw,
+        1 | 5 => GainNgcEncodingSyntax::Huffman,
+        2 => GainNgcEncodingSyntax::Delta,
+        3 => GainNgcEncodingSyntax::Direct {
+            bit_width: object.u32(0x1b498)? as u8,
+            base: object.u32(0x1b49c)? as i32,
+        },
+        6 => GainNgcEncodingSyntax::Previous {
+            counts: previous_rows()?.into_iter().map(|row| row.count).collect(),
+        },
+        7 => GainNgcEncodingSyntax::Empty,
+        _ => unreachable!("masked gain NGC dispatch index"),
+    };
+
+    let idlev_mode = object.u32(0x1b4a0)?;
+    let idlev_dispatch = (idlev_mode & 3) + (parity << 2);
+    let idlev_encoding = match idlev_dispatch {
+        0 | 4 => GainIdlevEncodingSyntax::Raw,
+        1 => GainIdlevEncodingSyntax::Delta,
+        2 => GainIdlevEncodingSyntax::RowDelta,
+        3 => GainIdlevEncodingSyntax::Direct {
+            bit_width: object.u32(0x1b4a4)? as u8,
+            base: object.u32(0x1b4a8)? as i32,
+        },
+        5 => GainIdlevEncodingSyntax::Previous {
+            levels: previous_rows()?.into_iter().map(|row| row.levels).collect(),
+        },
+        6 => GainIdlevEncodingSyntax::Flagged {
+            flags: object.u32_array(0x1b4ac, row_count)?,
+        },
+        7 => GainIdlevEncodingSyntax::Empty,
+        _ => unreachable!("masked gain IDLEV dispatch index"),
+    };
+
+    let idloc_mode = object.u32(0x1b4ec)?;
+    let idloc_dispatch = (idloc_mode & 3) + (parity << 2);
+    let idloc_encoding = match idloc_dispatch {
+        0 | 4 => GainIdlocEncodingSyntax::Raw,
+        1 => GainIdlocEncodingSyntax::LevelAdaptive,
+        2 => GainIdlocEncodingSyntax::RowAdaptive,
+        3 => GainIdlocEncodingSyntax::Direct {
+            bit_width: object.u32(0x1b4f0)? as u8,
+            base: object.u32(0x1b4f4)? as i32,
+        },
+        5 => GainIdlocEncodingSyntax::Previous {
+            locations: previous_rows()?
+                .into_iter()
+                .map(|row| row.locations)
+                .collect(),
+        },
+        6 => GainIdlocEncodingSyntax::PreviousFlagged {
+            locations: previous_rows()?
+                .into_iter()
+                .map(|row| row.locations)
+                .collect(),
+            flags: object.u32_array(0x1b4f8, row_count)?,
+        },
+        7 => GainIdlocEncodingSyntax::PreviousRawFlagged {
+            locations: previous_rows()?
+                .into_iter()
+                .map(|row| row.locations)
+                .collect(),
+            flags: object.u32_array(0x1b538, row_count)?,
+        },
+        _ => unreachable!("masked gain IDLOC dispatch index"),
+    };
+
+    let band_count = (object.u32(0x1b488)? != 0)
+        .then(|| object.u32(0x1b48c).map(|value| value as usize))
+        .transpose()?;
+    Ok(GainSyntax::Present(GainPayloadSyntax {
+        band_count,
+        rows,
+        ngc: GainNgcSyntax {
+            mode: ngc_mode,
+            encoding: ngc_encoding,
+        },
+        idlev: GainIdlevSyntax {
+            mode: idlev_mode,
+            encoding: idlev_encoding,
+        },
+        idloc: GainIdlocSyntax {
+            mode: idloc_mode,
+            encoding: idloc_encoding,
+        },
+    }))
+}
+
+fn gain_rows_from_reference(
+    object: &ObjectState,
+    count: usize,
+) -> Result<Vec<GainRowSyntax>, FrameAssemblyError> {
+    (0..count)
+        .map(|row| {
+            let base = row * 0x98;
+            let point_count = object.gainb_u32(base)?;
+            let points = point_count.min(7) as usize;
+            let locations = (0..points)
+                .map(|point| object.gainb_u32(base + 0x4 + point * 4))
+                .collect::<Result<Vec<_>, _>>()?;
+            let levels = (0..points)
+                .map(|point| object.gainb_u32(base + 0x20 + point * 4))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(GainRowSyntax {
+                count: point_count,
+                locations,
+                levels,
+            })
+        })
+        .collect()
 }
 
 impl SpectralSyntax {
@@ -1338,7 +1764,7 @@ mod tests {
         put_u32(&mut range_a, 0x1080, 1);
 
         let mut range_b = ObjectWindow::new(0x1b480, vec![0; 0x1780]);
-        put_u32(&mut range_b, 0x1b484, 1);
+        put_u32(&mut range_b, 0x1b484, 0);
         put_u32(&mut range_b, 0x1c70c, 2);
         put_u32(&mut range_b, 0x1c73c, 1);
 
@@ -1500,6 +1926,50 @@ mod tests {
                     assert_eq!(slot.word_len as usize, word_length);
                     assert!(slot.metadata().is_some());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn gain_dispatch_mappings_cover_every_mode_and_channel_parity() {
+        let ngc = [
+            "raw", "huffman", "delta", "direct", "raw", "huffman", "previous", "empty",
+        ];
+        let idlev = [
+            "raw",
+            "delta",
+            "row-delta",
+            "direct",
+            "raw",
+            "previous",
+            "flagged",
+            "empty",
+        ];
+        let idloc = [
+            "raw",
+            "level-adaptive",
+            "row-adaptive",
+            "direct",
+            "raw",
+            "previous",
+            "previous-flagged",
+            "previous-raw-flagged",
+        ];
+        for channel_index in 0..2 {
+            for mode in 0..4 {
+                let index = mode + channel_index * 4;
+                assert_eq!(
+                    GainNgcEncodingSyntax::kind_for_dispatch(mode as u32, channel_index as u32),
+                    ngc[index]
+                );
+                assert_eq!(
+                    GainIdlevEncodingSyntax::kind_for_dispatch(mode as u32, channel_index as u32),
+                    idlev[index]
+                );
+                assert_eq!(
+                    GainIdlocEncodingSyntax::kind_for_dispatch(mode as u32, channel_index as u32),
+                    idloc[index]
+                );
             }
         }
     }

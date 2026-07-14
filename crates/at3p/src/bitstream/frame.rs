@@ -102,7 +102,8 @@ use super::pack_spectral::{
 };
 use super::writer::{BitWriter, BitWriterError};
 use crate::pipeline::syntax::{
-    FrameSyntax, GatedFlagsSyntax, IdctCountSyntax, IdctEncodingSyntax, IdctSyntax,
+    FrameSyntax, GainIdlevEncodingSyntax, GainIdlocEncodingSyntax, GainNgcEncodingSyntax,
+    GainSyntax, GatedFlagsSyntax, IdctCountSyntax, IdctEncodingSyntax, IdctSyntax,
     IdsfEncodingSyntax, IdsfSyntax, IdwlEncodingSyntax, IdwlSyntax, SpectralSyntax, StereoSyntax,
     idspcqu_tail_count_at,
 };
@@ -557,8 +558,14 @@ fn pack_frame_at5_impl(
         }
 
         // Section 7: gain NGC/IDLEV/IDLOC side data (native 46866..47053).
-        for obj in group.objects.iter().take(nblk) {
-            pack_gain_block(writer, group, obj)?;
+        if let Some(typed) = syntax_group {
+            for channel in typed.channels() {
+                pack_gain_syntax(writer, channel.gain())?;
+            }
+        } else {
+            for obj in group.objects.iter().take(nblk) {
+                pack_gain_block(writer, group, obj)?;
+            }
         }
 
         // Section 8: GHA header (native 47055..47348), once per group, from the
@@ -1574,6 +1581,128 @@ fn pack_gain_block(
         Ok::<(), FrameAssemblyError>(())
     }?;
 
+    Ok(())
+}
+
+fn pack_gain_syntax(
+    writer: &mut BitWriter<'_>,
+    syntax: &GainSyntax,
+) -> Result<(), FrameAssemblyError> {
+    let GainSyntax::Present(payload) = syntax else {
+        writer.write_bits(0, 1)?;
+        return Ok(());
+    };
+
+    writer.write_bits(1, 1)?;
+    writer.write_bits(payload.rows.len().wrapping_sub(1) as u32, 4)?;
+    writer.write_bits(u32::from(payload.band_count.is_some()), 1)?;
+    if let Some(band_count) = payload.band_count {
+        writer.write_bits(band_count.wrapping_sub(1) as u32, 4)?;
+    }
+
+    let counts = payload.rows.iter().map(|row| row.count).collect::<Vec<_>>();
+    let level_rows = payload
+        .rows
+        .iter()
+        .map(|row| row.levels.as_slice())
+        .collect::<Vec<_>>();
+    let level_rows_i32 = payload
+        .rows
+        .iter()
+        .map(|row| {
+            row.levels
+                .iter()
+                .map(|value| *value as i32)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let level_row_refs_i32 = level_rows_i32.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let location_rows = payload
+        .rows
+        .iter()
+        .map(|row| row.locations.as_slice())
+        .collect::<Vec<_>>();
+    let idloc_rows = payload
+        .rows
+        .iter()
+        .zip(&level_rows_i32)
+        .map(|(row, levels)| IdlocRow {
+            locations: &row.locations,
+            levels,
+        })
+        .collect::<Vec<_>>();
+
+    writer.write_bits(payload.ngc.mode, 2)?;
+    match &payload.ngc.encoding {
+        GainNgcEncodingSyntax::Raw => pack_gain_ngc_0_at5(writer, &counts)?,
+        GainNgcEncodingSyntax::Huffman => pack_gain_ngc_1_at5(writer, &counts)?,
+        GainNgcEncodingSyntax::Delta => pack_gain_ngc_2_at5(writer, &counts)?,
+        GainNgcEncodingSyntax::Direct { bit_width, base } => {
+            let values = counts.iter().map(|value| *value as i32).collect::<Vec<_>>();
+            pack_gain_ngc_3_at5(
+                writer,
+                &Ngc3Fields {
+                    bit_width: *bit_width,
+                    base: *base,
+                    values: &values,
+                },
+            )?;
+        }
+        GainNgcEncodingSyntax::Previous { counts: previous } => {
+            pack_gain_ngc_4_at5(writer, &counts, previous)?
+        }
+        GainNgcEncodingSyntax::Empty => pack_gain_ngc_5_at5(writer)?,
+    }
+
+    writer.write_bits(payload.idlev.mode, 2)?;
+    match &payload.idlev.encoding {
+        GainIdlevEncodingSyntax::Raw => pack_gain_idlev_0_at5(writer, &level_rows)?,
+        GainIdlevEncodingSyntax::Delta => pack_gain_idlev_1_at5(writer, &level_rows)?,
+        GainIdlevEncodingSyntax::RowDelta => pack_gain_idlev_2_at5(writer, &level_rows)?,
+        GainIdlevEncodingSyntax::Direct { bit_width, base } => pack_gain_idlev_3_at5(
+            writer,
+            &Idlev3Fields {
+                bit_width: *bit_width,
+                base: *base,
+                rows: &level_row_refs_i32,
+            },
+        )?,
+        GainIdlevEncodingSyntax::Previous { levels } => {
+            let previous = levels.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            pack_gain_idlev_4_at5(writer, &level_rows, &previous)?;
+        }
+        GainIdlevEncodingSyntax::Flagged { flags } => {
+            pack_gain_idlev_5_at5(writer, &level_rows, flags)?
+        }
+        GainIdlevEncodingSyntax::Empty => pack_gain_idlev_6_at5(writer)?,
+    }
+
+    writer.write_bits(payload.idloc.mode, 2)?;
+    match &payload.idloc.encoding {
+        GainIdlocEncodingSyntax::Raw => pack_gain_idloc_0_at5(writer, &location_rows)?,
+        GainIdlocEncodingSyntax::LevelAdaptive => pack_gain_idloc_1_at5(writer, &idloc_rows)?,
+        GainIdlocEncodingSyntax::RowAdaptive => pack_gain_idloc_2_at5(writer, &idloc_rows)?,
+        GainIdlocEncodingSyntax::Direct { bit_width, base } => pack_gain_idloc_3_at5(
+            writer,
+            &Idloc3Fields {
+                bit_width: *bit_width,
+                base: *base,
+                rows: &location_rows,
+            },
+        )?,
+        GainIdlocEncodingSyntax::Previous { locations } => {
+            let previous = locations.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            pack_gain_idloc_4_at5(writer, &idloc_rows, &previous)?;
+        }
+        GainIdlocEncodingSyntax::PreviousFlagged { locations, flags } => {
+            let previous = locations.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            pack_gain_idloc_5_at5(writer, &idloc_rows, &previous, flags)?;
+        }
+        GainIdlocEncodingSyntax::PreviousRawFlagged { locations, flags } => {
+            let previous = locations.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            pack_gain_idloc_6_at5(writer, &location_rows, &previous, flags)?;
+        }
+    }
     Ok(())
 }
 
