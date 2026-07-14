@@ -103,10 +103,9 @@ use super::pack_spectral::{
 use super::writer::{BitWriter, BitWriterError};
 use crate::pipeline::syntax::{
     FrameSyntax, IdctCountSyntax, IdctEncodingSyntax, IdctSyntax, IdsfEncodingSyntax, IdsfSyntax,
-    IdwlEncodingSyntax, IdwlSyntax,
+    IdwlEncodingSyntax, IdwlSyntax, SpectralSyntax, idspcqu_tail_count_at,
 };
 use crate::tables::at5::{isps_at5, nsps_at5};
-use crate::tables::generated::{G_A_IDSPCBANDS_AT5, G_A_IDSPCQUS_AT5};
 use crate::tables::spectral::SPECTRAL_DESCRIPTOR_SLOTS;
 
 /// A captured memory window of a native object, indexable by native byte
@@ -213,7 +212,11 @@ impl ObjectState {
             .ok_or(FrameAssemblyError::MissingObjectWord { offset })
     }
 
-    fn u16_array(&self, offset: usize, count: usize) -> Result<Vec<u16>, FrameAssemblyError> {
+    pub(crate) fn u16_array(
+        &self,
+        offset: usize,
+        count: usize,
+    ) -> Result<Vec<u16>, FrameAssemblyError> {
         (0..count).map(|i| self.u16(offset + i * 2)).collect()
     }
 
@@ -492,10 +495,20 @@ fn pack_frame_at5_impl(
 
         // Spectral payload + per-block IDSPCQU tail (native 46378..46632). Each
         // block emits its descriptor-unit stream then its 4-bit level-word tail.
-        let bandwidth_remap = cfg_source.cfg_u32(0x90)? == 0;
-        for obj in group.objects.iter().take(nblk) {
-            pack_spectral_block(writer, obj, quant_unit_count, bandwidth_remap)?;
-            pack_spectral_idspcqu_block(writer, obj, cfg_source, quant_unit_count)?;
+        for (i, obj) in group.objects.iter().enumerate().take(nblk) {
+            let typed = syntax_group.and_then(|group| group.channels().get(i));
+            if syntax_group.is_some() && typed.is_none() {
+                return Err(FrameAssemblyError::UnpinnedOrdering {
+                    section: "typed_channel_count",
+                });
+            }
+            if let Some(channel) = typed {
+                pack_spectral_syntax(writer, channel.spectral())?;
+            } else {
+                let bandwidth_remap = cfg_source.cfg_u32(0x90)? == 0;
+                pack_spectral_block(writer, obj, quant_unit_count, bandwidth_remap)?;
+                pack_spectral_idspcqu_block(writer, obj, cfg_source, quant_unit_count)?;
+            }
         }
 
         // Stereo config side data (native 46633..46781, gated `iVar19 == 2`).
@@ -1160,16 +1173,20 @@ fn pack_spectral_block(
     Ok(())
 }
 
-/// Look up the native `g_a_idspcqus_at5` tail count, honoring the past-end read
-/// into the adjacent `g_a_idspcbands_at5` object (resolved via `readelf`; the
-/// symbols are contiguous). Returns `None` for the `0xff` sentinel.
-fn idspcqu_tail_count_at(index: usize) -> Option<usize> {
-    let value = if index < G_A_IDSPCQUS_AT5.len() {
-        G_A_IDSPCQUS_AT5[index]
-    } else {
-        *G_A_IDSPCBANDS_AT5.get(index - G_A_IDSPCQUS_AT5.len())?
-    };
-    (value != 0xff).then_some(usize::from(value) + 1)
+fn pack_spectral_syntax(
+    writer: &mut BitWriter<'_>,
+    syntax: &SpectralSyntax,
+) -> Result<(), FrameAssemblyError> {
+    let nsps = nsps_at5();
+    for unit in &syntax.units {
+        let slot_index = unit.codebook.slot_index();
+        let descriptor = SPECTRAL_DESCRIPTOR_SLOTS
+            .get(slot_index)
+            .ok_or(FrameAssemblyError::MissingSpectralSlot { slot_index })?;
+        pack_spectral_descriptor_unit(writer, descriptor, &unit.samples, nsps[unit.quant_unit])?;
+    }
+    pack_spectral_idspcqu_tail(writer, &syntax.tail_values)?;
+    Ok(())
 }
 
 /// Per-block IDSPCQU tail (native 46599..46628): when `quant_unit_count > 2` and

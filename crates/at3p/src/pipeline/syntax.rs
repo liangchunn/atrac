@@ -6,6 +6,9 @@
 //! section before production packing switches to this type.
 
 use crate::bitstream::frame::{FrameAssemblyError, FramePrepackerState};
+use crate::tables::at5::{isps_at5, nsps_at5};
+use crate::tables::generated::{G_A_IDSPCBANDS_AT5, G_A_IDSPCQUS_AT5};
+use crate::tables::spectral::SPECTRAL_DESCRIPTOR_SLOTS;
 
 const MAX_QUANT_UNITS: usize = 32;
 
@@ -41,9 +44,36 @@ pub(crate) struct ChannelSyntax {
     pub idwl: IdwlSyntax,
     pub idsf: IdsfSyntax,
     pub idct: IdctSyntax,
+    pub spectral: SpectralSyntax,
     pub gain_present: bool,
     pub gha_present: bool,
     pub gha_idam_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpectralSyntax {
+    pub units: Vec<SpectralUnitSyntax>,
+    pub tail_values: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpectralUnitSyntax {
+    pub quant_unit: usize,
+    pub codebook: SpectralCodebookSyntax,
+    pub samples: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpectralCodebookSyntax {
+    pub bandwidth: bool,
+    pub selector: usize,
+    pub word_length: usize,
+}
+
+impl SpectralCodebookSyntax {
+    pub(crate) fn slot_index(self) -> usize {
+        usize::from(self.bandwidth) * 56 + self.selector * 7 + (self.word_length - 1)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +262,14 @@ pub enum FrameSyntaxError {
         group: usize,
         channel: usize,
         detail: &'static str,
+    },
+    InvalidSpectralPayload {
+        group: usize,
+        channel: usize,
+        detail: &'static str,
+    },
+    UnsupportedSpectralRemap {
+        group: usize,
     },
     InvalidPreviousChannel {
         group: usize,
@@ -485,6 +523,45 @@ impl FrameSyntax {
                         }
                         _ => unreachable!("masked IDCT dispatch index"),
                     };
+                    if !header.bandwidth_gate {
+                        return Err(FrameSyntaxError::UnsupportedSpectralRemap {
+                            group: group_index,
+                        });
+                    }
+                    let nsps = nsps_at5();
+                    let isps = isps_at5();
+                    let mut spectral_units = Vec::new();
+                    for quant_unit in 0..header.quant_unit_count {
+                        let word_length = object.u32(0x1b5f8 + quant_unit * 4)? as i32;
+                        if word_length <= 0 {
+                            continue;
+                        }
+                        let sample_count = usize::from(nsps[quant_unit]);
+                        spectral_units.push(SpectralUnitSyntax {
+                            quant_unit,
+                            codebook: SpectralCodebookSyntax {
+                                bandwidth: object.u32(0x1074)? != 0,
+                                selector: object.u32(0x1b578 + quant_unit * 4)? as usize,
+                                word_length: word_length as usize,
+                            },
+                            samples: object.u16_array(
+                                0x1b6f8 + usize::from(isps[quant_unit]) * 2,
+                                sample_count,
+                            )?,
+                        });
+                    }
+                    let tail_values = if header.quant_unit_count <= 2 {
+                        Vec::new()
+                    } else {
+                        idspcqu_tail_count_at(header.stereo_unit_count + 0x1f)
+                            .map(|count| {
+                                object
+                                    .u32_array(0x1c6f8, count)
+                                    .map(|words| words.into_iter().map(|word| word as u8).collect())
+                            })
+                            .transpose()?
+                            .unwrap_or_default()
+                    };
                     Ok(ChannelSyntax {
                         channel_index: object.channel_index,
                         previous_channel: object.previous_index,
@@ -503,6 +580,10 @@ impl FrameSyntax {
                             count,
                             rows,
                             encoding,
+                        },
+                        spectral: SpectralSyntax {
+                            units: spectral_units,
+                            tail_values,
                         },
                         gain_present: object.u32(0x1b484)? != 0,
                         gha_present: object.arena_u32(0)? != 0,
@@ -678,6 +759,16 @@ impl FrameSyntax {
                         actual: values.len(),
                     });
                 }
+                if let Err(detail) = channel.spectral.validate(
+                    syntax.header.quant_unit_count,
+                    syntax.header.stereo_unit_count,
+                ) {
+                    return Err(FrameSyntaxError::InvalidSpectralPayload {
+                        group: group_index,
+                        channel: channel_index,
+                        detail,
+                    });
+                }
             }
         }
         Ok(())
@@ -719,6 +810,64 @@ impl ChannelSyntax {
     pub(crate) fn idsf(&self) -> &IdsfSyntax {
         &self.idsf
     }
+
+    pub(crate) fn spectral(&self) -> &SpectralSyntax {
+        &self.spectral
+    }
+}
+
+impl SpectralSyntax {
+    fn validate(
+        &self,
+        quant_unit_count: usize,
+        stereo_unit_count: usize,
+    ) -> Result<(), &'static str> {
+        let nsps = nsps_at5();
+        let mut previous_quant_unit = None;
+        for unit in &self.units {
+            if unit.quant_unit >= quant_unit_count {
+                return Err("quant-unit index");
+            }
+            if previous_quant_unit.is_some_and(|previous| previous >= unit.quant_unit) {
+                return Err("quant-unit ordering");
+            }
+            previous_quant_unit = Some(unit.quant_unit);
+            if unit.codebook.selector > 7 {
+                return Err("codebook selector");
+            }
+            if !(1..=7).contains(&unit.codebook.word_length) {
+                return Err("word length");
+            }
+            if SPECTRAL_DESCRIPTOR_SLOTS
+                .get(unit.codebook.slot_index())
+                .is_none()
+            {
+                return Err("codebook slot");
+            }
+            if unit.samples.len() != usize::from(nsps[unit.quant_unit]) {
+                return Err("sample count");
+            }
+        }
+        let expected_tail = if quant_unit_count <= 2 {
+            0
+        } else {
+            idspcqu_tail_count_at(stereo_unit_count + 0x1f).unwrap_or(0)
+        };
+        (self.tail_values.len() == expected_tail)
+            .then_some(())
+            .ok_or("tail count")
+    }
+}
+
+/// Interpret the IDSPCQU extent table, including its native contiguous-table
+/// spill into the following IDSPCBANDS bytes and the `0xff` absent sentinel.
+pub(crate) fn idspcqu_tail_count_at(index: usize) -> Option<usize> {
+    let value = if index < G_A_IDSPCQUS_AT5.len() {
+        G_A_IDSPCQUS_AT5[index]
+    } else {
+        *G_A_IDSPCBANDS_AT5.get(index - G_A_IDSPCQUS_AT5.len())?
+    };
+    (value != 0xff).then_some(usize::from(value) + 1)
 }
 
 impl IdwlEncodingSyntax {
@@ -1152,6 +1301,24 @@ mod tests {
                     IdsfEncodingSyntax::kind_for_dispatch(mode as u32, channel_index as u32),
                     expected[index]
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn spectral_codebook_coordinates_cover_both_bandwidth_states() {
+        for bandwidth in [false, true] {
+            for selector in 0..8 {
+                for word_length in 1..=7 {
+                    let codebook = SpectralCodebookSyntax {
+                        bandwidth,
+                        selector,
+                        word_length,
+                    };
+                    let slot = &SPECTRAL_DESCRIPTOR_SLOTS[codebook.slot_index()];
+                    assert_eq!(slot.word_len as usize, word_length);
+                    assert!(slot.metadata().is_some());
+                }
             }
         }
     }
