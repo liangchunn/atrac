@@ -27,6 +27,9 @@
 //!
 //! Complete deinterleaved input can instead use [`encode_to_vec`]. RIFF/WAVE
 //! inspection helpers are available under [`container`].
+//!
+//! The typed-syntax production boundary and debug-only native oracle are
+//! documented in the workspace's `docs/architecture.md`.
 
 #[allow(dead_code)]
 mod bitstream;

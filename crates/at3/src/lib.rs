@@ -23,6 +23,9 @@
 //! # Ok(bytes)
 //! # }
 //! ```
+//!
+//! The internal layer boundaries and parity policy are documented in the
+//! workspace's `docs/architecture.md`.
 
 #[allow(dead_code)]
 mod analysis;
