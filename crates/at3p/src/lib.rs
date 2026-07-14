@@ -15,6 +15,8 @@ mod encoder;
 #[allow(dead_code)]
 mod gha;
 #[allow(dead_code)]
+mod pipeline;
+#[allow(dead_code)]
 mod riff;
 #[allow(dead_code)]
 mod tables;

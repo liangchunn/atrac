@@ -169,14 +169,14 @@ pub struct ObjectState {
 }
 
 impl ObjectState {
-    fn u32(&self, offset: usize) -> Result<u32, FrameAssemblyError> {
+    pub(crate) fn u32(&self, offset: usize) -> Result<u32, FrameAssemblyError> {
         self.range_a
             .get_u32(offset)
             .or_else(|| self.range_b.get_u32(offset))
             .ok_or(FrameAssemblyError::MissingObjectWord { offset })
     }
 
-    fn cfg_u32(&self, offset: usize) -> Result<u32, FrameAssemblyError> {
+    pub(crate) fn cfg_u32(&self, offset: usize) -> Result<u32, FrameAssemblyError> {
         self.cfg
             .get_u32(offset)
             .ok_or(FrameAssemblyError::MissingConfigWord { offset })
@@ -220,7 +220,7 @@ impl ObjectState {
     }
 
     /// Word from the GHA header arena_root at word index `idx`.
-    fn arena_u32(&self, idx: usize) -> Result<u32, FrameAssemblyError> {
+    pub(crate) fn arena_u32(&self, idx: usize) -> Result<u32, FrameAssemblyError> {
         self.gha_arena
             .get_u32(idx * 4)
             .ok_or(FrameAssemblyError::MissingGhaWord { index: idx })

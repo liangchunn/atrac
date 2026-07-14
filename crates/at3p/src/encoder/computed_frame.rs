@@ -61,6 +61,7 @@ use crate::encoder::packer_bridge::{
     serialize_idwl_object_range_b, serialize_init_gain_header_range_b,
 };
 use crate::encoder::profile::ATRAC3PLUS_352;
+use crate::pipeline::syntax::{FrameSyntax, FrameSyntaxError};
 
 /// Frame byte length of the 352 stereo single-block frame.
 pub const COMPUTED_FRAME_BYTES: usize = 2048;
@@ -109,6 +110,9 @@ pub enum ComputedFrameError {
     /// `pack_frame_at5` failed on the assembled state — the frame is not a legal
     /// bitstream (a dispatch arm outside the proven live set, past the horizon).
     Pack(crate::bitstream::frame::FrameAssemblyError),
+    /// The assembled reference layout could not be represented as typed frame
+    /// syntax without violating structural invariants.
+    Syntax(FrameSyntaxError),
 }
 
 impl From<FrontendError> for ComputedFrameError {
@@ -124,6 +128,11 @@ impl From<CodingBridgeError> for ComputedFrameError {
 impl From<PackerBridgeError> for ComputedFrameError {
     fn from(error: PackerBridgeError) -> Self {
         ComputedFrameError::Packer(error)
+    }
+}
+impl From<FrameSyntaxError> for ComputedFrameError {
+    fn from(error: FrameSyntaxError) -> Self {
+        Self::Syntax(error)
     }
 }
 
@@ -764,6 +773,11 @@ impl ComputedFrameDriver {
             effective_band_limit,
             effective_band_count,
         )?;
+
+        let syntax = FrameSyntax::from_reference(&state)?;
+        debug_assert_eq!(syntax.frame_bytes(), state.frame_bytes);
+        debug_assert_eq!(syntax.groups().len(), state.groups.len());
+        debug_assert_eq!(syntax.to_reference()?, state);
 
         let mut bytes = vec![0u8; state.frame_bytes];
         let mut writer = BitWriter::new(&mut bytes);
