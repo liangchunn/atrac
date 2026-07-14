@@ -25,6 +25,7 @@ pub(crate) struct BlockGroupSyntax {
     channels: Vec<ChannelSyntax>,
     stereo: Option<StereoSyntax>,
     post_payload: Option<[u8; 2]>,
+    gha: GhaSyntax,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,8 +49,88 @@ pub(crate) struct ChannelSyntax {
     pub spectral: SpectralSyntax,
     pub gainb: GatedFlagsSyntax,
     pub gain: GainSyntax,
-    pub gha_present: bool,
-    pub gha_idam_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GhaSyntax {
+    Absent,
+    Present(GhaPayloadSyntax),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GhaPayloadSyntax {
+    pub header_mode: u32,
+    pub band_count: usize,
+    pub stereo_flags: Option<[GatedFlagsSyntax; 3]>,
+    pub channels: Vec<GhaChannelSyntax>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GhaChannelSyntax {
+    pub channel_index: u32,
+    pub records: Vec<GhaRecordSyntax>,
+    pub idloc_mode: u32,
+    pub nwavs: GhaNwavsSyntax,
+    pub freq: GhaFreqSyntax,
+    pub idsf: GhaIdsfSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GhaRecordSyntax {
+    pub active: bool,
+    pub first_location: Option<u32>,
+    pub second_location: Option<u32>,
+    pub waves: Vec<GhaWaveSyntax>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GhaWaveSyntax {
+    pub idsf: u32,
+    pub phase: u32,
+    pub freq: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GhaNwavsSyntax {
+    pub mode: u32,
+    pub encoding: GhaNwavsEncodingSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GhaNwavsEncodingSyntax {
+    Raw,
+    Huffman,
+    Previous { counts: Vec<u32> },
+    Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GhaFreqSyntax {
+    pub mode: u32,
+    pub encoding: GhaFreqEncodingSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GhaFreqEncodingSyntax {
+    Local { modes: Vec<u32> },
+    Previous { rows: Vec<Vec<u32>> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GhaIdsfSyntax {
+    pub mode: u32,
+    pub encoding: GhaIdsfEncodingSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GhaIdsfEncodingSyntax {
+    Raw,
+    Huffman,
+    Previous {
+        rows: Vec<Vec<u32>>,
+        indices: Vec<Vec<i32>>,
+    },
+    Empty,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +468,13 @@ pub enum FrameSyntaxError {
         channel: usize,
         detail: &'static str,
     },
+    InvalidGhaPayload {
+        group: usize,
+        detail: &'static str,
+    },
+    UnsupportedGhaIdam {
+        group: usize,
+    },
     InvalidPostPayload {
         group: usize,
         value: u8,
@@ -711,8 +799,6 @@ impl FrameSyntax {
                             group_index,
                             channel_index,
                         )?,
-                        gha_present: object.arena_u32(0)? != 0,
-                        gha_idam_enabled: object.arena_u32(1)? == 0,
                     })
                 })
                 .collect::<Result<Vec<_>, FrameSyntaxError>>()?;
@@ -741,11 +827,13 @@ impl FrameSyntax {
             } else {
                 Some([source.cfg_u32(0x98)? as u8, source.cfg_u32(0x9c)? as u8])
             };
+            let gha = gha_syntax_from_reference(group, source, group_index)?;
             groups.push(BlockGroupSyntax {
                 header,
                 channels,
                 stereo,
                 post_payload,
+                gha,
             });
         }
         let syntax = Self {
@@ -841,6 +929,12 @@ impl FrameSyntax {
                 return Err(FrameSyntaxError::InvalidPostPayload {
                     group: group_index,
                     value,
+                });
+            }
+            if let Err(detail) = syntax.gha.validate(syntax.channels.len()) {
+                return Err(FrameSyntaxError::InvalidGhaPayload {
+                    group: group_index,
+                    detail,
                 });
             }
             for (channel_index, channel) in syntax.channels.iter().enumerate() {
@@ -1023,6 +1117,10 @@ impl BlockGroupSyntax {
 
     pub(crate) fn post_payload(&self) -> Option<[u8; 2]> {
         self.post_payload
+    }
+
+    pub(crate) fn gha(&self) -> &GhaSyntax {
+        &self.gha
     }
 }
 
@@ -1245,6 +1343,149 @@ impl GatedFlagsSyntax {
     }
 }
 
+impl GhaSyntax {
+    fn validate(&self, channel_count: usize) -> Result<(), &'static str> {
+        let Self::Present(payload) = self else {
+            return Ok(());
+        };
+        if payload.header_mode != 1 {
+            return Err("header mode");
+        }
+        if !(1..=16).contains(&payload.band_count) {
+            return Err("band count");
+        }
+        match (&payload.stereo_flags, channel_count) {
+            (Some(flags), 2) => {
+                for flag_group in flags {
+                    flag_group.validate(payload.band_count)?;
+                }
+            }
+            (None, 1) => {}
+            _ => return Err("stereo flag agreement"),
+        }
+        if payload.channels.len() != channel_count {
+            return Err("channel count");
+        }
+        for channel in &payload.channels {
+            if channel.channel_index > 1 {
+                return Err("channel index");
+            }
+            if channel.records.len() != payload.band_count {
+                return Err("record count");
+            }
+            if channel.idloc_mode > 1 || channel.freq.mode > 1 {
+                return Err("one-bit mode width");
+            }
+            if channel.nwavs.mode > 3 || channel.idsf.mode > 3 {
+                return Err("two-bit mode width");
+            }
+            for record in &channel.records {
+                if record
+                    .first_location
+                    .into_iter()
+                    .chain(record.second_location)
+                    .any(|location| location > 31)
+                {
+                    return Err("location width");
+                }
+                if record.waves.len() > 15 {
+                    return Err("wave count width");
+                }
+                for wave in &record.waves {
+                    if wave.phase > 31 || wave.freq > 1023 || wave.idsf > 63 {
+                        return Err("wave field width");
+                    }
+                }
+            }
+            if channel.nwavs.encoding.kind()
+                != GhaNwavsEncodingSyntax::kind_for_mode(channel.nwavs.mode)
+            {
+                return Err("NWAVS mode/payload agreement");
+            }
+            if channel.freq.encoding.kind()
+                != GhaFreqEncodingSyntax::kind_for_mode(channel.freq.mode)
+            {
+                return Err("FREQ mode/payload agreement");
+            }
+            if channel.idsf.encoding.kind()
+                != GhaIdsfEncodingSyntax::kind_for_mode(channel.idsf.mode)
+            {
+                return Err("IDSF mode/payload agreement");
+            }
+            if let GhaNwavsEncodingSyntax::Previous { counts } = &channel.nwavs.encoding
+                && counts.len() != payload.band_count
+            {
+                return Err("NWAVS predictor rows");
+            }
+            match &channel.freq.encoding {
+                GhaFreqEncodingSyntax::Local { modes }
+                    if modes.len() != payload.band_count || modes.iter().any(|mode| *mode > 1) =>
+                {
+                    return Err("FREQ local modes");
+                }
+                GhaFreqEncodingSyntax::Previous { rows } if rows.len() != payload.band_count => {
+                    return Err("FREQ predictor rows");
+                }
+                _ => {}
+            }
+            if let GhaIdsfEncodingSyntax::Previous { rows, indices } = &channel.idsf.encoding {
+                if rows.len() != payload.band_count || indices.len() != payload.band_count {
+                    return Err("IDSF predictor rows");
+                }
+                for (record, index_row) in channel.records.iter().zip(indices) {
+                    if record.active && index_row.len() != record.waves.len() {
+                        return Err("IDSF predictor indices");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GhaNwavsEncodingSyntax {
+    fn kind_for_mode(mode: u32) -> &'static str {
+        ["raw", "huffman", "previous", "empty"][(mode & 3) as usize]
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Huffman => "huffman",
+            Self::Previous { .. } => "previous",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+impl GhaFreqEncodingSyntax {
+    fn kind_for_mode(mode: u32) -> &'static str {
+        ["local", "previous"][(mode & 1) as usize]
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Local { .. } => "local",
+            Self::Previous { .. } => "previous",
+        }
+    }
+}
+
+impl GhaIdsfEncodingSyntax {
+    fn kind_for_mode(mode: u32) -> &'static str {
+        ["raw", "huffman", "previous", "empty"][(mode & 3) as usize]
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Huffman => "huffman",
+            Self::Previous { .. } => "previous",
+            Self::Empty => "empty",
+        }
+    }
+}
+
 fn gated_flags_from_cfg(
     object: &crate::bitstream::frame::ObjectState,
     present_offset: usize,
@@ -1421,6 +1662,195 @@ fn gain_rows_from_reference(
             })
         })
         .collect()
+}
+
+fn gha_syntax_from_reference(
+    group: &BlockGroup,
+    source: &ObjectState,
+    group_index: usize,
+) -> Result<GhaSyntax, FrameSyntaxError> {
+    if source.arena_u32(0)? == 0 {
+        return Ok(GhaSyntax::Absent);
+    }
+    let header_mode = source.arena_u32(1)?;
+    if header_mode == 0 {
+        return Err(FrameSyntaxError::UnsupportedGhaIdam { group: group_index });
+    }
+    let band_count = source.arena_u32(2)? as usize;
+    let stereo_flags = if group.nblk == 2 {
+        Some([
+            gated_flags_from_arena(source, 0xc4, 0xc5, 0xc6, band_count)?,
+            gated_flags_from_arena(source, 0xe8, 0xe9, 0xea, band_count)?,
+            gated_flags_from_arena(source, 0xd6, 0xd7, 0xd8, band_count)?,
+        ])
+    } else {
+        None
+    };
+    let channels = group
+        .objects
+        .iter()
+        .take(group.nblk)
+        .enumerate()
+        .map(|(channel_position, object)| {
+            let active = (0..object.gha_records.len())
+                .map(|record| object.u32(0x1c7b0 + record * 4).map(|value| value != 0))
+                .collect::<Result<Vec<_>, _>>()?;
+            let records = object
+                .gha_records
+                .iter()
+                .enumerate()
+                .map(|(record, waves)| {
+                    let word = record * 10;
+                    Ok(GhaRecordSyntax {
+                        active: active[record],
+                        first_location: (object.p1_u32(word + 5)? != 0)
+                            .then(|| object.p1_u32(word + 7))
+                            .transpose()?,
+                        second_location: (object.p1_u32(word + 6)? != 0)
+                            .then(|| object.p1_u32(word + 8))
+                            .transpose()?,
+                        waves: waves
+                            .iter()
+                            .map(|wave| GhaWaveSyntax {
+                                idsf: wave.idsf,
+                                phase: wave.phase,
+                                freq: wave.freq,
+                            })
+                            .collect(),
+                    })
+                })
+                .collect::<Result<Vec<_>, FrameAssemblyError>>()?;
+            let previous = || -> Result<&ObjectState, FrameSyntaxError> {
+                object
+                    .previous_index
+                    .and_then(|index| group.objects.get(index))
+                    .ok_or(FrameSyntaxError::MissingPreviousChannel {
+                        group: group_index,
+                        channel: channel_position,
+                    })
+            };
+
+            let nwavs_mode = object.u32(0x1c760)?;
+            let nwavs_encoding = match nwavs_mode & 3 {
+                0 => GhaNwavsEncodingSyntax::Raw,
+                1 => GhaNwavsEncodingSyntax::Huffman,
+                2 => GhaNwavsEncodingSyntax::Previous {
+                    counts: previous()?
+                        .gha_records
+                        .iter()
+                        .map(|waves| waves.len() as u32)
+                        .collect(),
+                },
+                3 => GhaNwavsEncodingSyntax::Empty,
+                _ => unreachable!("masked GHA NWAVS mode"),
+            };
+
+            let freq_mode = object.u32(0x1c764)?;
+            let freq_encoding = if freq_mode & 1 == 0 {
+                GhaFreqEncodingSyntax::Local {
+                    modes: (0..records.len())
+                        .map(|record| object.u32(0x1c770 + record * 4))
+                        .collect::<Result<Vec<_>, _>>()?,
+                }
+            } else {
+                GhaFreqEncodingSyntax::Previous {
+                    rows: previous()?
+                        .gha_records
+                        .iter()
+                        .map(|waves| waves.iter().map(|wave| wave.freq).collect())
+                        .collect(),
+                }
+            };
+
+            let idsf_mode = object.u32(0x1c768)?;
+            let idsf_encoding = match idsf_mode & 3 {
+                0 => GhaIdsfEncodingSyntax::Raw,
+                1 => GhaIdsfEncodingSyntax::Huffman,
+                2 => GhaIdsfEncodingSyntax::Previous {
+                    rows: previous()?
+                        .gha_records
+                        .iter()
+                        .map(|waves| waves.iter().map(|wave| wave.idsf).collect())
+                        .collect(),
+                    indices: gha_predictor_indices_from_reference(object, &active)?,
+                },
+                3 => GhaIdsfEncodingSyntax::Empty,
+                _ => unreachable!("masked GHA IDSF mode"),
+            };
+
+            Ok(GhaChannelSyntax {
+                channel_index: object.channel_index,
+                records,
+                idloc_mode: object.u32(0x1c75c)?,
+                nwavs: GhaNwavsSyntax {
+                    mode: nwavs_mode,
+                    encoding: nwavs_encoding,
+                },
+                freq: GhaFreqSyntax {
+                    mode: freq_mode,
+                    encoding: freq_encoding,
+                },
+                idsf: GhaIdsfSyntax {
+                    mode: idsf_mode,
+                    encoding: idsf_encoding,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, FrameSyntaxError>>()?;
+    Ok(GhaSyntax::Present(GhaPayloadSyntax {
+        header_mode,
+        band_count,
+        stereo_flags,
+        channels,
+    }))
+}
+
+fn gated_flags_from_arena(
+    object: &ObjectState,
+    present_index: usize,
+    flags_present_index: usize,
+    flags_index: usize,
+    count: usize,
+) -> Result<GatedFlagsSyntax, FrameAssemblyError> {
+    if object.arena_u32(present_index)? == 0 {
+        return Ok(GatedFlagsSyntax::Absent);
+    }
+    if object.arena_u32(flags_present_index)? == 0 {
+        return Ok(GatedFlagsSyntax::PresentWithoutFlags);
+    }
+    let flags = (0..count)
+        .map(|index| {
+            object
+                .arena_u32(flags_index + index)
+                .map(|value| value != 0)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GatedFlagsSyntax::Present { flags })
+}
+
+fn gha_predictor_indices_from_reference(
+    object: &ObjectState,
+    active: &[bool],
+) -> Result<Vec<Vec<i32>>, FrameAssemblyError> {
+    let mut rows = Vec::with_capacity(object.gha_records.len());
+    let mut base = 0;
+    for (record, waves) in object.gha_records.iter().enumerate() {
+        if !active[record] {
+            rows.push(Vec::new());
+            continue;
+        }
+        rows.push(
+            (0..waves.len())
+                .map(|wave| {
+                    object
+                        .cfg_u32(0x11c + (base + wave) * 4)
+                        .map(|value| value as i32)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        base += waves.len();
+    }
+    Ok(rows)
 }
 
 impl SpectralSyntax {
@@ -1783,7 +2213,7 @@ mod tests {
         }
 
         let mut gha_arena = ObjectWindow::new(0, vec![0; 8]);
-        put_u32(&mut gha_arena, 0, 1);
+        put_u32(&mut gha_arena, 0, 0);
         put_u32(&mut gha_arena, 4, 0);
 
         let object = ObjectState {
@@ -1972,5 +2402,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn gha_mode_mappings_cover_every_payload_family() {
+        for (mode, expected) in ["raw", "huffman", "previous", "empty"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(GhaNwavsEncodingSyntax::kind_for_mode(mode as u32), expected);
+            assert_eq!(GhaIdsfEncodingSyntax::kind_for_mode(mode as u32), expected);
+        }
+        assert_eq!(GhaFreqEncodingSyntax::kind_for_mode(0), "local");
+        assert_eq!(GhaFreqEncodingSyntax::kind_for_mode(1), "previous");
     }
 }

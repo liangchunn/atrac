@@ -103,7 +103,8 @@ use super::pack_spectral::{
 use super::writer::{BitWriter, BitWriterError};
 use crate::pipeline::syntax::{
     FrameSyntax, GainIdlevEncodingSyntax, GainIdlocEncodingSyntax, GainNgcEncodingSyntax,
-    GainSyntax, GatedFlagsSyntax, IdctCountSyntax, IdctEncodingSyntax, IdctSyntax,
+    GainSyntax, GatedFlagsSyntax, GhaFreqEncodingSyntax, GhaIdsfEncodingSyntax,
+    GhaNwavsEncodingSyntax, GhaSyntax, IdctCountSyntax, IdctEncodingSyntax, IdctSyntax,
     IdsfEncodingSyntax, IdsfSyntax, IdwlEncodingSyntax, IdwlSyntax, SpectralSyntax, StereoSyntax,
     idspcqu_tail_count_at,
 };
@@ -230,7 +231,7 @@ impl ObjectState {
     }
 
     /// Word from the GHA record arena `p1` at word index `idx`.
-    fn p1_u32(&self, idx: usize) -> Result<u32, FrameAssemblyError> {
+    pub(crate) fn p1_u32(&self, idx: usize) -> Result<u32, FrameAssemblyError> {
         self.gha_p1
             .get_u32(idx * 4)
             .ok_or(FrameAssemblyError::MissingGhaWord { index: idx })
@@ -577,16 +578,20 @@ fn pack_frame_at5_impl(
         // loop are skipped. That is the GHA-disabled frame layout law
         // (`calc_nbits_for_gha_at5` absent arm == 1 bit, decompile 6813); first
         // ported this slice (docs/13 §5.1).
-        let arena_flag0 = cfg_source.arena_u32(0)?;
-        pack_gha_header(writer, cfg_source, nblk)?;
+        if let Some(typed) = syntax_group {
+            pack_gha_syntax(writer, typed.gha())?;
+        } else {
+            let arena_flag0 = cfg_source.arena_u32(0)?;
+            pack_gha_header(writer, cfg_source, nblk)?;
 
-        // Sections 9 + 10: per-channel GHA side data then the per-wave payload
-        // loop (native 47349..47568), gated on `arena_root[0] != 0` (the same
-        // native `if (*piVar22 != 0)` gate). The idam gate is `arena_root[1] == 0`.
-        if arena_flag0 != 0 {
-            let arena_flag1 = cfg_source.arena_u32(1)?;
-            for obj in group.objects.iter().take(nblk) {
-                pack_gha_channel(writer, group, obj, arena_flag1)?;
+            // Sections 9 + 10: per-channel GHA side data then the per-wave payload
+            // loop (native 47349..47568), gated on `arena_root[0] != 0` (the same
+            // native `if (*piVar22 != 0)` gate). The idam gate is `arena_root[1] == 0`.
+            if arena_flag0 != 0 {
+                let arena_flag1 = cfg_source.arena_u32(1)?;
+                for obj in group.objects.iter().take(nblk) {
+                    pack_gha_channel(writer, group, obj, arena_flag1)?;
+                }
             }
         }
 
@@ -1712,6 +1717,163 @@ fn idloc_rows(rows: &GainRows) -> Vec<IdlocRow<'_>> {
         .zip(rows.levels_i32.iter())
         .map(|(locations, levels)| IdlocRow { locations, levels })
         .collect()
+}
+
+fn pack_gha_syntax(
+    writer: &mut BitWriter<'_>,
+    syntax: &GhaSyntax,
+) -> Result<(), FrameAssemblyError> {
+    let GhaSyntax::Present(payload) = syntax else {
+        writer.write_bits(0, 1)?;
+        return Ok(());
+    };
+
+    writer.write_bits(1, 1)?;
+    writer.write_bits(payload.header_mode, 1)?;
+    let (code, len) = G_A_GH_NBANDS_PACK
+        .get(payload.band_count.wrapping_sub(1))
+        .copied()
+        .ok_or(FrameAssemblyError::MissingNbandsSymbol {
+            nbands: payload.band_count,
+        })?;
+    writer.write_bits(u32::from(code), len)?;
+    if let Some(flag_groups) = &payload.stereo_flags {
+        for flags in flag_groups {
+            pack_gated_flags(writer, flags)?;
+        }
+    }
+
+    for channel in &payload.channels {
+        let active = channel
+            .records
+            .iter()
+            .map(|record| record.active)
+            .collect::<Vec<_>>();
+        let idloc_rows = channel
+            .records
+            .iter()
+            .map(|record| GhIdlocRow {
+                active: record.active,
+                first_flag: u32::from(record.first_location.is_some()),
+                first_location: record.first_location.unwrap_or(0),
+                second_flag: u32::from(record.second_location.is_some()),
+                second_location: record.second_location.unwrap_or(0),
+            })
+            .collect::<Vec<_>>();
+        if channel.channel_index == 1 {
+            writer.write_bits(channel.idloc_mode, 1)?;
+        }
+        if channel.idloc_mode == 0 {
+            pack_gh_idloc_0_at5(writer, &idloc_rows)?;
+        } else {
+            pack_gh_idloc_1_at5(writer)?;
+        }
+
+        let nwavs_rows = channel
+            .records
+            .iter()
+            .map(|record| GhNwavsRow {
+                active: record.active,
+                value: record.waves.len() as u32,
+            })
+            .collect::<Vec<_>>();
+        let prefix_bits = pmodebits(channel.channel_index);
+        if prefix_bits != 0 {
+            writer.write_bits(channel.nwavs.mode, prefix_bits)?;
+        }
+        match &channel.nwavs.encoding {
+            GhaNwavsEncodingSyntax::Raw => pack_gh_nwavs_0_at5(writer, &nwavs_rows)?,
+            GhaNwavsEncodingSyntax::Huffman => pack_gh_nwavs_1_at5(writer, &nwavs_rows)?,
+            GhaNwavsEncodingSyntax::Previous { counts } => {
+                pack_gh_nwavs_2_at5(writer, &nwavs_rows, counts)?
+            }
+            GhaNwavsEncodingSyntax::Empty => pack_gh_nwavs_3_at5(writer)?,
+        }
+
+        let freq_values = channel
+            .records
+            .iter()
+            .map(|record| {
+                record
+                    .waves
+                    .iter()
+                    .map(|wave| wave.freq)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let freq_rows = freq_values
+            .iter()
+            .zip(&active)
+            .map(|(values, active)| GhFreqRow {
+                active: *active,
+                values,
+            })
+            .collect::<Vec<_>>();
+        if channel.channel_index == 1 {
+            writer.write_bits(channel.freq.mode, 1)?;
+        }
+        match &channel.freq.encoding {
+            GhaFreqEncodingSyntax::Local { modes } => {
+                pack_gh_freq_0_at5(writer, &freq_rows, modes)?
+            }
+            GhaFreqEncodingSyntax::Previous { rows } => {
+                let previous = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                pack_gh_freq_1_at5(writer, &freq_rows, &previous)?;
+            }
+        }
+
+        let idsf_values = channel
+            .records
+            .iter()
+            .map(|record| {
+                record
+                    .waves
+                    .iter()
+                    .map(|wave| wave.idsf)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let idsf_rows = idsf_values
+            .iter()
+            .zip(&active)
+            .map(|(values, active)| GhIdsfRow {
+                active: *active,
+                values,
+            })
+            .collect::<Vec<_>>();
+        if prefix_bits != 0 {
+            writer.write_bits(channel.idsf.mode, prefix_bits)?;
+        }
+        match &channel.idsf.encoding {
+            GhaIdsfEncodingSyntax::Raw => {
+                pack_gh_idsf_0_at5(writer, payload.header_mode, &idsf_rows)?
+            }
+            GhaIdsfEncodingSyntax::Huffman => {
+                pack_gh_idsf_1_at5(writer, payload.header_mode, &idsf_rows)?
+            }
+            GhaIdsfEncodingSyntax::Previous { rows, indices } => {
+                let previous_rows = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let previous_indices = indices.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                pack_gh_idsf_2_at5(
+                    writer,
+                    payload.header_mode,
+                    &idsf_rows,
+                    &previous_rows,
+                    &previous_indices,
+                )?;
+            }
+            GhaIdsfEncodingSyntax::Empty => pack_gh_idsf_3_at5(writer)?,
+        }
+
+        for record in &channel.records {
+            if record.active {
+                for wave in &record.waves {
+                    writer.write_bits(wave.phase, 5)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Section 8: GHA header (native 47055..47348) from the shared arena_root.
