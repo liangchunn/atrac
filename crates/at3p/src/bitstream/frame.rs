@@ -396,9 +396,21 @@ fn pack_frame_at5_impl(
             })?;
 
         // Channel/block header (native 46158..46225).
-        let channel_mode = cfg_source.cfg_u32(0xa0)?;
-        let quant_header = cfg_source.cfg_u32(0xc4)?;
-        let header_flag = cfg_source.cfg_u32(0x118)?;
+        let (channel_mode, quant_header, header_flag) = match syntax_group {
+            Some(group) => {
+                let header = group.header();
+                (
+                    header.channel_mode,
+                    header.quant_header,
+                    u32::from(header.header_flag),
+                )
+            }
+            None => (
+                cfg_source.cfg_u32(0xa0)?,
+                cfg_source.cfg_u32(0xc4)?,
+                cfg_source.cfg_u32(0x118)?,
+            ),
+        };
         {
             writer.write_bits(channel_mode, 2)?;
             writer.write_bits(quant_header.wrapping_sub(1), 5)?;
@@ -406,11 +418,17 @@ fn pack_frame_at5_impl(
             Ok::<(), FrameAssemblyError>(())
         }?;
 
-        let nblk = group.nblk;
-        let quant_unit_count = cfg_source.cfg_u32(0xb0)? as usize;
-        let syntax_quant_unit_count = syntax_group
-            .map(|group| group.header().quant_unit_count)
-            .unwrap_or(quant_unit_count);
+        let (nblk, quant_unit_count, syntax_quant_unit_count) = match syntax_group {
+            Some(group) => (
+                group.channels().len(),
+                group.header().quant_unit_count,
+                group.header().quant_unit_count,
+            ),
+            None => {
+                let count = cfg_source.cfg_u32(0xb0)? as usize;
+                (group.nblk, count, count)
+            }
+        };
 
         // IDWL section (native 46226..46260).
         for (i, obj) in group.objects.iter().enumerate().take(nblk) {
@@ -578,7 +596,10 @@ fn pack_frame_at5_impl(
     // Frame tail (native 47651..47713): 2-bit marker `3`, byte align, then `0x01`
     // stuffing to `frame_bytes`.
     {
-        writer.write_frame_tail(state.frame_bytes * 8)?;
+        let frame_bytes = syntax
+            .map(FrameSyntax::frame_bytes)
+            .unwrap_or(state.frame_bytes);
+        writer.write_frame_tail(frame_bytes * 8)?;
         Ok::<(), FrameAssemblyError>(())
     }?;
 

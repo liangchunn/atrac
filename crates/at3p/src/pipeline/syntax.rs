@@ -246,6 +246,10 @@ pub enum FrameSyntaxError {
         group: usize,
         channels: usize,
     },
+    InvalidHeader {
+        group: usize,
+        detail: &'static str,
+    },
     InvalidQuantUnitCount {
         group: usize,
         count: usize,
@@ -687,6 +691,30 @@ impl FrameSyntax {
                 return Err(FrameSyntaxError::UnsupportedChannelCount {
                     group: group_index,
                     channels: syntax.channels.len(),
+                });
+            }
+            if syntax.header.channel_mode > 3 {
+                return Err(FrameSyntaxError::InvalidHeader {
+                    group: group_index,
+                    detail: "channel mode",
+                });
+            }
+            if !(1..=32).contains(&(syntax.header.quant_header as usize)) {
+                return Err(FrameSyntaxError::InvalidHeader {
+                    group: group_index,
+                    detail: "quant header",
+                });
+            }
+            if syntax.header.stereo_unit_count > MAX_QUANT_UNITS {
+                return Err(FrameSyntaxError::InvalidHeader {
+                    group: group_index,
+                    detail: "stereo-unit count",
+                });
+            }
+            if syntax.header.gainb_count > MAX_QUANT_UNITS {
+                return Err(FrameSyntaxError::InvalidHeader {
+                    group: group_index,
+                    detail: "gainB count",
                 });
             }
             if syntax.header.quant_unit_count > MAX_QUANT_UNITS {
