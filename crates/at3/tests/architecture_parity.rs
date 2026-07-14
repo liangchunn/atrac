@@ -1,7 +1,8 @@
 use std::io::{self, Write};
 
+use at3::Atrac3Profile;
 use at3::encoder::stream::{
-    Atrac3StreamConfig, Atrac3StreamEncoder, Atrac3StreamError, Atrac3WriteStage, PCM_BLOCK_FRAMES,
+    Atrac3StreamEncoder, Atrac3StreamError, Atrac3WriteStage, PCM_BLOCK_FRAMES,
 };
 
 const PROFILES: [(u32, u16); 5] = [(52, 1), (66, 1), (66, 2), (105, 2), (132, 2)];
@@ -18,15 +19,8 @@ fn generated_pcm(channels: usize, frames: usize) -> Vec<Vec<i16>> {
 
 fn encode(bitrate_kbps: u32, channels: u16, frames: usize) -> Vec<u8> {
     let pcm = generated_pcm(channels as usize, frames);
-    let mut encoder = Atrac3StreamEncoder::new(
-        Vec::new(),
-        Atrac3StreamConfig {
-            bitrate_kbps,
-            channels,
-        },
-        frames as u32,
-    )
-    .unwrap();
+    let profile = Atrac3Profile::new(bitrate_kbps, channels).unwrap();
+    let mut encoder = Atrac3StreamEncoder::new(Vec::new(), profile, frames as u32).unwrap();
     let mut offset = 0;
     while offset < frames {
         let end = usize::min(offset + PCM_BLOCK_FRAMES, frames);
@@ -95,27 +89,14 @@ impl Write for FailImmediately {
 
 #[test]
 fn empty_invalid_and_header_failure_errors_are_stable() {
-    let config = Atrac3StreamConfig {
-        bitrate_kbps: 132,
-        channels: 2,
-    };
+    let profile = Atrac3Profile::new(132, 2).unwrap();
     assert!(matches!(
-        Atrac3StreamEncoder::new(Vec::new(), config, 0),
+        Atrac3StreamEncoder::new(Vec::new(), profile, 0),
         Err(Atrac3StreamError::EmptyInput)
     ));
+    assert!(Atrac3Profile::new(52, 2).is_err());
     assert!(matches!(
-        Atrac3StreamEncoder::new(
-            Vec::new(),
-            Atrac3StreamConfig {
-                bitrate_kbps: 52,
-                channels: 2,
-            },
-            2048,
-        ),
-        Err(Atrac3StreamError::UnsupportedConfig { .. })
-    ));
-    assert!(matches!(
-        Atrac3StreamEncoder::new(FailImmediately, config, 2048),
+        Atrac3StreamEncoder::new(FailImmediately, profile, 2048),
         Err(Atrac3StreamError::Io {
             stage: Atrac3WriteStage::Header,
             ..

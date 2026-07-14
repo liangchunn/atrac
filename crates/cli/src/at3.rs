@@ -1,9 +1,8 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
-use at3::encoder::stream::{
-    Atrac3StreamConfig, Atrac3StreamEncoder, EncodePhase, EncodeProgress, PCM_BLOCK_FRAMES,
-};
+use at3::Atrac3Profile;
+use at3::encoder::stream::{Atrac3StreamEncoder, EncodePhase, EncodeProgress, PCM_BLOCK_FRAMES};
 use hound::SampleFormat;
 
 use crate::args::EncodeArgs;
@@ -89,22 +88,11 @@ fn encode(bitrate: u32, input: &Path, output: &Path) -> anyhow::Result<()> {
         metadata.sample_frames > 0,
         "not enough samples: need at least one sample, got {total_pcm}"
     );
-    anyhow::ensure!(
-        matches!((spec.channels, bitrate), (1, 52 | 66) | (2, 66 | 105 | 132)),
-        "unsupported ATRAC3 bitrate/channel combination: {bitrate} kbps, {} channel(s); supported mono rates are 52 and 66 kbps, supported stereo rates are 66, 105, and 132 kbps",
-        spec.channels
-    );
+    let profile = Atrac3Profile::new(bitrate, spec.channels)?;
 
     eprintln!("encoding {total_pcm} samples at {bitrate} kbps...");
     let (file, pending) = create_pending_output(output, "at3").map_err(anyhow::Error::msg)?;
-    let mut encoder = Atrac3StreamEncoder::new(
-        file,
-        Atrac3StreamConfig {
-            bitrate_kbps: bitrate,
-            channels: spec.channels,
-        },
-        metadata.sample_frames,
-    )?;
+    let mut encoder = Atrac3StreamEncoder::new(file, profile, metadata.sample_frames)?;
     let mut progress = CliProgress::new();
     let mut blocks: Vec<Vec<i16>> = (0..spec.channels)
         .map(|_| Vec::with_capacity(PCM_BLOCK_FRAMES))

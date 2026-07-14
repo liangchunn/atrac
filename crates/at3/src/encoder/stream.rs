@@ -2,20 +2,13 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Write};
 
+use crate::config::{Atrac3Profile, EncoderStrategy, UnsupportedProfile};
 use crate::dsp::encode::Atrac3Encoder;
 
 pub const PCM_BLOCK_FRAMES: usize = 1024;
 const SAMPLE_RATE: u32 = 44_100;
 const ENCODER_DELAY: usize = 69;
-const CLEAN_PRIMING_SOUND_UNITS: usize = 2;
-const DBA_PRIMING_SOUND_UNITS: usize = 1;
 const HEADER_BYTES: u64 = 80;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Atrac3StreamConfig {
-    pub bitrate_kbps: u32,
-    pub channels: u16,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Atrac3WriteStage {
@@ -48,10 +41,7 @@ pub struct EncodeProgress {
 
 #[derive(Debug)]
 pub enum Atrac3StreamError {
-    UnsupportedConfig {
-        bitrate_kbps: u32,
-        channels: u16,
-    },
+    UnsupportedProfile(UnsupportedProfile),
     EmptyInput,
     RiffSizeOverflow {
         payload_bytes: u64,
@@ -93,13 +83,7 @@ pub enum Atrac3StreamError {
 impl fmt::Display for Atrac3StreamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedConfig {
-                bitrate_kbps,
-                channels,
-            } => write!(
-                f,
-                "unsupported ATRAC3 bitrate/channel combination: {bitrate_kbps} kbps, {channels} channel(s); supported mono rates are 52 and 66 kbps, supported stereo rates are 66, 105, and 132 kbps"
-            ),
+            Self::UnsupportedProfile(error) => error.fmt(f),
             Self::EmptyInput => write!(f, "not enough samples: need at least one sample"),
             Self::RiffSizeOverflow { payload_bytes } => write!(
                 f,
@@ -148,9 +132,16 @@ impl fmt::Display for Atrac3StreamError {
 impl std::error::Error for Atrac3StreamError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::UnsupportedProfile(source) => Some(source),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+impl From<UnsupportedProfile> for Atrac3StreamError {
+    fn from(value: UnsupportedProfile) -> Self {
+        Self::UnsupportedProfile(value)
     }
 }
 
@@ -162,62 +153,11 @@ pub struct Atrac3StreamSummary {
     pub file_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ResolvedConfig {
-    frame_size: usize,
-    encoder_bitrate: u32,
-    joint_stereo: bool,
-    output_channels: u16,
-}
-
-impl ResolvedConfig {
-    fn resolve(config: Atrac3StreamConfig) -> Result<Self, Atrac3StreamError> {
-        match (config.channels, config.bitrate_kbps) {
-            (2, 132) => Ok(Self {
-                frame_size: 384,
-                encoder_bitrate: 132,
-                joint_stereo: false,
-                output_channels: 2,
-            }),
-            (2, 105) => Ok(Self {
-                frame_size: 304,
-                encoder_bitrate: 105,
-                joint_stereo: false,
-                output_channels: 2,
-            }),
-            (2, 66) => Ok(Self {
-                frame_size: 192,
-                encoder_bitrate: 66,
-                joint_stereo: true,
-                output_channels: 2,
-            }),
-            (1, 66) => Ok(Self {
-                frame_size: 192,
-                encoder_bitrate: 132,
-                joint_stereo: false,
-                output_channels: 1,
-            }),
-            (1, 52) => Ok(Self {
-                frame_size: 152,
-                encoder_bitrate: 105,
-                joint_stereo: false,
-                output_channels: 1,
-            }),
-            _ => Err(Atrac3StreamError::UnsupportedConfig {
-                bitrate_kbps: config.bitrate_kbps,
-                channels: config.channels,
-            }),
-        }
-    }
-}
-
 pub struct Atrac3StreamEncoder<W: Write> {
     writer: W,
     encoder: Atrac3Encoder,
-    config: Atrac3StreamConfig,
-    resolved: ResolvedConfig,
+    profile: Atrac3Profile,
     sample_frames: u32,
-    dba_priming: bool,
     sound_units: usize,
     next_sound_unit: usize,
     received_frames: u32,
@@ -234,19 +174,17 @@ pub struct Atrac3StreamEncoder<W: Write> {
 impl<W: Write> Atrac3StreamEncoder<W> {
     pub fn new(
         mut writer: W,
-        config: Atrac3StreamConfig,
+        profile: Atrac3Profile,
         sample_frames: u32,
     ) -> Result<Self, Atrac3StreamError> {
         if sample_frames == 0 {
             return Err(Atrac3StreamError::EmptyInput);
         }
-        let resolved = ResolvedConfig::resolve(config)?;
-        let encoder = Atrac3Encoder::new(resolved.encoder_bitrate, resolved.joint_stereo);
-        let dba_priming = encoder.enc_algo() == 0;
-        let sound_units = sound_units_to_encode(sample_frames as usize, dba_priming);
-        let payload_frames = sound_units - priming_sound_units(dba_priming);
+        let encoder = Atrac3Encoder::new(profile);
+        let sound_units = sound_units_to_encode(sample_frames as usize, profile);
+        let payload_frames = sound_units - profile.priming_sound_units();
         let expected_payload_bytes = (payload_frames as u64)
-            .checked_mul(resolved.frame_size as u64)
+            .checked_mul(profile.frame_bytes() as u64)
             .ok_or(Atrac3StreamError::RiffSizeOverflow {
                 payload_bytes: u64::MAX,
             })?;
@@ -258,22 +196,12 @@ impl<W: Write> Atrac3StreamEncoder<W> {
             });
         }
 
-        let internal_frame_size = match resolved.encoder_bitrate {
-            132 => 384,
-            105 => 304,
-            66 => 192,
-            _ => unreachable!("resolved ATRAC3 encoder bitrate"),
-        };
-        let silence_frame = build_silence_frame(
-            resolved.encoder_bitrate,
-            resolved.joint_stereo,
-            internal_frame_size,
-        )?;
+        let silence_frame = build_silence_frame(profile)?;
         let header = build_header(
             sample_frames,
-            resolved.frame_size as u32,
-            resolved.output_channels,
-            resolved.joint_stereo,
+            profile.frame_bytes() as u32,
+            profile.channels(),
+            profile.is_joint_stereo(),
             expected_payload_bytes as u32,
         );
         writer
@@ -286,15 +214,13 @@ impl<W: Write> Atrac3StreamEncoder<W> {
         Ok(Self {
             writer,
             encoder,
-            config,
-            resolved,
+            profile,
             sample_frames,
-            dba_priming,
             sound_units,
             next_sound_unit: 0,
             received_frames: 0,
             buffer_start: 0,
-            pcm: (0..config.channels)
+            pcm: (0..profile.channels())
                 .map(|_| VecDeque::with_capacity(PCM_BLOCK_FRAMES * 2))
                 .collect(),
             out_buf: vec![0; 48 * 1024],
@@ -319,9 +245,9 @@ impl<W: Write> Atrac3StreamEncoder<W> {
     where
         F: FnMut(EncodeProgress),
     {
-        if channels.len() != self.config.channels as usize {
+        if channels.len() != self.profile.channels() as usize {
             return Err(Atrac3StreamError::WrongChannelCount {
-                expected: self.config.channels as usize,
+                expected: self.profile.channels() as usize,
                 actual: channels.len(),
             });
         }
@@ -407,7 +333,7 @@ impl<W: Write> Atrac3StreamEncoder<W> {
         while self.next_sound_unit < self.sound_units {
             let base = input_base_frame_for_sound_unit(
                 self.next_sound_unit,
-                self.dba_priming,
+                self.profile.strategy() == EncoderStrategy::Dba,
                 ENCODER_DELAY,
             );
             if !finalizing && base + PCM_BLOCK_FRAMES as isize > self.received_frames as isize {
@@ -426,7 +352,7 @@ impl<W: Write> Atrac3StreamEncoder<W> {
     }
 
     fn progress(&self, phase: EncodePhase) -> EncodeProgress {
-        let priming = priming_sound_units(self.dba_priming);
+        let priming = self.profile.priming_sound_units();
         EncodeProgress {
             phase,
             completed_steps: self.next_sound_unit as u32,
@@ -438,13 +364,13 @@ impl<W: Write> Atrac3StreamEncoder<W> {
 
     fn encode_sound_unit(&mut self, input_base_frame: isize) -> Result<(), Atrac3StreamError> {
         let sound_unit = self.next_sound_unit;
-        let write_frame = write_sound_unit(sound_unit, self.dba_priming);
+        let write_frame = write_sound_unit(sound_unit, self.profile);
         let mut pcm0 = [0.0f32; PCM_BLOCK_FRAMES];
         let mut pcm1 = [0.0f32; PCM_BLOCK_FRAMES];
         for index in 0..PCM_BLOCK_FRAMES {
             let source_index = input_base_frame + index as isize;
             let left = self.sample_at(0, source_index);
-            let right = if self.config.channels == 1 {
+            let right = if self.profile.channels() == 1 {
                 left
             } else {
                 self.sample_at(1, source_index)
@@ -466,10 +392,10 @@ impl<W: Write> Atrac3StreamEncoder<W> {
 
         let bytes = if byte_count.is_none_or(|count| count > self.silence_frame.len()) {
             self.fallback_frames += 1;
-            &self.silence_frame[..self.resolved.frame_size]
+            &self.silence_frame[..self.profile.frame_bytes()]
         } else {
             self.encoded_frames += 1;
-            &self.out_buf[..self.resolved.frame_size]
+            &self.out_buf[..self.profile.frame_bytes()]
         };
         self.writer
             .write_all(bytes)
@@ -496,8 +422,12 @@ impl<W: Write> Atrac3StreamEncoder<W> {
 
     fn discard_consumed_pcm(&mut self) {
         let next_required = if self.next_sound_unit < self.sound_units {
-            input_base_frame_for_sound_unit(self.next_sound_unit, self.dba_priming, ENCODER_DELAY)
-                .max(0) as u32
+            input_base_frame_for_sound_unit(
+                self.next_sound_unit,
+                self.profile.strategy() == EncoderStrategy::Dba,
+                ENCODER_DELAY,
+            )
+            .max(0) as u32
         } else {
             self.received_frames
         };
@@ -517,19 +447,15 @@ impl<W: Write> Atrac3StreamEncoder<W> {
     }
 }
 
-fn build_silence_frame(
-    encoder_bitrate: u32,
-    joint_stereo: bool,
-    frame_size: usize,
-) -> Result<Vec<u8>, Atrac3StreamError> {
-    let mut encoder = Atrac3Encoder::new(encoder_bitrate, joint_stereo);
+fn build_silence_frame(profile: Atrac3Profile) -> Result<Vec<u8>, Atrac3StreamError> {
+    let mut encoder = Atrac3Encoder::new(profile);
     let silence0 = [0.0f32; PCM_BLOCK_FRAMES];
     let silence1 = [0.0f32; PCM_BLOCK_FRAMES];
     let refs = [&silence0, &silence1];
-    let mut frame = vec![0; frame_size];
+    let mut frame = vec![0; profile.internal_frame_bytes()];
     let bit_count = encoder.encode_frame(&refs, &mut frame);
     let byte_count = ((bit_count.max(0) as u32 + 7) >> 3) as usize;
-    if bit_count < 0 || byte_count > frame_size {
+    if bit_count < 0 || byte_count > profile.internal_frame_bytes() {
         return Err(Atrac3StreamError::SilenceFrame);
     }
     Ok(frame)
@@ -582,24 +508,16 @@ fn build_header(
     header
 }
 
-fn sound_units_to_encode(sample_frames: usize, dba_priming: bool) -> usize {
-    if dba_priming {
+fn sound_units_to_encode(sample_frames: usize, profile: Atrac3Profile) -> usize {
+    if profile.strategy() == EncoderStrategy::Dba {
         (sample_frames + PCM_BLOCK_FRAMES - ENCODER_DELAY) / PCM_BLOCK_FRAMES + 2
     } else {
-        sample_frames / PCM_BLOCK_FRAMES + 2 + CLEAN_PRIMING_SOUND_UNITS
+        sample_frames / PCM_BLOCK_FRAMES + 2 + profile.priming_sound_units()
     }
 }
 
-fn priming_sound_units(dba_priming: bool) -> usize {
-    if dba_priming {
-        DBA_PRIMING_SOUND_UNITS
-    } else {
-        CLEAN_PRIMING_SOUND_UNITS
-    }
-}
-
-fn write_sound_unit(sound_unit: usize, dba_priming: bool) -> bool {
-    sound_unit >= priming_sound_units(dba_priming)
+fn write_sound_unit(sound_unit: usize, profile: Atrac3Profile) -> bool {
+    sound_unit >= profile.priming_sound_units()
 }
 
 fn input_base_frame_for_sound_unit(
@@ -652,23 +570,12 @@ mod tests {
             .collect()
     }
 
-    fn legacy_buffered_encode(config: Atrac3StreamConfig, pcm: &[Vec<i16>]) -> Vec<u8> {
-        let resolved = ResolvedConfig::resolve(config).unwrap();
-        let mut encoder = Atrac3Encoder::new(resolved.encoder_bitrate, resolved.joint_stereo);
-        let dba_priming = encoder.enc_algo() == 0;
-        let sound_units = sound_units_to_encode(pcm[0].len(), dba_priming);
-        let internal_frame_size = match resolved.encoder_bitrate {
-            132 => 384,
-            105 => 304,
-            66 => 192,
-            _ => unreachable!(),
-        };
-        let silence = build_silence_frame(
-            resolved.encoder_bitrate,
-            resolved.joint_stereo,
-            internal_frame_size,
-        )
-        .unwrap();
+    fn legacy_buffered_encode(profile: Atrac3Profile, pcm: &[Vec<i16>]) -> Vec<u8> {
+        let mut encoder = Atrac3Encoder::new(profile);
+        let dba_priming = profile.strategy() == EncoderStrategy::Dba;
+        let sound_units = sound_units_to_encode(pcm[0].len(), profile);
+        let internal_frame_size = profile.internal_frame_bytes();
+        let silence = build_silence_frame(profile).unwrap();
         let mut out_buf = vec![0; 48 * 1024];
         let mut payload = Vec::new();
         for sound_unit in 0..sound_units {
@@ -679,7 +586,7 @@ mod tests {
                 let index = base + frame as isize;
                 if index >= 0 && (index as usize) < pcm[0].len() {
                     left[frame] = f32::from(pcm[0][index as usize]);
-                    right[frame] = if config.channels == 1 {
+                    right[frame] = if profile.channels() == 1 {
                         left[frame]
                     } else {
                         f32::from(pcm[1][index as usize])
@@ -687,33 +594,33 @@ mod tests {
                 }
             }
             let bit_count = encoder.encode_frame(&[&left, &right], &mut out_buf);
-            if write_sound_unit(sound_unit, dba_priming) {
+            if write_sound_unit(sound_unit, profile) {
                 let byte_count = ((bit_count.max(0) as u32 + 7) >> 3) as usize;
                 if bit_count < 0 || byte_count > internal_frame_size {
-                    payload.extend_from_slice(&silence[..resolved.frame_size]);
+                    payload.extend_from_slice(&silence[..profile.frame_bytes()]);
                 } else {
-                    payload.extend_from_slice(&out_buf[..resolved.frame_size]);
+                    payload.extend_from_slice(&out_buf[..profile.frame_bytes()]);
                 }
             }
         }
         let mut output = build_header(
             pcm[0].len() as u32,
-            resolved.frame_size as u32,
-            resolved.output_channels,
-            resolved.joint_stereo,
+            profile.frame_bytes() as u32,
+            profile.channels(),
+            profile.is_joint_stereo(),
             payload.len() as u32,
         );
         output.extend_from_slice(&payload);
         output
     }
 
-    fn streaming_encode(config: Atrac3StreamConfig, pcm: &[Vec<i16>]) -> Vec<u8> {
+    fn streaming_encode(profile: Atrac3Profile, pcm: &[Vec<i16>]) -> Vec<u8> {
         let mut encoder =
-            Atrac3StreamEncoder::new(Vec::new(), config, pcm[0].len() as u32).unwrap();
+            Atrac3StreamEncoder::new(Vec::new(), profile, pcm[0].len() as u32).unwrap();
         let mut offset = 0;
         while offset < pcm[0].len() {
             let end = usize::min(offset + PCM_BLOCK_FRAMES, pcm[0].len());
-            match config.channels {
+            match profile.channels() {
                 1 => encoder.push_pcm(&[&pcm[0][offset..end]]).unwrap(),
                 2 => encoder
                     .push_pcm(&[&pcm[0][offset..end], &pcm[1][offset..end]])
@@ -727,10 +634,12 @@ mod tests {
 
     #[test]
     fn schedule_matches_existing_clean_and_dba_counts() {
-        assert_eq!(sound_units_to_encode(8192, false), 12);
-        assert_eq!(sound_units_to_encode(580_078, false), 570);
-        assert_eq!(sound_units_to_encode(8192, true), 10);
-        assert_eq!(sound_units_to_encode(580_078, true), 569);
+        let clean = Atrac3Profile::new(132, 2).unwrap();
+        let dba = Atrac3Profile::new(66, 2).unwrap();
+        assert_eq!(sound_units_to_encode(8192, clean), 12);
+        assert_eq!(sound_units_to_encode(580_078, clean), 570);
+        assert_eq!(sound_units_to_encode(8192, dba), 10);
+        assert_eq!(sound_units_to_encode(580_078, dba), 569);
         assert_eq!(
             input_base_frame_for_sound_unit(0, false, ENCODER_DELAY),
             -955
@@ -740,11 +649,8 @@ mod tests {
 
     #[test]
     fn rolling_pcm_storage_stays_bounded() {
-        let config = Atrac3StreamConfig {
-            bitrate_kbps: 132,
-            channels: 2,
-        };
-        let mut encoder = Atrac3StreamEncoder::new(Vec::new(), config, 8193).unwrap();
+        let profile = Atrac3Profile::new(132, 2).unwrap();
+        let mut encoder = Atrac3StreamEncoder::new(Vec::new(), profile, 8193).unwrap();
         let block = vec![0i16; PCM_BLOCK_FRAMES];
         for _ in 0..8 {
             encoder.push_pcm(&[&block, &block]).unwrap();
@@ -758,12 +664,9 @@ mod tests {
 
     #[test]
     fn progress_covers_encoding_priming_and_flushing_tail() {
-        let config = Atrac3StreamConfig {
-            bitrate_kbps: 132,
-            channels: 2,
-        };
+        let profile = Atrac3Profile::new(132, 2).unwrap();
         let pcm = generated_pcm(2, 1024);
-        let mut encoder = Atrac3StreamEncoder::new(Vec::new(), config, 1024).unwrap();
+        let mut encoder = Atrac3StreamEncoder::new(Vec::new(), profile, 1024).unwrap();
         let mut progress = Vec::new();
         encoder
             .push_pcm_with_progress(&[&pcm[0], &pcm[1]], |update| progress.push(update))
@@ -796,12 +699,9 @@ mod tests {
 
     #[test]
     fn dba_progress_can_begin_after_the_first_pcm_chunk() {
-        let config = Atrac3StreamConfig {
-            bitrate_kbps: 66,
-            channels: 2,
-        };
+        let profile = Atrac3Profile::new(66, 2).unwrap();
         let pcm = generated_pcm(2, 2048);
-        let mut encoder = Atrac3StreamEncoder::new(Vec::new(), config, 2048).unwrap();
+        let mut encoder = Atrac3StreamEncoder::new(Vec::new(), profile, 2048).unwrap();
         let mut progress = Vec::new();
         encoder
             .push_pcm_with_progress(&[&pcm[0][..1024], &pcm[1][..1024]], |update| {
@@ -838,14 +738,11 @@ mod tests {
         cases.push((52, 1, 1025));
 
         for (bitrate_kbps, channels, frames) in cases {
-            let config = Atrac3StreamConfig {
-                bitrate_kbps,
-                channels,
-            };
+            let profile = Atrac3Profile::new(bitrate_kbps, channels).unwrap();
             let pcm = generated_pcm(channels, frames);
             assert_eq!(
-                streaming_encode(config, &pcm),
-                legacy_buffered_encode(config, &pcm),
+                streaming_encode(profile, &pcm),
+                legacy_buffered_encode(profile, &pcm),
                 "{bitrate_kbps} kbps, {channels} channel(s), {frames} frames"
             );
         }
@@ -857,11 +754,8 @@ mod tests {
             limit: HEADER_BYTES as usize,
             written: 0,
         };
-        let config = Atrac3StreamConfig {
-            bitrate_kbps: 132,
-            channels: 2,
-        };
-        let mut encoder = Atrac3StreamEncoder::new(writer, config, 1024).unwrap();
+        let profile = Atrac3Profile::new(132, 2).unwrap();
+        let mut encoder = Atrac3StreamEncoder::new(writer, profile, 1024).unwrap();
         let pcm = generated_pcm(2, 1024);
         encoder.push_pcm(&[&pcm[0], &pcm[1]]).unwrap();
         assert!(matches!(

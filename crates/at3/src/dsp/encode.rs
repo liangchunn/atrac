@@ -7,6 +7,7 @@
 //! Half 1 (deterministic pipeline): implemented and validated.
 //! Half 2 (iterative bit-allocation convergence loop): in progress (Phase 3–4).
 
+use crate::config::{Atrac3Profile, EncoderStrategy};
 use crate::dsp::gain::GainInfo;
 use crate::dsp::pack::ToneComponentNbits;
 use crate::dsp::pack::ToneGroupNbits;
@@ -1413,40 +1414,12 @@ enum EncAlgo {
 }
 
 impl EncAlgo {
-    fn from_sony_params(bitrate_kbps: u32, channels: u16) -> Self {
-        match (bitrate_kbps, channels) {
-            (52, 1) | (66, 2) | (105, 2) => Self::Dba,
-            (66, 1) | (132, 2) => Self::Clean,
-            _ => Self::Clean,
+    fn from_profile(profile: Atrac3Profile) -> Self {
+        match profile.strategy() {
+            EncoderStrategy::Dba => Self::Dba,
+            EncoderStrategy::Clean => Self::Clean,
         }
     }
-
-    fn sony_value(self) -> i32 {
-        match self {
-            Self::Dba => 0,
-            Self::Clean => 1,
-        }
-    }
-}
-
-fn sony_frame_bytes(bitrate_kbps: u32, channels: u16) -> usize {
-    match (bitrate_kbps, channels) {
-        (52, 1) => 304,
-        (66, 1) => 384,
-        (66, 2) => 192,
-        (105, 2) => 304,
-        (132, 2) => 384,
-        _ => match bitrate_kbps {
-            132 => 384,
-            105 => 304,
-            66 | 52 => 192,
-            _ => 384,
-        },
-    }
-}
-
-fn uses_internal_stereo_frame(bitrate_kbps: u32, channels: u16) -> bool {
-    matches!((bitrate_kbps, channels), (52, 1) | (66, 1))
 }
 
 fn has_gain_side_info(current: &[GainInfo; 4], previous: &[GainInfo; 4]) -> bool {
@@ -1456,8 +1429,8 @@ fn has_gain_side_info(current: &[GainInfo; 4], previous: &[GainInfo; 4]) -> bool
         .any(|gain| gain.count != 0)
 }
 
-fn dba_frame_config(bitrate_kbps: u32, channels: u16) -> Option<crate::dsp::dba::DbaFrameConfig> {
-    match (bitrate_kbps, channels) {
+fn dba_frame_config(profile: Atrac3Profile) -> Option<crate::dsp::dba::DbaFrameConfig> {
+    match (profile.bitrate_kbps(), profile.channels()) {
         (52, 1) | (105, 2) => Some(crate::dsp::dba::DbaFrameConfig::sony_105_stereo()),
         (66, 2) => Some(crate::dsp::dba::DbaFrameConfig::sony_66_stereo()),
         _ => None,
@@ -1465,37 +1438,33 @@ fn dba_frame_config(bitrate_kbps: u32, channels: u16) -> Option<crate::dsp::dba:
 }
 
 impl Atrac3Encoder {
-    /// Creates a new encoder for the given bitrate (kbps) and joint-stereo mode.
+    /// Creates a new frame encoder for a validated ATRAC3 profile.
     ///
     /// Initialises all per-channel DSP and encoder state with defaults.
     /// The bit budget per channel is derived from the ATRAC3 frame size for the
     /// given bitrate: budget = (bitrate * 1024 / sample_rate) * 8 bits / 2 channels.
     /// For 132 kbps at 44.1 kHz: 132000 * 1024 / 44100 = ~3066 bits/frame,
     /// divided by 2 channels ≈ 1533, rounded to 1536 by the binary's overheads.
-    pub fn new(bitrate_kbps: u32, joint_stereo: bool) -> Self {
-        let channels = if bitrate_kbps == 52 || (bitrate_kbps == 66 && !joint_stereo) {
-            1
-        } else {
-            2
-        };
-        Self::new_with_channels(bitrate_kbps, channels)
-    }
-
-    pub fn new_with_channels(bitrate_kbps: u32, channels: u16) -> Self {
-        let enc_algo = EncAlgo::from_sony_params(bitrate_kbps, channels);
-        let frame_bytes = sony_frame_bytes(bitrate_kbps, channels);
-        let joint_stereo = bitrate_kbps == 66 && channels == 2;
+    pub fn new(profile: Atrac3Profile) -> Self {
+        let enc_algo = EncAlgo::from_profile(profile);
+        let frame_bytes = profile.internal_frame_bytes();
+        debug_assert_eq!(
+            frame_bytes,
+            match profile.encoder_bitrate_kbps() {
+                66 => 192,
+                105 => 304,
+                132 => 384,
+                _ => unreachable!("validated ATRAC3 internal bitrate"),
+            }
+        );
+        let joint_stereo = profile.is_joint_stereo();
         let channel_bytes: [usize; 2] = if joint_stereo {
             [144, 48]
-        } else if enc_algo == EncAlgo::Dba || uses_internal_stereo_frame(bitrate_kbps, channels) {
-            [frame_bytes / 2, frame_bytes / 2]
-        } else if channels == 1 {
-            [frame_bytes, 0]
         } else {
             [frame_bytes / 2, frame_bytes / 2]
         };
         let dba_frame_encoder =
-            dba_frame_config(bitrate_kbps, channels).map(crate::dsp::dba::DbaFrameEncoder::new);
+            dba_frame_config(profile).map(crate::dsp::dba::DbaFrameEncoder::new);
         let channel_bfu_counts: [i32; 2] = [29, 29];
         let tone_huff = HuffTableSet::build_tone();
         let spec_huff = HuffTableSet::build_spec();
@@ -1540,10 +1509,6 @@ impl Atrac3Encoder {
             enc_algo,
             dba_frame_encoder,
         }
-    }
-
-    pub fn enc_algo(&self) -> i32 {
-        self.enc_algo.sony_value()
     }
 
     fn companion_spectra(
