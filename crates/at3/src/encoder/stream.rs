@@ -23,6 +23,29 @@ pub enum Atrac3WriteStage {
     Payload,
 }
 
+/// The stream phase responsible for an ATRAC3 encode progress update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodePhase {
+    /// Work completed while PCM was being supplied to the stream.
+    Encoding,
+    /// Tail work completed after all PCM had been supplied.
+    Flushing,
+}
+
+/// Progress after one successfully encoded ATRAC3 sound unit.
+///
+/// `completed_steps / total_steps` includes priming sound units that do not
+/// produce output. `completed_output_frames / total_output_frames` separately
+/// reports the number of payload frames written to the output stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeProgress {
+    pub phase: EncodePhase,
+    pub completed_steps: u32,
+    pub total_steps: u32,
+    pub completed_output_frames: u32,
+    pub total_output_frames: u32,
+}
+
 #[derive(Debug)]
 pub enum Atrac3StreamError {
     UnsupportedConfig {
@@ -284,6 +307,18 @@ impl<W: Write> Atrac3StreamEncoder<W> {
     }
 
     pub fn push_pcm(&mut self, channels: &[&[i16]]) -> Result<(), Atrac3StreamError> {
+        self.push_pcm_with_progress(channels, |_| {})
+    }
+
+    /// Supply one PCM chunk and report progress after every sound unit encoded.
+    pub fn push_pcm_with_progress<F>(
+        &mut self,
+        channels: &[&[i16]],
+        mut on_progress: F,
+    ) -> Result<(), Atrac3StreamError>
+    where
+        F: FnMut(EncodeProgress),
+    {
         if channels.len() != self.config.channels as usize {
             return Err(Atrac3StreamError::WrongChannelCount {
                 expected: self.config.channels as usize,
@@ -318,17 +353,28 @@ impl<W: Write> Atrac3StreamEncoder<W> {
             buffer.extend(channel.iter().copied());
         }
         self.received_frames += actual as u32;
-        self.process_ready(false)
+        self.process_ready(false, &mut on_progress)
     }
 
-    pub fn finish(mut self) -> Result<(W, Atrac3StreamSummary), Atrac3StreamError> {
+    pub fn finish(self) -> Result<(W, Atrac3StreamSummary), Atrac3StreamError> {
+        self.finish_with_progress(|_| {})
+    }
+
+    /// Finish the stream and report progress after every tail sound unit.
+    pub fn finish_with_progress<F>(
+        mut self,
+        mut on_progress: F,
+    ) -> Result<(W, Atrac3StreamSummary), Atrac3StreamError>
+    where
+        F: FnMut(EncodeProgress),
+    {
         if self.received_frames != self.sample_frames {
             return Err(Atrac3StreamError::IncompleteInput {
                 expected: self.sample_frames,
                 actual: self.received_frames,
             });
         }
-        self.process_ready(true)?;
+        self.process_ready(true, &mut on_progress)?;
         if self.next_sound_unit != self.sound_units {
             return Err(Atrac3StreamError::IncompleteSchedule {
                 expected_sound_units: self.sound_units,
@@ -350,7 +396,14 @@ impl<W: Write> Atrac3StreamEncoder<W> {
         Ok((self.writer, summary))
     }
 
-    fn process_ready(&mut self, finalizing: bool) -> Result<(), Atrac3StreamError> {
+    fn process_ready<F>(
+        &mut self,
+        finalizing: bool,
+        on_progress: &mut F,
+    ) -> Result<(), Atrac3StreamError>
+    where
+        F: FnMut(EncodeProgress),
+    {
         while self.next_sound_unit < self.sound_units {
             let base = input_base_frame_for_sound_unit(
                 self.next_sound_unit,
@@ -362,9 +415,25 @@ impl<W: Write> Atrac3StreamEncoder<W> {
             }
             self.encode_sound_unit(base)?;
             self.next_sound_unit += 1;
+            on_progress(self.progress(if finalizing {
+                EncodePhase::Flushing
+            } else {
+                EncodePhase::Encoding
+            }));
             self.discard_consumed_pcm();
         }
         Ok(())
+    }
+
+    fn progress(&self, phase: EncodePhase) -> EncodeProgress {
+        let priming = priming_sound_units(self.dba_priming);
+        EncodeProgress {
+            phase,
+            completed_steps: self.next_sound_unit as u32,
+            total_steps: self.sound_units as u32,
+            completed_output_frames: self.next_sound_unit.saturating_sub(priming) as u32,
+            total_output_frames: self.sound_units.saturating_sub(priming) as u32,
+        }
     }
 
     fn encode_sound_unit(&mut self, input_base_frame: isize) -> Result<(), Atrac3StreamError> {
@@ -685,6 +754,77 @@ mod tests {
         encoder.push_pcm(&[&tail, &tail]).unwrap();
         assert!(encoder.buffered_frames() <= PCM_BLOCK_FRAMES * 2);
         encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn progress_covers_encoding_priming_and_flushing_tail() {
+        let config = Atrac3StreamConfig {
+            bitrate_kbps: 132,
+            channels: 2,
+        };
+        let pcm = generated_pcm(2, 1024);
+        let mut encoder = Atrac3StreamEncoder::new(Vec::new(), config, 1024).unwrap();
+        let mut progress = Vec::new();
+        encoder
+            .push_pcm_with_progress(&[&pcm[0], &pcm[1]], |update| progress.push(update))
+            .unwrap();
+        encoder
+            .finish_with_progress(|update| progress.push(update))
+            .unwrap();
+
+        assert_eq!(progress.len(), 5);
+        assert_eq!(progress[0].phase, EncodePhase::Encoding);
+        assert_eq!(progress[0].completed_steps, 1);
+        assert_eq!(progress[0].completed_output_frames, 0);
+        assert_eq!(progress[1].completed_output_frames, 0);
+        assert!(
+            progress[1..]
+                .iter()
+                .all(|update| update.phase == EncodePhase::Flushing)
+        );
+        assert_eq!(
+            progress.last(),
+            Some(&EncodeProgress {
+                phase: EncodePhase::Flushing,
+                completed_steps: 5,
+                total_steps: 5,
+                completed_output_frames: 3,
+                total_output_frames: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn dba_progress_can_begin_after_the_first_pcm_chunk() {
+        let config = Atrac3StreamConfig {
+            bitrate_kbps: 66,
+            channels: 2,
+        };
+        let pcm = generated_pcm(2, 2048);
+        let mut encoder = Atrac3StreamEncoder::new(Vec::new(), config, 2048).unwrap();
+        let mut progress = Vec::new();
+        encoder
+            .push_pcm_with_progress(&[&pcm[0][..1024], &pcm[1][..1024]], |update| {
+                progress.push(update)
+            })
+            .unwrap();
+        assert!(progress.is_empty());
+        encoder
+            .push_pcm_with_progress(&[&pcm[0][1024..], &pcm[1][1024..]], |update| {
+                progress.push(update)
+            })
+            .unwrap();
+        encoder
+            .finish_with_progress(|update| progress.push(update))
+            .unwrap();
+
+        assert_eq!(progress.len(), 4);
+        assert_eq!(progress[0].phase, EncodePhase::Encoding);
+        assert_eq!(progress[0].completed_output_frames, 0);
+        assert_eq!(progress.last().unwrap().completed_steps, 4);
+        assert_eq!(progress.last().unwrap().total_steps, 4);
+        assert_eq!(progress.last().unwrap().completed_output_frames, 3);
+        assert_eq!(progress.last().unwrap().total_output_frames, 3);
     }
 
     #[test]

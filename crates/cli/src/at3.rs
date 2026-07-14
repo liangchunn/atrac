@@ -1,12 +1,61 @@
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
-use at3::encoder::stream::{Atrac3StreamConfig, Atrac3StreamEncoder, PCM_BLOCK_FRAMES};
+use at3::encoder::stream::{
+    Atrac3StreamConfig, Atrac3StreamEncoder, EncodePhase, EncodeProgress, PCM_BLOCK_FRAMES,
+};
 use hound::SampleFormat;
 
 use crate::args::EncodeArgs;
 use crate::output::create_pending_output;
 use crate::pcm::PcmWaveStream;
+
+/// Interactive CLI renderer for the library's exact sound-unit progress.
+/// Redirected stderr receives no progress redraws; library callers can consume
+/// every update through the callback-enabled stream methods.
+struct CliProgress {
+    enabled: bool,
+    active_line: bool,
+}
+
+impl CliProgress {
+    fn new() -> Self {
+        Self {
+            enabled: io::stderr().is_terminal(),
+            active_line: false,
+        }
+    }
+
+    fn update(&mut self, progress: EncodeProgress) {
+        if !self.enabled {
+            return;
+        }
+
+        let phase = match progress.phase {
+            EncodePhase::Encoding => "Encoding",
+            EncodePhase::Flushing => "Flushing",
+        };
+        let percent = f64::from(progress.completed_steps) * 100.0 / f64::from(progress.total_steps);
+        let mut stderr = io::stderr().lock();
+        let _ = write!(
+            stderr,
+            "\r{phase}: {percent:5.1}% ({}/{}) - {}/{} output frames",
+            progress.completed_steps,
+            progress.total_steps,
+            progress.completed_output_frames,
+            progress.total_output_frames,
+        );
+        let _ = stderr.flush();
+        self.active_line = true;
+    }
+
+    fn finish(&mut self) {
+        if self.active_line {
+            eprintln!();
+            self.active_line = false;
+        }
+    }
+}
 
 pub fn run(args: EncodeArgs) -> anyhow::Result<()> {
     encode(args.bitrate, &args.input, &args.output)
@@ -56,18 +105,44 @@ fn encode(bitrate: u32, input: &Path, output: &Path) -> anyhow::Result<()> {
         },
         metadata.sample_frames,
     )?;
+    let mut progress = CliProgress::new();
     let mut blocks: Vec<Vec<i16>> = (0..spec.channels)
         .map(|_| Vec::with_capacity(PCM_BLOCK_FRAMES))
         .collect();
-    while reader.read_block(&mut blocks, PCM_BLOCK_FRAMES)? != 0 {
-        match spec.channels {
-            1 => encoder.push_pcm(&[blocks[0].as_slice()])?,
-            2 => encoder.push_pcm(&[blocks[0].as_slice(), blocks[1].as_slice()])?,
+    loop {
+        let frames = match reader.read_block(&mut blocks, PCM_BLOCK_FRAMES) {
+            Ok(frames) => frames,
+            Err(error) => {
+                progress.finish();
+                return Err(error.into());
+            }
+        };
+        if frames == 0 {
+            break;
+        }
+        let result = match spec.channels {
+            1 => encoder
+                .push_pcm_with_progress(&[blocks[0].as_slice()], |update| progress.update(update)),
+            2 => encoder
+                .push_pcm_with_progress(&[blocks[0].as_slice(), blocks[1].as_slice()], |update| {
+                    progress.update(update)
+                }),
             _ => unreachable!("validated ATRAC3 channel count"),
+        };
+        if let Err(error) = result {
+            progress.finish();
+            return Err(error.into());
         }
     }
     drop(reader);
-    let (mut file, summary) = encoder.finish()?;
+    let (mut file, summary) = match encoder.finish_with_progress(|update| progress.update(update)) {
+        Ok(result) => result,
+        Err(error) => {
+            progress.finish();
+            return Err(error.into());
+        }
+    };
+    progress.finish();
     file.flush().map_err(|error| {
         anyhow::anyhow!(
             "failed to flush temporary output for `{}`: {error}",
