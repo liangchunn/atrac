@@ -12,7 +12,7 @@ use crate::coding::allocation::{
 };
 use crate::coding::bitcount::{IdctBlockState, IdsfBlockState, IdwlBlockState};
 use crate::coding::calc_block::{CalcChannelOutput, CalcFrameOutput};
-use crate::encoder::cfg_bridge::CfgPerFrame352;
+use crate::encoder::cfg_bridge::FrameConfig;
 use crate::encoder::frame::{FrameError, ObjectInputs};
 use crate::encoder::frontend::FrontendState;
 use crate::encoder::packing_prep::{GhaBandData, GhaPackingPrep, PackingPrepError};
@@ -35,13 +35,13 @@ struct GainRowData {
     levels: Vec<i32>,
 }
 
-/// Build one complete, self-contained typed frame from computed encoder
+/// Build one complete, self-contained typed frame from encoder
 /// decisions. `band_index`/`band_count` are the per-frame fallback shape words
 /// used by the zeroth 29..=31 rounding law.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_frame_syntax(
     out: &CalcFrameOutput,
-    per_frame: &CfgPerFrame352,
+    per_frame: &FrameConfig,
     frontend: &FrontendState,
     prep: &GhaPackingPrep,
     objects: &[ObjectInputs],

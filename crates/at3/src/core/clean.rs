@@ -4,8 +4,8 @@
 //! `libatrac.so.1.2.0` using the already-validated leaf functions
 //! from `core::coding::tone` and `core::coding::quant`.
 //!
-//! Half 1 (deterministic pipeline): implemented and validated.
-//! Half 2 (iterative bit-allocation convergence loop): in progress (Phase 3–4).
+//! The deterministic pipeline and iterative bit-allocation convergence loop are
+//! implemented and covered by the stream parity fixtures.
 
 use crate::analysis::gain::GainInfo;
 use crate::config::{Atrac3Profile, EncoderStrategy};
@@ -102,8 +102,7 @@ pub struct EncodeResult {
 /// `encode_mddata_at3` (`0x65c98`): encodes spectral data for one
 /// channel into the encoder state.
 ///
-/// Half 1 (deterministic pipeline): implemented and validated.
-/// Half 2 (iterative convergence): in progress.
+/// The deterministic and iterative convergence stages are both implemented.
 pub fn encode_mddata_at3(
     specs_a: &[f32],
     specs_b: &[f32],

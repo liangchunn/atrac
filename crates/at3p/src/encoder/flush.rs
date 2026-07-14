@@ -177,9 +177,6 @@ pub enum FlushScheduleError {
     FlushAlreadyDone,
 }
 
-// ===========================================================================
-// docs/11 Phase 2 §2.2 (c) / docs/12 §0.1 — computed-frame flush scheduler.
-//
 // Computes each output frame from PCM via [`FrameDriver`]. It reproduces
 // the native schedule contract for ANY input of
 // `N >= MIN_INPUT_SAMPLE_FRAMES` sample frames per channel, driven by a
@@ -188,8 +185,8 @@ pub enum FlushScheduleError {
 // (N=154064) this is exactly the archived 76 encode + 9 flush → 77 output
 // contract.
 //
-// The driver's per-call PCM is supplied at construction (the length-agnostic
-// `core_call_pcm_frames_352` chunking: `encode_calls` encode frames incl. the
+// The driver's per-call PCM is supplied at construction (the schedule-derived
+// chunking: `encode_calls` encode frames including the
 // zero-padded tail + `flush_processing_calls` zero flush frames), so
 // `encode_chunk` / `flush` keep the schedule's sample-frame-count contract while
 // feeding the driver the real f32 samples for the current core call.
@@ -208,7 +205,7 @@ pub enum FlushError {
     /// A schedule contract violation (same set as [`FlushScheduleError`]).
     Schedule(FlushScheduleError),
     /// The per-call PCM frame supply had the wrong length (must be exactly the
-    /// derived `core_call_pcm_frames_352` chunking:
+    /// derived schedule chunking:
     /// `encode_calls + flush_processing_calls`).
     FrameSupplyLen { expected: usize, actual: usize },
     /// A supplied per-call PCM frame had the wrong channel count (must equal the
@@ -287,7 +284,7 @@ impl BufferedFlushScheduler {
     }
 
     /// Build the scheduler from the input sample-frame count `N` and the full
-    /// length-agnostic [`core_call_pcm_frames_352`] chunking
+    /// length-agnostic schedule chunking
     /// (`src/encoder/frontend.rs`). Rejects `N < MIN_INPUT_SAMPLE_FRAMES` with the
     /// typed too-short error. The supply must be exactly
     /// [`expected_frame_supply`](Self::expected_frame_supply) frames for the

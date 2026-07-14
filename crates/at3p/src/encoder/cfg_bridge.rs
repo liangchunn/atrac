@@ -26,12 +26,12 @@
 //!   the `+0x1b5f8` word-length rows, then `cfg+0xc0 = g_a_x_at5[active]+1`).
 //!   Already computed live by `assemble_calc_frame_entry_at5`
 //!   (`compute_zeroth_active_band_counts_at5`, `src/encoder/coding_bridge.rs`);
-//!   ([`CfgPerFrame352::active_b0`] / [`CfgPerFrame352::level_groups_c0`]) so the
+//!   ([`FrameConfig::active_b0`] / [`FrameConfig::level_groups_c0`]) so the
 //!   builder is not silently a constant emitter.
 //! * **`0x1e4` (calc epilogue word).** Sign-extended `s_12e`, computed live as
 //!   `CalcFrameOutput.ctx_field_1e4` by `calc_channel_block_frame_at5`
 //!   (`src/coding/calc_block.rs`, `ctx_field_1e4 = i32::from(s_12e)`). Call-7
-//!   value: 16364. Taken as [`CfgPerFrame352::bits_1e4`].
+//!   value: 16364. Taken as [`FrameConfig::bits_1e4`].
 //! * **Stereo config side data** (group 1 `0x48` head / `0x4c` inner /
 //!   `0x50 + k*4`; group 2 `0x00` head / `0x04` inner / `0x08 + k*4`). Parameterized
 //!   as per-frame input. The orchestrator's 77-call diff found these nonzero ONLY
@@ -181,10 +181,10 @@ pub const OFFSET_1EC: usize = 0x1ec;
 /// a law.
 pub const OFFSET_1F0: usize = 0x1f0;
 
-/// Per-frame inputs the 352 config window depends on. Everything else in the
-/// window is a 352 constant or a DEFERRED (zeroed) region — see the module docs.
+/// Per-frame values shared by direct typed syntax assembly and the debug-only
+/// native config-window oracle.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CfgPerFrame352 {
+pub struct FrameConfig {
     /// Zeroth active band count (`cfg+0xb0`); 32 at call 7. From
     /// `assemble_calc_frame_entry_at5` / the calc-entry `band_count_b0` word.
     pub active_b0: u32,
@@ -219,7 +219,7 @@ fn put_u32(window: &mut ObjectWindow, offset: usize, value: u32) {
 /// full-band extent (band_index 32 / band_count 16), and stereo channel
 /// count (2).
 #[cfg(any(test, debug_assertions))]
-pub fn build_cfg_window_352(per_frame: &CfgPerFrame352) -> ObjectWindow {
+pub fn build_cfg_window_352(per_frame: &FrameConfig) -> ObjectWindow {
     build_cfg_window(per_frame, 30, 16379, 0x20, 16, 2)
 }
 
@@ -266,7 +266,7 @@ pub fn cfg_shape_count_b8(band_index: u32) -> u32 {
 /// stereo path is byte-identical.
 #[cfg(any(test, debug_assertions))]
 pub fn build_cfg_window(
-    per_frame: &CfgPerFrame352,
+    per_frame: &FrameConfig,
     selector: u32,
     budget: i32,
     band_index: u32,
@@ -364,8 +364,8 @@ pub fn build_cfg_window(
 mod tests {
     use super::*;
 
-    fn call7_per_frame() -> CfgPerFrame352 {
-        CfgPerFrame352 {
+    fn call7_per_frame() -> FrameConfig {
+        FrameConfig {
             active_b0: 32,
             level_groups_c0: 16,
             stereo_group1: (0, 0, [0; 16]),
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn threads_per_frame_fields() {
-        let per_frame = CfgPerFrame352 {
+        let per_frame = FrameConfig {
             active_b0: 31,
             level_groups_c0: 15,
             stereo_group1: (7, 8, {

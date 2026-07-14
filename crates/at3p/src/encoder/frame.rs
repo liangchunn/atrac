@@ -41,7 +41,7 @@ use crate::bitstream::writer::BitWriter;
 use crate::coding::allocation::zeroth_band_shape_counts_at5;
 use crate::coding::allocation::{ZerothActivitySummary, zeroth_activity_summary_at5};
 use crate::coding::calc_block::{CalcFrameEntry, CalcFrameOutput, calc_channel_block_frame_at5};
-use crate::encoder::cfg_bridge::CfgPerFrame352;
+use crate::encoder::cfg_bridge::FrameConfig;
 #[cfg(any(test, debug_assertions))]
 use crate::encoder::cfg_bridge::build_cfg_window;
 use crate::encoder::coding_bridge::{
@@ -184,7 +184,7 @@ pub struct ObjectInputs {
 #[cfg(any(test, debug_assertions))]
 pub fn build_reference_prepacker_state(
     out: &CalcFrameOutput,
-    per_frame: &CfgPerFrame352,
+    per_frame: &FrameConfig,
     frontend: &FrontendState,
     prep: &GhaPackingPrep,
     objects: &[ObjectInputs],
@@ -263,7 +263,7 @@ fn reference_prep(prep: &GhaPackingPrep) -> crate::reference::native_layout::Gha
 #[cfg(any(test, debug_assertions))]
 pub fn build_reference_prepacker_state_for_params(
     out: &CalcFrameOutput,
-    per_frame: &CfgPerFrame352,
+    per_frame: &FrameConfig,
     frontend: &FrontendState,
     prep: &GhaPackingPrep,
     objects: &[ObjectInputs],
@@ -786,7 +786,7 @@ impl FrameDriver {
         // Per-frame cfg inputs from the computed entry/output + the computed tone
         // summaries (docs/11 §2.2 (a)3 — NEW vs the capstone, which hardcoded the
         // stereo groups to zero).
-        let per_frame = CfgPerFrame352 {
+        let per_frame = FrameConfig {
             active_b0: frame.channels[0].config_b0,
             level_groups_c0: frame.channels[0].config_c0,
             stereo_group1: stereo_group_at5(
