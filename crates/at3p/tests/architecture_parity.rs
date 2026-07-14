@@ -1,10 +1,7 @@
-use at3p::encoder::payload::{
-    assemble_computed_atracx_file_for_mono_profile, assemble_computed_atracx_file_for_profile,
+use at3p::{
+    ATRAC3PLUS_MONO_PROFILES, ATRAC3PLUS_STEREO_PROFILES, Atrac3plusEncoder, Atrac3plusProfile,
+    encode_to_vec,
 };
-use at3p::encoder::profile::{
-    ATRAC3PLUS_MONO_PROFILES, ATRAC3PLUS_STEREO_PROFILES, Atrac3plusProfile,
-};
-use at3p::encoder::stream::Atrac3plusStreamEncoder;
 
 fn generated_pcm(channels: usize, frames: usize) -> Vec<Vec<i16>> {
     (0..channels)
@@ -17,8 +14,7 @@ fn generated_pcm(channels: usize, frames: usize) -> Vec<Vec<i16>> {
 }
 
 fn stream(profile: &Atrac3plusProfile, pcm: &[Vec<i16>]) -> Vec<u8> {
-    let mut encoder =
-        Atrac3plusStreamEncoder::new(Vec::new(), profile, pcm[0].len() as u32).unwrap();
+    let mut encoder = Atrac3plusEncoder::new(Vec::new(), profile, pcm[0].len() as u32).unwrap();
     let mut offset = 0;
     while let Some(frames) = encoder.expected_next_chunk_frames() {
         let chunk: Vec<&[i16]> = pcm
@@ -32,18 +28,7 @@ fn stream(profile: &Atrac3plusProfile, pcm: &[Vec<i16>]) -> Vec<u8> {
 }
 
 fn buffered(profile: &Atrac3plusProfile, pcm: &[Vec<i16>]) -> Vec<u8> {
-    match profile.channels() {
-        1 => assemble_computed_atracx_file_for_mono_profile(profile, pcm[0].len() as u32, pcm)
-            .unwrap(),
-        2 => assemble_computed_atracx_file_for_profile(
-            profile,
-            pcm[0].len() as u32,
-            &pcm[0],
-            &pcm[1],
-        )
-        .unwrap(),
-        _ => unreachable!(),
-    }
+    encode_to_vec(profile, pcm[0].len() as u32, pcm).unwrap()
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {

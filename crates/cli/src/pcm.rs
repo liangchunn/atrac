@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::Path;
 
-use at3p::riff::read::PcmWaveInfo;
+use at3p::container::PcmWaveInfo;
 use hound::{SampleFormat, WavIntoSamples, WavReader, WavSpec};
 
 pub const MAX_PCM_BLOCK_FRAMES: usize = 2048;

@@ -2,13 +2,12 @@ use std::fs::File;
 use std::io::{self, IsTerminal, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use at3p::encoder::payload::{ComputedFileError, ComputedWriteError, EncodePhase, EncodeProgress};
-use at3p::encoder::profile::{
-    ATRAC3PLUS_MONO_PROFILES, ATRAC3PLUS_STEREO_PROFILES, Atrac3plusProfile,
-    profile_by_bitrate_and_channels,
+use at3p::container::{RiffReadError, inspect_target_pcm_wave_for_channels, inspect_wave_format};
+use at3p::{
+    ATRAC3PLUS_MONO_PROFILES, ATRAC3PLUS_STEREO_PROFILES, Atrac3plusEncoder, Atrac3plusProfile,
+    EncodeError as ComputedWriteError, EncodePhase, EncodeProgress,
+    FileEncodeError as ComputedFileError, PCM_BLOCK_FRAMES, profile_by_bitrate_and_channels,
 };
-use at3p::encoder::stream::{Atrac3plusStreamEncoder, PCM_BLOCK_FRAMES};
-use at3p::riff::read::{RiffReadError, inspect_target_pcm_wave_for_channels, inspect_wave_format};
 
 use crate::args::EncodeArgs;
 use crate::output::create_pending_output;
@@ -181,7 +180,7 @@ fn encode_computed(
     let input_sample_frames = pcm.metadata().sample_frames;
     let (file, pending) = create_pending_output(output, "at3p")?;
     let mut progress = CliProgress::new();
-    let mut encoder = Atrac3plusStreamEncoder::new(file, profile, input_sample_frames)
+    let mut encoder = Atrac3plusEncoder::new(file, profile, input_sample_frames)
         .map_err(|error| describe_computed_write_error(output, &error))?;
     let mut blocks: Vec<Vec<i16>> = (0..profile.channels())
         .map(|_| Vec::with_capacity(PCM_BLOCK_FRAMES))
