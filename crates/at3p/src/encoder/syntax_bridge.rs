@@ -56,16 +56,7 @@ pub(crate) fn build_frame_syntax(
 
     let active = per_frame.active_b0 as usize;
     let stereo_units = per_frame.level_groups_c0 as usize;
-    let shape = zeroth_band_shape_counts_at5(active, band_index as usize, band_count as usize);
-    let header = BlockHeaderSyntax {
-        channel_mode: u32::from(channel_count != 1),
-        quant_header: shape.word_length_count as u32,
-        header_flag: false,
-        quant_unit_count: active,
-        bandwidth_gate: true,
-        stereo_unit_count: stereo_units,
-        gainb_count: shape.group_count,
-    };
+    let header = build_block_header(channel_count, active, stereo_units, band_index, band_count);
 
     let gain_rows = objects
         .iter()
@@ -90,8 +81,8 @@ pub(crate) fn build_frame_syntax(
                     .map(|object| object.gain_a_records.as_slice()),
                 active,
                 stereo_units,
-                shape.word_length_count,
-                shape.group_count,
+                header.quant_header as usize,
+                header.gainb_count,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -103,6 +94,33 @@ pub(crate) fn build_frame_syntax(
     let gha = build_gha_syntax(frontend, prep, channel_count)?;
     let group = BlockGroupSyntax::new(header, channels, stereo, None, gha);
     FrameSyntax::from_parts(frame_bytes, vec![group]).map_err(FrameError::from)
+}
+
+fn build_block_header(
+    channel_count: usize,
+    active: usize,
+    stereo_units: usize,
+    band_index: u32,
+    band_count: u32,
+) -> BlockHeaderSyntax {
+    // Native derives cfg+0xc4/cfg+0xc8 from the effective cfg+0xb4/cfg+0xbc
+    // extent independently of the returned per-frame active cfg+0xb0 count.
+    // In particular, extent 29/13 rounds to header shape 32/16 even when the
+    // current frame has fewer than 29 active quant units.
+    let shape = zeroth_band_shape_counts_at5(
+        band_index as usize,
+        band_index as usize,
+        band_count as usize,
+    );
+    BlockHeaderSyntax {
+        channel_mode: u32::from(channel_count != 1),
+        quant_header: shape.word_length_count as u32,
+        header_flag: false,
+        quant_unit_count: active,
+        bandwidth_gate: true,
+        stereo_unit_count: stereo_units,
+        gainb_count: shape.group_count,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -820,4 +838,29 @@ fn build_gha_syntax(
         stereo_flags,
         channels,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_header_rounds_192_extent_independently_of_active_units() {
+        let header = build_block_header(2, 0, 1, 29, 13);
+
+        assert_eq!(header.channel_mode, 1);
+        assert_eq!(header.quant_header, 32);
+        assert_eq!(header.quant_unit_count, 0);
+        assert_eq!(header.stereo_unit_count, 1);
+        assert_eq!(header.gainb_count, 16);
+    }
+
+    #[test]
+    fn block_header_keeps_non_rounding_reduced_extent() {
+        let header = build_block_header(2, 17, 8, 28, 12);
+
+        assert_eq!(header.quant_header, 28);
+        assert_eq!(header.quant_unit_count, 17);
+        assert_eq!(header.gainb_count, 12);
+    }
 }
