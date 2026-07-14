@@ -18,7 +18,7 @@
 //! X[k] = (1/128) * Σ_{n=0}^{511} x[n] * w[n] * cos(π/256 * (n + 128.5) * (k + 0.5))
 //! ```
 //!
-//! verified against Unicorn traces of `winormal_mdct_256` to within `f32`
+//! verified against `winormal_mdct_256` to within `f32`
 //! precision (max abs error < 1e-9). The FFT-based decomposition uses
 //! `rustfft` with `f64` accumulation to mirror the x87 extended-precision
 //! evaluation in the original library.
@@ -437,10 +437,6 @@ impl Atrac3ForwardTransform {
             mdct: Mdct512::new(),
             overlap: [[0.0; BAND_SAMPLES]; BAND_COUNT],
         }
-    }
-
-    pub(crate) fn overlap_snapshot(&self) -> [[f32; BAND_SAMPLES]; BAND_COUNT] {
-        self.overlap
     }
 
     pub(crate) fn set_overlap_from_bands(&mut self, bands: &[[f32; BAND_SAMPLES]; BAND_COUNT]) {

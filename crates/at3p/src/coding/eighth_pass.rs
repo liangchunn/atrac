@@ -262,8 +262,6 @@ pub struct EighthFrameOutput {
     pub idct_bits_11e: i16,
     pub base_total_12a: i16,
     pub extended_total_12e: i16,
-    pub trials: usize,
-    pub accepts: usize,
 }
 
 /// Run the scoped eighth pass. The entry/inner budget gates, trial
@@ -319,8 +317,6 @@ pub fn eighth_bit_allocation_frame_at5(
     let mut bits_11e = state.idct_bits_11e;
     let mut bits_12a = state.base_total_12a;
     let mut bits_12e = state.current_bits_12e;
-    let mut trials = 0usize;
-    let mut accepts = 0usize;
 
     'pass: {
         // Entry gate: the pass runs only while over target.
@@ -338,7 +334,6 @@ pub fn eighth_bit_allocation_frame_at5(
                     if entry_idsf < EIGHTH_IDSF_TRIAL_MAX_AT5 {
                         let mut trial_idsf = entry_idsf + 1;
                         loop {
-                            trials += 1;
                             let word_length = rows[channel][band];
                             let scale = state.channels[channel].band_scale[band];
                             let threshold = eighth_threshold_base_at5(trial_idsf, word_length)?;
@@ -429,7 +424,6 @@ pub fn eighth_bit_allocation_frame_at5(
                                     .wrapping_add((var.bit_delta as i16).wrapping_sub(delta_12a));
                                 bits_11e = var.idct_bits as i16;
                                 bits_12e = bits_12e.wrapping_add(var.bit_delta as i16);
-                                accepts += 1;
                             } else {
                                 state.channels[channel].spectra[band].copy_from_slice(&backup);
                                 idct_blocks = saved_idct;
@@ -474,7 +468,5 @@ pub fn eighth_bit_allocation_frame_at5(
         idct_bits_11e: bits_11e,
         base_total_12a: bits_12a,
         extended_total_12e: bits_12e,
-        trials,
-        accepts,
     })
 }

@@ -1,9 +1,8 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Write};
-use std::path::Path;
 
-use crate::dsp::encode::{Atrac3Encoder, EncodeFitterDiagnostics, ProductionTraceFrameContext};
+use crate::dsp::encode::Atrac3Encoder;
 
 pub const PCM_BLOCK_FRAMES: usize = 1024;
 const SAMPLE_RATE: u32 = 44_100;
@@ -22,7 +21,6 @@ pub struct Atrac3StreamConfig {
 pub enum Atrac3WriteStage {
     Header,
     Payload,
-    Trace,
 }
 
 #[derive(Debug)]
@@ -139,7 +137,6 @@ pub struct Atrac3StreamSummary {
     pub fallback_frames: u32,
     pub payload_bytes: u64,
     pub file_bytes: u64,
-    pub diagnostics: EncodeFitterDiagnostics,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -286,19 +283,6 @@ impl<W: Write> Atrac3StreamEncoder<W> {
         })
     }
 
-    pub fn enable_production_trace<P: AsRef<Path>>(&mut self, out_dir: P) -> io::Result<()> {
-        self.encoder.enable_production_trace(out_dir)
-    }
-
-    pub fn enable_production_trace_with_max_frames<P: AsRef<Path>>(
-        &mut self,
-        out_dir: P,
-        max_sound_frames: Option<u32>,
-    ) -> io::Result<()> {
-        self.encoder
-            .enable_production_trace_with_max_frames(out_dir, max_sound_frames)
-    }
-
     pub fn push_pcm(&mut self, channels: &[&[i16]]) -> Result<(), Atrac3StreamError> {
         if channels.len() != self.config.channels as usize {
             return Err(Atrac3StreamError::WrongChannelCount {
@@ -345,12 +329,6 @@ impl<W: Write> Atrac3StreamEncoder<W> {
             });
         }
         self.process_ready(true)?;
-        self.encoder
-            .finish_production_trace()
-            .map_err(|source| Atrac3StreamError::Io {
-                stage: Atrac3WriteStage::Trace,
-                source,
-            })?;
         if self.next_sound_unit != self.sound_units {
             return Err(Atrac3StreamError::IncompleteSchedule {
                 expected_sound_units: self.sound_units,
@@ -368,7 +346,6 @@ impl<W: Write> Atrac3StreamEncoder<W> {
             fallback_frames: self.fallback_frames,
             payload_bytes: self.written_payload_bytes,
             file_bytes: HEADER_BYTES + self.written_payload_bytes,
-            diagnostics: self.encoder.diagnostics(),
         };
         Ok((self.writer, summary))
     }
@@ -393,9 +370,6 @@ impl<W: Write> Atrac3StreamEncoder<W> {
     fn encode_sound_unit(&mut self, input_base_frame: isize) -> Result<(), Atrac3StreamError> {
         let sound_unit = self.next_sound_unit;
         let write_frame = write_sound_unit(sound_unit, self.dba_priming);
-        let requested_channels = self.encoder.channel_count().max(1);
-        let mut trace_input_pcm =
-            Vec::with_capacity(PCM_BLOCK_FRAMES * 2 * usize::from(requested_channels));
         let mut pcm0 = [0.0f32; PCM_BLOCK_FRAMES];
         let mut pcm1 = [0.0f32; PCM_BLOCK_FRAMES];
         for index in 0..PCM_BLOCK_FRAMES {
@@ -408,39 +382,8 @@ impl<W: Write> Atrac3StreamEncoder<W> {
             };
             pcm0[index] = f32::from(left);
             pcm1[index] = f32::from(right);
-            trace_input_pcm.extend_from_slice(&left.to_le_bytes());
-            if requested_channels > 1 {
-                trace_input_pcm.extend_from_slice(&right.to_le_bytes());
-            }
         }
         let pcm_refs: [&[f32; PCM_BLOCK_FRAMES]; 2] = [&pcm0, &pcm1];
-        let input_byte_count = trace_input_pcm.len() as u32;
-        let scheduled_start = (sound_unit * PCM_BLOCK_FRAMES) as u64;
-        let actual_start = input_base_frame.max(0) as u64;
-        self.encoder
-            .begin_production_trace_frame_with_pcm(
-                ProductionTraceFrameContext {
-                    sound_frame_call_idx: sound_unit as u32,
-                    frame_index: sound_unit as u32 + 1,
-                    frame_sequence_arg: sound_unit as i32,
-                    requested_channels,
-                    input_byte_count_arg: input_byte_count / u32::from(requested_channels),
-                    input_byte_count,
-                    input_sample_frame_count: PCM_BLOCK_FRAMES as u32,
-                    scheduled_input_sample_frame_start: scheduled_start,
-                    scheduled_input_sample_frame_end: scheduled_start + PCM_BLOCK_FRAMES as u64,
-                    actual_input_sample_frame_start: actual_start,
-                    actual_input_sample_frame_end: actual_start + PCM_BLOCK_FRAMES as u64,
-                    priming_frame: !write_frame,
-                    write_frame,
-                    payload_offset: write_frame.then_some(self.written_payload_bytes),
-                },
-                &trace_input_pcm,
-            )
-            .map_err(|source| Atrac3StreamError::Io {
-                stage: Atrac3WriteStage::Trace,
-                source,
-            })?;
 
         let bit_count = self.encoder.encode_frame(&pcm_refs, &mut self.out_buf);
         let byte_count = if bit_count < 0 {

@@ -120,8 +120,6 @@ pub struct SixthFrameOutput {
     pub base_total_12a: i16,
     pub extended_total_12e: i16,
     pub return_bits: i16,
-    pub trials: usize,
-    pub accepts: usize,
 }
 
 /// Run the scoped sixth pass. The idsf decrements, selector/cost-row
@@ -182,8 +180,6 @@ pub fn sixth_bit_allocation_frame_at5(
     let mut bits_11e = state.idct_bits_11e;
     let mut bits_12a = state.base_total_12a;
     let mut bits_12e = state.current_bits_12e;
-    let mut trials = 0usize;
-    let mut accepts = 0usize;
 
     if i32::from(bits_12e) <= state.budget_limit.wrapping_sub(state.threshold_90) {
         for index in 0..state.band_count * channel_count {
@@ -205,7 +201,6 @@ pub fn sixth_bit_allocation_frame_at5(
                 continue;
             }
 
-            trials += 1;
             state.channels[channel].band_idsf[band] = idsf - 1;
             let saved_idct = idct_blocks.clone();
 
@@ -265,7 +260,6 @@ pub fn sixth_bit_allocation_frame_at5(
                     .wrapping_add((var.bit_delta as i16).wrapping_sub(delta_12a));
                 bits_11e = var.idct_bits as i16;
                 bits_12e = bits_12e.wrapping_add(var.bit_delta as i16);
-                accepts += 1;
             } else {
                 state.channels[channel].band_idsf[band] = idsf;
                 idct_blocks = saved_idct;
@@ -292,7 +286,5 @@ pub fn sixth_bit_allocation_frame_at5(
         base_total_12a: bits_12a,
         extended_total_12e: bits_12e,
         return_bits: bits_12e,
-        trials,
-        accepts,
     })
 }

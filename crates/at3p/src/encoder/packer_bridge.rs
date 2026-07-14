@@ -1230,7 +1230,7 @@ pub struct GhaPackingPrep {
     pub channels: Vec<GhaChannelSelectors>,
     /// The three header summary pairs.
     pub summaries: GhaHeaderSummaries,
-    /// The `calc_nbits_for_gha_at5` total bit estimate (diagnostic).
+    /// The `calc_nbits_for_gha_at5` total bit estimate.
     pub total_bits: usize,
 }
 

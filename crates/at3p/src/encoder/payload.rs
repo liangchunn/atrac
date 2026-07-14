@@ -1,12 +1,5 @@
 //!
-//! This module hosts two assembly paths:
-//!
-//! - The trace-fed path ([`assemble_trace_fed_payload`] /
-//!   [`assemble_trace_fed_atracx_file`]) composes a Rust-owned ATRAC3plus `data`
-//!   payload from caller-supplied native-packed 2048-byte frames. It models only
-//!   the native output ordering proven by the trace-fed flush scheduler; it does
-//!   not compute PCM, frontend, allocation, or packer state.
-//! - The computed path ([`assemble_computed_payload`] /
+//! This module hosts the computed assembly path ([`assemble_computed_payload`] /
 //!   [`assemble_computed_atracx_file`], docs/11 Phase 3 §3.1, generalized by
 //!   docs/12 §0.1) drives the pure [`ComputedFlushScheduler`] over raw PCM and
 //!   COMPUTES every 2048-byte output frame for ANY input of
@@ -20,152 +13,16 @@ use std::io::{self, Write};
 
 use super::flush::{
     ComputedFlushError, ComputedFlushScheduler, ComputedFrameResult, ComputedSchedule352,
-    IncrementalComputedFlushScheduler, InputTooShort, TRACE_ENCODE_WRAPPER_CALLS,
-    TRACE_FINAL_INPUT_SAMPLE_FRAMES, TRACE_FLUSH_WRAPPER_CALLS, TRACE_FRAME_BYTES,
-    TRACE_FULL_INPUT_CORE_CALLS, TRACE_FULL_INPUT_SAMPLE_FRAMES, TRACE_TOTAL_OUTPUT_FRAMES,
-    TraceFedFlushError, TraceFedFlushScheduler, TraceFedFrameResult, TraceFedFrameSource,
+    FrameSource, IncrementalComputedFlushScheduler, InputTooShort,
 };
 use crate::encoder::coding_params::CodingParams;
+use crate::encoder::computed_frame::COMPUTED_FRAME_BYTES;
 use crate::encoder::frontend::{CurrentPcmFrameError, prepare_current_pcm_frame};
 use crate::encoder::profile::EncodeProfile;
 use crate::riff::write::{
     ATRACX_HEADER_LEN, RiffWriteError, write_atracx_header, write_atracx_header_for_rate,
     write_atracx_header_for_rate_channels,
 };
-
-pub const TRACE_INPUT_SAMPLE_FRAMES: u32 = 154_064;
-pub const TRACE_PAYLOAD_BYTES: usize = TRACE_TOTAL_OUTPUT_FRAMES * TRACE_FRAME_BYTES;
-pub const TRACE_FILE_BYTES: usize = ATRACX_HEADER_LEN as usize + TRACE_PAYLOAD_BYTES;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TraceFedPayloadError {
-    Scheduler(TraceFedFlushError),
-    UnexpectedZeroOutput {
-        source: TraceFedFrameSource,
-        core_call_index: Option<u32>,
-        produced_bytes: usize,
-    },
-    MissingFrameBytes {
-        source: TraceFedFrameSource,
-        core_call_index: Option<u32>,
-        output_frame_index: u32,
-        produced_bytes: usize,
-    },
-    UnexpectedProducedBytes {
-        source: TraceFedFrameSource,
-        core_call_index: Option<u32>,
-        output_frame_index: u32,
-        expected: usize,
-        actual: usize,
-    },
-    UnexpectedOutputFrameOrder {
-        expected: u32,
-        actual: u32,
-    },
-    IncompleteOutputFrames {
-        expected: usize,
-        actual: usize,
-    },
-    SchedulerNotDone {
-        flush_calls: u32,
-    },
-    FinalPayloadLength {
-        expected: usize,
-        actual: usize,
-    },
-}
-
-impl From<TraceFedFlushError> for TraceFedPayloadError {
-    fn from(value: TraceFedFlushError) -> Self {
-        Self::Scheduler(value)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TraceFedFileError {
-    Header(RiffWriteError),
-    Payload(TraceFedPayloadError),
-    FinalFileLength { expected: usize, actual: usize },
-}
-
-impl From<RiffWriteError> for TraceFedFileError {
-    fn from(value: RiffWriteError) -> Self {
-        Self::Header(value)
-    }
-}
-
-impl From<TraceFedPayloadError> for TraceFedFileError {
-    fn from(value: TraceFedPayloadError) -> Self {
-        Self::Payload(value)
-    }
-}
-
-pub fn assemble_trace_fed_payload(frames: Vec<Vec<u8>>) -> Result<Vec<u8>, TraceFedPayloadError> {
-    let mut scheduler = TraceFedFlushScheduler::new(frames)?;
-    let mut payload = Vec::with_capacity(TRACE_PAYLOAD_BYTES);
-    let mut next_output_frame_index = 0u32;
-
-    for core_call_index in 0..TRACE_ENCODE_WRAPPER_CALLS {
-        let result = scheduler.encode_chunk(expected_encode_sample_frames(core_call_index))?;
-        append_output_frame(&mut payload, &mut next_output_frame_index, result)?;
-    }
-
-    for _ in 0..TRACE_FLUSH_WRAPPER_CALLS {
-        let result = scheduler.flush()?;
-        append_output_frame(&mut payload, &mut next_output_frame_index, result)?;
-    }
-
-    if next_output_frame_index as usize != TRACE_TOTAL_OUTPUT_FRAMES {
-        return Err(TraceFedPayloadError::IncompleteOutputFrames {
-            expected: TRACE_TOTAL_OUTPUT_FRAMES,
-            actual: next_output_frame_index as usize,
-        });
-    }
-
-    if !scheduler.is_done() {
-        return Err(TraceFedPayloadError::SchedulerNotDone {
-            flush_calls: scheduler.flush_calls(),
-        });
-    }
-
-    if payload.len() != TRACE_PAYLOAD_BYTES {
-        return Err(TraceFedPayloadError::FinalPayloadLength {
-            expected: TRACE_PAYLOAD_BYTES,
-            actual: payload.len(),
-        });
-    }
-
-    Ok(payload)
-}
-
-pub fn assemble_trace_fed_atracx_file(
-    input_sample_frames: u32,
-    frames: Vec<Vec<u8>>,
-) -> Result<Vec<u8>, TraceFedFileError> {
-    let mut bytes = write_atracx_header(input_sample_frames, TRACE_TOTAL_OUTPUT_FRAMES as u32)?;
-    bytes.extend_from_slice(&assemble_trace_fed_payload(frames)?);
-
-    if bytes.len() != TRACE_FILE_BYTES {
-        return Err(TraceFedFileError::FinalFileLength {
-            expected: TRACE_FILE_BYTES,
-            actual: bytes.len(),
-        });
-    }
-
-    Ok(bytes)
-}
-
-// ===========================================================================
-// docs/11 Phase 3 §3.1 / docs/12 §0.1 — computed payload / file assembly.
-//
-// Mirrors the trace-fed assembly above, but drives the pure
-// [`ComputedFlushScheduler`] (COMPUTES each frame from PCM) instead of the
-// trace-fed one (replays captured native frames). Generalized to ANY input of
-// `N >= MIN_INPUT_SAMPLE_FRAMES` sample frames: the encode/flush/output schedule
-// is derived from `N` by [`ComputedSchedule352`], and the per-frame checks and
-// final lengths are schedule-parameterized. The computed frame bytes are owned
-// (`Option<Vec<u8>>`), not borrowed.
-// ===========================================================================
 
 /// The native wrapper phase responsible for a computed-encode progress update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,18 +55,18 @@ pub enum ComputedPayloadError {
     Scheduler(ComputedFlushError),
     Prepare(CurrentPcmFrameError),
     UnexpectedZeroOutput {
-        source: TraceFedFrameSource,
+        source: FrameSource,
         core_call_index: Option<u32>,
         produced_bytes: usize,
     },
     MissingFrameBytes {
-        source: TraceFedFrameSource,
+        source: FrameSource,
         core_call_index: Option<u32>,
         output_frame_index: u32,
         produced_bytes: usize,
     },
     UnexpectedProducedBytes {
-        source: TraceFedFrameSource,
+        source: FrameSource,
         core_call_index: Option<u32>,
         output_frame_index: u32,
         expected: usize,
@@ -340,7 +197,7 @@ impl From<InputTooShort> for ComputedFileError {
 pub enum ComputedWriteStage {
     Header,
     OutputFrame {
-        source: TraceFedFrameSource,
+        source: FrameSource,
         core_call_index: Option<u32>,
         output_frame_index: u32,
     },
@@ -416,7 +273,7 @@ where
         CodingParams {
             selector: 30,
             budget: 16379,
-            frame_bytes: TRACE_FRAME_BYTES as u32,
+            frame_bytes: COMPUTED_FRAME_BYTES as u32,
             // Stereo anchor (`handle+0x94` == 2).
             channels: 2,
             mode_a: 2,
@@ -686,7 +543,7 @@ where
     // Reject `N < 6144` (native minimum) with the typed too-short error.
     let schedule = ComputedSchedule352::new(input_sample_frames)?;
     let total_output_frames = schedule.total_output_frames();
-    let payload_bytes = total_output_frames as usize * TRACE_FRAME_BYTES;
+    let payload_bytes = total_output_frames as usize * COMPUTED_FRAME_BYTES;
     let file_bytes = ATRACX_HEADER_LEN as usize + payload_bytes;
 
     let params = CodingParams::for_profile(&crate::encoder::profile::ATRAC3PLUS_352);
@@ -1306,59 +1163,4 @@ fn append_computed_output_frame(
         }
     }
     Ok(())
-}
-
-fn append_output_frame(
-    payload: &mut Vec<u8>,
-    next_output_frame_index: &mut u32,
-    result: TraceFedFrameResult<'_>,
-) -> Result<(), TraceFedPayloadError> {
-    match result.output_frame_index {
-        Some(output_frame_index) => {
-            if output_frame_index != *next_output_frame_index {
-                return Err(TraceFedPayloadError::UnexpectedOutputFrameOrder {
-                    expected: *next_output_frame_index,
-                    actual: output_frame_index,
-                });
-            }
-            if result.produced_bytes != TRACE_FRAME_BYTES {
-                return Err(TraceFedPayloadError::UnexpectedProducedBytes {
-                    source: result.source,
-                    core_call_index: result.core_call_index,
-                    output_frame_index,
-                    expected: TRACE_FRAME_BYTES,
-                    actual: result.produced_bytes,
-                });
-            }
-            let frame_bytes =
-                result
-                    .frame_bytes
-                    .ok_or(TraceFedPayloadError::MissingFrameBytes {
-                        source: result.source,
-                        core_call_index: result.core_call_index,
-                        output_frame_index,
-                        produced_bytes: result.produced_bytes,
-                    })?;
-            payload.extend_from_slice(frame_bytes);
-            *next_output_frame_index += 1;
-        }
-        None => {
-            if result.produced_bytes != 0 || result.frame_bytes.is_some() {
-                return Err(TraceFedPayloadError::UnexpectedZeroOutput {
-                    source: result.source,
-                    core_call_index: result.core_call_index,
-                    produced_bytes: result.produced_bytes,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-fn expected_encode_sample_frames(core_call_index: u32) -> u32 {
-    if core_call_index < TRACE_FULL_INPUT_CORE_CALLS {
-        TRACE_FULL_INPUT_SAMPLE_FRAMES
-    } else {
-        TRACE_FINAL_INPUT_SAMPLE_FRAMES
-    }
 }

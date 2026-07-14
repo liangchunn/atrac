@@ -56,18 +56,6 @@ fn encode(bitrate: u32, input: &Path, output: &Path) -> anyhow::Result<()> {
         },
         metadata.sample_frames,
     )?;
-    if let Some(trace_dir) = std::env::var_os("ATRAC3_PRODUCTION_TRACE_DIR") {
-        let max_trace_frames =
-            if let Some(value) = std::env::var_os("ATRAC3_PRODUCTION_TRACE_MAX_FRAMES") {
-                Some(value.to_string_lossy().parse::<u32>().map_err(|error| {
-                    anyhow::anyhow!("invalid ATRAC3_PRODUCTION_TRACE_MAX_FRAMES: {error}")
-                })?)
-            } else {
-                None
-            };
-        encoder.enable_production_trace_with_max_frames(trace_dir, max_trace_frames)?;
-    }
-
     let mut blocks: Vec<Vec<i16>> = (0..spec.channels)
         .map(|_| Vec::with_capacity(PCM_BLOCK_FRAMES))
         .collect();
@@ -101,12 +89,6 @@ fn encode(bitrate: u32, input: &Path, output: &Path) -> anyhow::Result<()> {
         summary.fallback_frames,
         summary.encoded_frames + summary.fallback_frames,
         output.display(),
-    );
-    eprintln!(
-        "diagnostics: {} tone drops, {} BFU trims, {} channel rejects",
-        summary.diagnostics.tone_payload_drop_events,
-        summary.diagnostics.bfu_idwl_decrement_events,
-        summary.diagnostics.channel_encode_reject_events,
     );
     Ok(())
 }

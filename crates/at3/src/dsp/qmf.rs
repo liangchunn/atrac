@@ -34,15 +34,6 @@ pub struct QmfSplit {
     history: Vec<f32>,
 }
 
-#[derive(Clone)]
-pub struct QmfTraceCapture {
-    pub input: Vec<f32>,
-    pub lower: Vec<f32>,
-    pub upper: Vec<f32>,
-    pub history_before: Vec<f32>,
-    pub history_after: Vec<f32>,
-}
-
 impl QmfSplit {
     pub fn new() -> Self {
         Self {
@@ -70,24 +61,6 @@ impl QmfSplit {
         }
 
         self.history.copy_from_slice(&input[n - HISTORY..]);
-    }
-
-    pub fn analysis_with_trace(
-        &mut self,
-        input: &[f32],
-        lower: &mut [f32],
-        upper: &mut [f32],
-        traces: &mut Vec<QmfTraceCapture>,
-    ) {
-        let history_before = self.history.clone();
-        self.analysis(input, lower, upper);
-        traces.push(QmfTraceCapture {
-            input: input.to_vec(),
-            lower: lower.to_vec(),
-            upper: upper.to_vec(),
-            history_before,
-            history_after: self.history.clone(),
-        });
     }
 }
 
@@ -190,27 +163,6 @@ impl Atrac3AnalysisFilterBank {
         let [sub0, sub1, sub2, sub3] = bands;
         self.stage2.analysis(&self.buf_low, sub0, sub1);
         self.stage3.analysis(&self.buf_up, sub3, sub2);
-    }
-
-    pub fn analysis_with_trace(
-        &mut self,
-        pcm: &[f32],
-        bands: &mut [&mut [f32]; BAND_COUNT],
-        traces: &mut Vec<QmfTraceCapture>,
-    ) {
-        assert_eq!(pcm.len(), NUM_SAMPLES);
-        for b in bands.iter() {
-            assert_eq!(b.len(), BAND_SAMPLES);
-        }
-
-        self.stage1
-            .analysis_with_trace(pcm, &mut self.buf_low, &mut self.buf_up, traces);
-
-        let [sub0, sub1, sub2, sub3] = bands;
-        self.stage2
-            .analysis_with_trace(&self.buf_low, sub0, sub1, traces);
-        self.stage3
-            .analysis_with_trace(&self.buf_up, sub3, sub2, traces);
     }
 }
 

@@ -108,10 +108,6 @@ impl DbaAnalysisFilterBank {
         }
     }
 
-    pub(crate) fn history_snapshot(&self) -> [f32; DBA_QMF_HISTORY] {
-        self.history
-    }
-
     #[cfg(not(feature = "bit-perfect"))]
     pub(crate) fn analysis(&mut self, pcm: &[f32; 1024], bands: &mut [[f32; 256]; 4]) {
         let mut work = [0.0f32; DBA_QMF_WORK];
@@ -1064,61 +1060,13 @@ impl DbaGainMdctChannelState {
         input_bands: &[f32; 1024],
         mode: DbaGainScheduleMode,
     ) -> DbaGainMdctFrameResult {
-        self.transform_inner(input_bands, mode, None)
-    }
-
-    fn transform_with_trace(
-        &mut self,
-        input_bands: &[f32; 1024],
-        mode: DbaGainScheduleMode,
-        qmf_history: [f32; DBA_QMF_HISTORY],
-    ) -> (DbaGainMdctFrameResult, DbaGainMdctProductionTrace) {
-        let mut trace = DbaGainMdctProductionTrace {
-            channel: 0,
-            input_bands: *input_bands,
-            history_before: qmf_history,
-            mdct_history_before: self.mdct.history,
-            pre_mdct_bands: *input_bands,
-            history_mid: qmf_history,
-            mdct_history_mid: [0.0; DBA_GAIN_MDCT_HISTORY],
-            output_spectrum: [0.0; 1024],
-            history_after: qmf_history,
-            mdct_history_after: [0.0; DBA_GAIN_MDCT_HISTORY],
-            gain_side_info: [0; DBA_GAIN_INFO_WORDS],
-            gain_side_info_ext: [0; DBA_GAIN_INFO_EXT_WORDS],
-            initial_nunits: 0,
-            available_bits: 0,
-            channel_mode: mode.channel_mode,
-        };
-        let result = self.transform_inner(input_bands, mode, Some(&mut trace));
-        (result, trace)
-    }
-
-    fn transform_inner(
-        &mut self,
-        input_bands: &[f32; 1024],
-        mode: DbaGainScheduleMode,
-        trace: Option<&mut DbaGainMdctProductionTrace>,
-    ) -> DbaGainMdctFrameResult {
         dba_generate_gain_side_info(input_bands, mode, &mut self.schedule);
         let gain_side_info =
             core::array::from_fn(|idx| self.schedule.side_info_ext[DBA_GAIN_INFO_EXT_PREFIX + idx]);
         let gain_side_info_ext = self.schedule.side_info_ext;
         let band0_gain_count = self.schedule.band0_gain_count();
-        let mut trace = trace;
-        if let Some(trace) = trace.as_mut() {
-            trace.gain_side_info = gain_side_info;
-            trace.gain_side_info_ext = gain_side_info_ext;
-        }
         dba_apply_scheduled_gain(&gain_side_info_ext, &mut self.mdct);
-        if let Some(trace) = trace.as_mut() {
-            trace.mdct_history_mid = self.mdct.history;
-        }
         let spectrum = dba_mdct_after_scheduled_gain(input_bands, &gain_side_info, &mut self.mdct);
-        if let Some(trace) = trace.as_mut() {
-            trace.output_spectrum = spectrum;
-            trace.mdct_history_after = self.mdct.history;
-        }
         DbaGainMdctFrameResult {
             spectrum,
             gain_side_info,
@@ -1126,112 +1074,6 @@ impl DbaGainMdctChannelState {
             band0_gain_count,
         }
     }
-}
-
-#[derive(Clone)]
-pub(crate) struct DbaQmfProductionTrace {
-    pub(crate) channel: u32,
-    pub(crate) pcm_input: [f32; 1024],
-    pub(crate) history_before: [f32; DBA_QMF_HISTORY],
-    pub(crate) output_interleaved: [f32; 1024],
-    pub(crate) history_after: [f32; DBA_QMF_HISTORY],
-}
-
-#[derive(Clone)]
-pub(crate) struct DbaSelectChconvProductionTrace {
-    pub(crate) threshold: i32,
-    pub(crate) input_modes: [i32; 4],
-    pub(crate) output_modes: [i32; 4],
-    pub(crate) tonal_spectrum: [f32; 1024],
-    pub(crate) nontonal_spectrum: [f32; 1024],
-    pub(crate) coefficient: i32,
-}
-
-#[derive(Clone)]
-pub(crate) struct DbaChconvProductionTrace {
-    pub(crate) threshold: i32,
-    pub(crate) bands_before: [[f32; 1024]; 2],
-    pub(crate) bands_after: [[f32; 1024]; 2],
-    pub(crate) modes_before: [i32; 4],
-    pub(crate) modes_after: [i32; 4],
-    pub(crate) abs_modes_before: [i32; 4],
-    pub(crate) abs_modes_after: [i32; 4],
-    pub(crate) smooth_coefficients_before: [f32; 4],
-    pub(crate) smooth_coefficients_after: [f32; 4],
-    pub(crate) target_coefficients_before: [f32; 4],
-    pub(crate) target_coefficients_after: [f32; 4],
-    pub(crate) previous_coefficient_before: i32,
-    pub(crate) previous_coefficient_after: i32,
-    pub(crate) current_coefficient_before: i32,
-    pub(crate) current_coefficient_after: i32,
-    pub(crate) energy_history_before: [[[f32; 2]; 3]; 4],
-    pub(crate) energy_history_after: [[[f32; 2]; 3]; 4],
-}
-
-#[derive(Clone)]
-pub(crate) struct DbaGainMdctProductionTrace {
-    pub(crate) channel: u32,
-    pub(crate) input_bands: [f32; 1024],
-    pub(crate) history_before: [f32; DBA_QMF_HISTORY],
-    pub(crate) mdct_history_before: [f32; DBA_GAIN_MDCT_HISTORY],
-    pub(crate) pre_mdct_bands: [f32; 1024],
-    pub(crate) history_mid: [f32; DBA_QMF_HISTORY],
-    pub(crate) mdct_history_mid: [f32; DBA_GAIN_MDCT_HISTORY],
-    pub(crate) output_spectrum: [f32; 1024],
-    pub(crate) history_after: [f32; DBA_QMF_HISTORY],
-    pub(crate) mdct_history_after: [f32; DBA_GAIN_MDCT_HISTORY],
-    pub(crate) gain_side_info: [i32; DBA_GAIN_INFO_WORDS],
-    pub(crate) gain_side_info_ext: [i32; DBA_GAIN_INFO_EXT_WORDS],
-    pub(crate) initial_nunits: i32,
-    pub(crate) available_bits: i32,
-    pub(crate) channel_mode: i32,
-}
-
-#[derive(Clone)]
-pub(crate) struct DbaMainsubProductionTrace {
-    pub(crate) tonal_spectrum: [f32; 1024],
-    pub(crate) tonal_bfu_count: i32,
-    pub(crate) nontonal_spectrum: [f32; 1024],
-    pub(crate) nontonal_bfu_count: i32,
-    pub(crate) base_position: i32,
-    pub(crate) position_scale: i32,
-    pub(crate) mode: i32,
-    pub(crate) fixed_splice: i32,
-    pub(crate) splice_position: i32,
-}
-
-#[derive(Clone)]
-pub(crate) struct DbaAt3DataProductionTrace {
-    pub(crate) channel: u32,
-    pub(crate) param_2_channel_block: u32,
-    pub(crate) spectrum_in: [f32; 1024],
-    pub(crate) initial_nunits: i32,
-    pub(crate) available_bits: i32,
-    pub(crate) channel_mode: i32,
-    pub(crate) prior_tone_counts: [i32; 4],
-    pub(crate) param_1_0xb56: i32,
-    pub(crate) channel_flags: i32,
-    pub(crate) balance_spectrum: [f32; 1024],
-    pub(crate) balance_idsfs: [u32; 256],
-    pub(crate) presence_after: [i32; 32],
-    pub(crate) allocation_after: [i32; 32],
-    pub(crate) nunits: i32,
-    pub(crate) ntones: i32,
-    pub(crate) tone_table: DbaToneTable,
-    pub(crate) return_value: i32,
-    pub(crate) prelude_high_rate: bool,
-    pub(crate) post_tone_coding_layout: i32,
-    pub(crate) balance_tone_mode: i32,
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct DbaProductionFrameTrace {
-    pub(crate) qmf: Vec<DbaQmfProductionTrace>,
-    pub(crate) select_chconv: Vec<DbaSelectChconvProductionTrace>,
-    pub(crate) chconv: Vec<DbaChconvProductionTrace>,
-    pub(crate) gain_mdct: Vec<DbaGainMdctProductionTrace>,
-    pub(crate) mainsub: Vec<DbaMainsubProductionTrace>,
-    pub(crate) at3data: Vec<DbaAt3DataProductionTrace>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1300,90 +1142,18 @@ impl DbaFrameEncoder {
         pcm: &[&[f32; 1024]; 2],
         output: &mut [u8],
     ) -> Result<(), i32> {
-        self.encode_frame_inner(pcm, output, None)
-    }
-
-    pub(crate) fn encode_frame_with_trace(
-        &mut self,
-        pcm: &[&[f32; 1024]; 2],
-        output: &mut [u8],
-        trace: &mut DbaProductionFrameTrace,
-    ) -> Result<(), i32> {
-        self.encode_frame_inner(pcm, output, Some(trace))
-    }
-
-    fn encode_frame_inner(
-        &mut self,
-        pcm: &[&[f32; 1024]; 2],
-        output: &mut [u8],
-        trace: Option<&mut DbaProductionFrameTrace>,
-    ) -> Result<(), i32> {
         if output.len() < self.config.frame_bytes {
             return Err(-1);
         }
         output[..self.config.frame_bytes].fill(0);
 
-        let mut trace = trace;
         let mut qmf_bands = [[[0.0f32; 256]; 4]; 2];
         for channel in 0..2 {
-            let history_before = trace.as_ref().map(|_| self.qmf[channel].history_snapshot());
             self.qmf[channel].analysis(pcm[channel], &mut qmf_bands[channel]);
-            if let Some(trace) = trace.as_mut() {
-                trace.qmf.push(DbaQmfProductionTrace {
-                    channel: channel as u32,
-                    pcm_input: *pcm[channel],
-                    history_before: history_before.unwrap(),
-                    output_interleaved: dba_interleave_bands(&qmf_bands[channel]),
-                    history_after: self.qmf[channel].history_snapshot(),
-                });
-            }
         }
 
         if self.config.js_enabled {
-            let trace_before = trace.as_ref().map(|_| {
-                (
-                    self.chconv.clone(),
-                    [
-                        dba_interleave_bands(&qmf_bands[0]),
-                        dba_interleave_bands(&qmf_bands[1]),
-                    ],
-                )
-            });
             dba_channel_convert(&mut qmf_bands, &mut self.chconv);
-            if let Some(trace) = trace.as_mut() {
-                let (state_before, bands_before) = trace_before.unwrap();
-                let bands_after = [
-                    dba_interleave_bands(&qmf_bands[0]),
-                    dba_interleave_bands(&qmf_bands[1]),
-                ];
-                trace.select_chconv.push(DbaSelectChconvProductionTrace {
-                    threshold: state_before.threshold,
-                    input_modes: state_before.modes,
-                    output_modes: self.chconv.modes,
-                    tonal_spectrum: bands_before[0],
-                    nontonal_spectrum: bands_before[1],
-                    coefficient: self.chconv.current_coefficient,
-                });
-                trace.chconv.push(DbaChconvProductionTrace {
-                    threshold: state_before.threshold,
-                    bands_before,
-                    bands_after,
-                    modes_before: state_before.modes,
-                    modes_after: self.chconv.modes,
-                    abs_modes_before: state_before.abs_modes,
-                    abs_modes_after: self.chconv.abs_modes,
-                    smooth_coefficients_before: state_before.smooth_coefficients,
-                    smooth_coefficients_after: self.chconv.smooth_coefficients,
-                    target_coefficients_before: state_before.target_coefficients,
-                    target_coefficients_after: self.chconv.target_coefficients,
-                    previous_coefficient_before: state_before.previous_coefficient,
-                    previous_coefficient_after: self.chconv.previous_coefficient,
-                    current_coefficient_before: state_before.current_coefficient,
-                    current_coefficient_after: self.chconv.current_coefficient,
-                    energy_history_before: state_before.energy_history,
-                    energy_history_after: self.chconv.energy_history,
-                });
-            }
         }
 
         let mut gain_results: [Option<DbaGainMdctFrameResult>; 2] = [None, None];
@@ -1399,27 +1169,13 @@ impl DbaFrameEncoder {
             } else {
                 DbaGainScheduleMode::default()
             };
-            if let Some(trace) = trace.as_mut() {
-                let (result, mut gain_trace) = self.gain_mdct[channel].transform_with_trace(
-                    &input,
-                    mode,
-                    self.qmf[channel].history_snapshot(),
-                );
-                gain_trace.channel = channel as u32;
-                gain_trace.initial_nunits = self.config.initial_nunits[channel];
-                gain_trace.available_bits = self.config.base_available_bits[channel];
-                gain_trace.channel_mode = channel_mode;
-                trace.gain_mdct.push(gain_trace);
-                gain_results[channel] = Some(result);
-            } else {
-                gain_results[channel] = Some(self.gain_mdct[channel].transform(&input, mode));
-            }
+            gain_results[channel] = Some(self.gain_mdct[channel].transform(&input, mode));
         }
 
         if self.config.js_enabled {
-            self.encode_js_frame(gain_results, output, trace)
+            self.encode_js_frame(gain_results, output)
         } else {
-            self.encode_independent_frame(gain_results, output, trace)
+            self.encode_independent_frame(gain_results, output)
         }
     }
 
@@ -1439,12 +1195,11 @@ impl DbaFrameEncoder {
         }
     }
 
-    fn at3data_or_fallback_with_trace(
+    fn at3data_or_fallback(
         &self,
         gain: &DbaGainMdctFrameResult,
         channel: usize,
         available_bits: i32,
-        trace: Option<&mut DbaProductionFrameTrace>,
     ) -> DbaAt3DataResult {
         if available_bits < 0x28 {
             return dba_fallback_at3data();
@@ -1459,32 +1214,7 @@ impl DbaFrameEncoder {
             channel_flags: self.channel_flags(),
             param_1_0xb56: gain.band0_gain_count,
         };
-        let result = dba_at3data(params);
-        if let Some(trace) = trace {
-            trace.at3data.push(DbaAt3DataProductionTrace {
-                channel: channel as u32,
-                param_2_channel_block: 0,
-                spectrum_in: gain.spectrum,
-                initial_nunits: params.initial_nunits,
-                available_bits: params.available_bits,
-                channel_mode: params.channel_mode,
-                prior_tone_counts: prior_gain_counts,
-                param_1_0xb56: params.param_1_0xb56,
-                channel_flags: params.channel_flags,
-                balance_spectrum: result.residual_spectrum,
-                balance_idsfs: result.residual_idsfs,
-                presence_after: result.presence,
-                allocation_after: result.allocations,
-                nunits: result.nunits,
-                ntones: result.ntones,
-                tone_table: result.tone_table.clone(),
-                return_value: result.remaining_bits,
-                prelude_high_rate: result.coding_layout == 1,
-                post_tone_coding_layout: result.coding_layout,
-                balance_tone_mode: result.tone_mode,
-            });
-        }
-        result
+        dba_at3data(params)
     }
 
     fn pack_channel(
@@ -1512,9 +1242,7 @@ impl DbaFrameEncoder {
         &self,
         gain_results: [Option<DbaGainMdctFrameResult>; 2],
         output: &mut [u8],
-        trace: Option<&mut DbaProductionFrameTrace>,
     ) -> Result<(), i32> {
-        let mut trace = trace;
         let [Some(gain0), Some(gain1)] = gain_results else {
             return Err(-1);
         };
@@ -1529,35 +1257,12 @@ impl DbaFrameEncoder {
             mode: self.config.splice_mode,
             fixed_splice,
         });
-        if let Some(trace) = trace.as_mut() {
-            trace.mainsub.push(DbaMainsubProductionTrace {
-                tonal_spectrum: gain0.spectrum,
-                tonal_bfu_count: self.config.initial_nunits[0],
-                nontonal_spectrum: gain1.spectrum,
-                nontonal_bfu_count: self.config.initial_nunits[1],
-                base_position: self.config.base_available_bits[0],
-                position_scale: self.config.splice_scale,
-                mode: self.config.splice_mode,
-                fixed_splice,
-                splice_position: ch0_available,
-            });
-        }
-        let data0 =
-            self.at3data_or_fallback_with_trace(&gain0, 0, ch0_available, trace.as_deref_mut());
+        let data0 = self.at3data_or_fallback(&gain0, 0, ch0_available);
         let ch0_end = self.pack_channel(&data0, &gain0, 0, output, 0)?;
         let ch1_available = (self.config.frame_bytes as i32 - ch0_end as i32)
             .wrapping_mul(8)
             .wrapping_sub(0x1b);
-        if let Some(gain_trace) = trace.as_mut().and_then(|trace| {
-            trace
-                .gain_mdct
-                .iter_mut()
-                .rev()
-                .find(|cap| cap.channel == 1)
-        }) {
-            gain_trace.available_bits = ch1_available;
-        }
-        let data1 = self.at3data_or_fallback_with_trace(&gain1, 1, ch1_available, trace);
+        let data1 = self.at3data_or_fallback(&gain1, 1, ch1_available);
         self.pack_channel(&data1, &gain1, 1, output, ch0_end)?;
         output[ch0_end..self.config.frame_bytes].reverse();
         Ok(())
@@ -1567,19 +1272,13 @@ impl DbaFrameEncoder {
         &self,
         gain_results: [Option<DbaGainMdctFrameResult>; 2],
         output: &mut [u8],
-        trace: Option<&mut DbaProductionFrameTrace>,
     ) -> Result<(), i32> {
-        let mut trace = trace;
         for (channel, gain) in gain_results.into_iter().enumerate() {
             let Some(gain) = gain else {
                 return Err(-1);
             };
-            let data = self.at3data_or_fallback_with_trace(
-                &gain,
-                channel,
-                self.config.base_available_bits[channel],
-                trace.as_deref_mut(),
-            );
+            let data =
+                self.at3data_or_fallback(&gain, channel, self.config.base_available_bits[channel]);
             self.pack_channel(
                 &data,
                 &gain,
@@ -2554,36 +2253,6 @@ impl DbaToneTable {
         }
         self.components[slot] = component;
     }
-}
-
-pub(crate) fn dba_tone_table_trace_words(
-    table: &DbaToneTable,
-    component_base: u32,
-) -> [i32; 0x28c] {
-    let mut words = [0i32; 0x28c];
-    for bank in 0..2 {
-        let base = bank * 0x86;
-        words[base..base + 4].copy_from_slice(&table.banks[bank].active_quarters);
-        words[base + 4] = table.banks[bank].idwl;
-        words[base + 5] = table.banks[bank].width;
-        for group in 0..16 {
-            let group_base = base + 6 + group * 8;
-            let group_slots = &table.banks[bank].groups[group];
-            let stored = group_slots.len().min(7);
-            words[group_base] = stored as i32;
-            for (idx, slot) in group_slots.iter().take(stored).enumerate() {
-                words[group_base + 1 + idx] =
-                    component_base.wrapping_add(*slot as u32 * 0x18) as i32;
-            }
-        }
-    }
-    for (slot, component) in table.components.iter().take(0x40).enumerate() {
-        let base = 0x10c + slot * 6;
-        words[base..base + 4].copy_from_slice(&component.quantized);
-        words[base + 4] = component.position;
-        words[base + 5] = component.idsf;
-    }
-    words
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

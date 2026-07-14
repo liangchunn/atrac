@@ -1,6 +1,4 @@
-//!
-//! This helper models only the native frame-count and flush-emission boundary
-//! supply the already native-packed 2048-byte frames in output-frame order.
+//! Native frame-count, encode, and flush scheduling for the computed encoder.
 //!
 //! Evidence:
 //! - `atrac_encode` wrapper native `0x000096d0` / decompile comment `0x196d0`
@@ -12,30 +10,16 @@
 //!   decrements `state+0x1c` before calling `atx_encode(... sample_count=0 ...)`;
 //!   otherwise it sets `*produced=0`, `*done=1`.
 
-pub const TRACE_FRAME_BYTES: usize = 2048;
-pub const TRACE_TOTAL_OUTPUT_FRAMES: usize = 77;
-pub const TRACE_ENCODE_WRAPPER_CALLS: u32 = 76;
-pub const TRACE_ENCODE_OUTPUT_FRAMES: u32 = 69;
-pub const TRACE_FLUSH_WRAPPER_CALLS: u32 = 9;
-pub const TRACE_FLUSH_OUTPUT_FRAMES: u32 = 8;
-pub const TRACE_FIRST_OUTPUT_CORE_CALL: u32 = 7;
-pub const TRACE_FIRST_FLUSH_CORE_CALL: u32 = 76;
-pub const TRACE_FIRST_FLUSH_OUTPUT_FRAME: u32 = 69;
-pub const TRACE_FULL_INPUT_CORE_CALLS: u32 = 75;
-pub const TRACE_FULL_INPUT_SAMPLE_FRAMES: u32 = 2048;
-pub const TRACE_FINAL_INPUT_SAMPLE_FRAMES: u32 = 464;
-
 /// PCM sample frames a full (non-final) encode core call consumes (native
 /// `atx_encode_core` reads `input_bytes / (2 * channels)` = 2048 for the 352
-/// stereo path). Same value as [`TRACE_FULL_INPUT_SAMPLE_FRAMES`], named for the
-/// length-agnostic schedule.
+/// stereo path).
 pub const CORE_CALL_SAMPLE_FRAMES: u32 = 2048;
 
 /// The first output-bearing global core call (native delay/priming: calls 0..6
 /// produce no output frame). Universal across all input lengths — for
 /// sub-priming inputs the early flush calls simply produce 0 bytes
 /// (`len_edges_run.json` N=6144: 4 zero-producing flush calls then 5
-/// output-bearing ones). Same value as [`TRACE_FIRST_OUTPUT_CORE_CALL`].
+/// output-bearing ones).
 pub const FIRST_OUTPUT_CORE_CALL: u32 = 7;
 
 /// The native minimum accepted input length. `at3tool` `checkEncodeParam`
@@ -172,33 +156,13 @@ impl ComputedSchedule352 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TraceFedFrameSource {
+pub enum FrameSource {
     Encode,
     Flush,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraceFedFrameResult<'a> {
-    pub source: TraceFedFrameSource,
-    pub core_call_index: Option<u32>,
-    pub output_frame_index: Option<u32>,
-    pub produced_bytes: usize,
-    pub frame_bytes: Option<&'a [u8]>,
-    pub done: bool,
-    pub flush_remaining: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TraceFedFlushError {
-    InvalidFrameCount {
-        expected: usize,
-        actual: usize,
-    },
-    InvalidFrameSize {
-        frame_index: usize,
-        expected: usize,
-        actual: usize,
-    },
+pub enum FlushScheduleError {
     WrongSampleFrameCount {
         core_call_index: u32,
         expected: u32,
@@ -213,183 +177,16 @@ pub enum TraceFedFlushError {
     FlushAlreadyDone,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraceFedFlushScheduler {
-    frames: Vec<Vec<u8>>,
-    encode_calls: u32,
-    flush_calls: u32,
-    flush_remaining: u32,
-    output_frames_emitted: u32,
-    input_exhausted: bool,
-    flush_started: bool,
-    flush_done: bool,
-}
-
-impl TraceFedFlushScheduler {
-    pub fn new(frames: Vec<Vec<u8>>) -> Result<Self, TraceFedFlushError> {
-        if frames.len() != TRACE_TOTAL_OUTPUT_FRAMES {
-            return Err(TraceFedFlushError::InvalidFrameCount {
-                expected: TRACE_TOTAL_OUTPUT_FRAMES,
-                actual: frames.len(),
-            });
-        }
-        for (frame_index, frame) in frames.iter().enumerate() {
-            if frame.len() != TRACE_FRAME_BYTES {
-                return Err(TraceFedFlushError::InvalidFrameSize {
-                    frame_index,
-                    expected: TRACE_FRAME_BYTES,
-                    actual: frame.len(),
-                });
-            }
-        }
-
-        Ok(Self {
-            frames,
-            encode_calls: 0,
-            flush_calls: 0,
-            flush_remaining: TRACE_FLUSH_WRAPPER_CALLS,
-            output_frames_emitted: 0,
-            input_exhausted: false,
-            flush_started: false,
-            flush_done: false,
-        })
-    }
-
-    pub fn encode_chunk(
-        &mut self,
-        sample_frames: u32,
-    ) -> Result<TraceFedFrameResult<'_>, TraceFedFlushError> {
-        if self.flush_started {
-            return Err(TraceFedFlushError::EncodeAfterFlushStarted);
-        }
-        if self.encode_calls >= TRACE_ENCODE_WRAPPER_CALLS {
-            return Err(TraceFedFlushError::TooManyEncodeCalls);
-        }
-
-        let core_call_index = self.encode_calls;
-        let expected = expected_encode_sample_frames(core_call_index);
-        if sample_frames != expected {
-            return Err(TraceFedFlushError::WrongSampleFrameCount {
-                core_call_index,
-                expected,
-                actual: sample_frames,
-            });
-        }
-
-        self.encode_calls += 1;
-        if self.encode_calls == TRACE_ENCODE_WRAPPER_CALLS {
-            self.input_exhausted = true;
-            self.flush_remaining = TRACE_FLUSH_OUTPUT_FRAMES;
-        }
-
-        let output_frame_index = if core_call_index >= TRACE_FIRST_OUTPUT_CORE_CALL {
-            Some(core_call_index - TRACE_FIRST_OUTPUT_CORE_CALL)
-        } else {
-            None
-        };
-        if output_frame_index.is_some() {
-            self.output_frames_emitted += 1;
-        }
-
-        Ok(self.result(
-            TraceFedFrameSource::Encode,
-            Some(core_call_index),
-            output_frame_index,
-            false,
-        ))
-    }
-
-    pub fn flush(&mut self) -> Result<TraceFedFrameResult<'_>, TraceFedFlushError> {
-        if !self.input_exhausted {
-            return Err(TraceFedFlushError::FlushBeforeInputExhausted {
-                encode_calls: self.encode_calls,
-                expected: TRACE_ENCODE_WRAPPER_CALLS,
-            });
-        }
-        if self.flush_done {
-            return Err(TraceFedFlushError::FlushAlreadyDone);
-        }
-
-        self.flush_started = true;
-        let flush_call_index = self.flush_calls;
-        self.flush_calls += 1;
-
-        if flush_call_index < TRACE_FLUSH_OUTPUT_FRAMES {
-            self.flush_remaining -= 1;
-            let core_call_index = TRACE_FIRST_FLUSH_CORE_CALL + flush_call_index;
-            let output_frame_index = TRACE_FIRST_FLUSH_OUTPUT_FRAME + flush_call_index;
-            self.output_frames_emitted += 1;
-            Ok(self.result(
-                TraceFedFrameSource::Flush,
-                Some(core_call_index),
-                Some(output_frame_index),
-                false,
-            ))
-        } else {
-            self.flush_done = true;
-            Ok(self.result(TraceFedFrameSource::Flush, None, None, true))
-        }
-    }
-
-    pub fn encode_calls(&self) -> u32 {
-        self.encode_calls
-    }
-
-    pub fn flush_calls(&self) -> u32 {
-        self.flush_calls
-    }
-
-    pub fn flush_remaining(&self) -> u32 {
-        self.flush_remaining
-    }
-
-    pub fn output_frames_emitted(&self) -> u32 {
-        self.output_frames_emitted
-    }
-
-    pub fn is_done(&self) -> bool {
-        self.flush_done
-    }
-
-    fn result(
-        &self,
-        source: TraceFedFrameSource,
-        core_call_index: Option<u32>,
-        output_frame_index: Option<u32>,
-        done: bool,
-    ) -> TraceFedFrameResult<'_> {
-        let frame_bytes = output_frame_index.map(|index| self.frames[index as usize].as_slice());
-        TraceFedFrameResult {
-            source,
-            core_call_index,
-            output_frame_index,
-            produced_bytes: frame_bytes.map_or(0, <[u8]>::len),
-            frame_bytes,
-            done,
-            flush_remaining: self.flush_remaining,
-        }
-    }
-}
-
-fn expected_encode_sample_frames(core_call_index: u32) -> u32 {
-    if core_call_index < TRACE_FULL_INPUT_CORE_CALLS {
-        TRACE_FULL_INPUT_SAMPLE_FRAMES
-    } else {
-        TRACE_FINAL_INPUT_SAMPLE_FRAMES
-    }
-}
-
 // ===========================================================================
 // docs/11 Phase 2 §2.2 (c) / docs/12 §0.1 — computed-frame flush scheduler.
 //
-// A drop-in counterpart to [`TraceFedFlushScheduler`] that COMPUTES each output
-// frame from PCM (via [`ComputedFrameDriver`]) instead of replaying captured
-// native frames. It reproduces the native schedule contract for ANY input of
+// Computes each output frame from PCM via [`ComputedFrameDriver`]. It reproduces
+// the native schedule contract for ANY input of
 // `N >= MIN_INPUT_SAMPLE_FRAMES` sample frames per channel, driven by a
 // [`ComputedSchedule352`] (see its doc comment for the native sources): encode
 // calls + PCM-processing flush calls (8 or 9) → output frames, first output at
 // (N=154064) this is exactly the archived 76 encode + 9 flush → 77 output
-// contract validated against `api_trace`; the trace-fed scheduler stays intact
+// contract.
 //
 // The driver's per-call PCM is supplied at construction (the length-agnostic
 // `core_call_pcm_frames_352` chunking: `encode_calls` encode frames incl. the
@@ -404,16 +201,14 @@ use crate::encoder::computed_frame::{
 };
 use crate::encoder::frontend::FRONTEND_FRAME_SAMPLES;
 
-/// Errors from the computed flush scheduler: the trace-fed schedule errors plus
-/// the computed-frame assembly errors, the too-short guard, and a PCM-shape
-/// guard.
+/// Errors from the computed flush scheduler.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComputedFlushError {
     /// The input is shorter than the native minimum (`N < MIN_INPUT_SAMPLE_FRAMES`;
     /// native `at3tool` rejects it before any library call — fail explicit).
     InputTooShort(InputTooShort),
-    /// A schedule contract violation (same set as [`TraceFedFlushError`]).
-    Schedule(TraceFedFlushError),
+    /// A schedule contract violation (same set as [`FlushScheduleError`]).
+    Schedule(FlushScheduleError),
     /// The per-call PCM frame supply had the wrong length (must be exactly the
     /// derived `core_call_pcm_frames_352` chunking:
     /// `encode_calls + flush_processing_calls`).
@@ -431,16 +226,15 @@ pub enum ComputedFlushError {
         expected: usize,
         actual: usize,
     },
-    /// The computed single-frame assembly failed at this core call (typically an
-    /// untraceable dispatch arm past the parity horizon — surfaced, never wired).
+    /// The computed single-frame assembly failed at this core call.
     Compute {
         core_call_index: u32,
         error: ComputedFrameError,
     },
 }
 
-impl From<TraceFedFlushError> for ComputedFlushError {
-    fn from(error: TraceFedFlushError) -> Self {
+impl From<FlushScheduleError> for ComputedFlushError {
+    fn from(error: FlushScheduleError) -> Self {
         ComputedFlushError::Schedule(error)
     }
 }
@@ -451,11 +245,10 @@ impl From<InputTooShort> for ComputedFlushError {
     }
 }
 
-/// A computed output-frame result. Mirrors [`TraceFedFrameResult`] but owns the
-/// computed 2048 bytes.
+/// A computed output-frame result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputedFrameResult {
-    pub source: TraceFedFrameSource,
+    pub source: FrameSource,
     pub core_call_index: Option<u32>,
     pub output_frame_index: Option<u32>,
     pub produced_bytes: usize,
@@ -595,8 +388,7 @@ impl ComputedFlushScheduler {
             flush_calls: 0,
             // Before input is exhausted, the eventual flush drain length is the
             // full wrapper count (processing + 1). Reset to the processing count
-            // once the final encode call runs (matching the trace-fed scheduler's
-            // `flush_remaining` bookkeeping).
+            // once the final encode call runs.
             flush_remaining: schedule.flush_wrapper_calls(),
             output_frames_emitted: 0,
             input_exhausted: false,
@@ -611,23 +403,22 @@ impl ComputedFlushScheduler {
     }
 
     /// One encode wrapper call for a chunk of `sample_frames` samples. The
-    /// sample-count contract is identical in shape to
-    /// [`TraceFedFlushScheduler::encode_chunk`], derived from the schedule; the
-    /// frame bytes are COMPUTED from the stored PCM for this core call.
+    /// sample-count contract is derived from the schedule; the frame bytes are
+    /// computed from the stored PCM for this core call.
     pub fn encode_chunk(
         &mut self,
         sample_frames: u32,
     ) -> Result<ComputedFrameResult, ComputedFlushError> {
         if self.flush_started {
-            return Err(TraceFedFlushError::EncodeAfterFlushStarted.into());
+            return Err(FlushScheduleError::EncodeAfterFlushStarted.into());
         }
         if self.encode_calls >= self.schedule.encode_calls() {
-            return Err(TraceFedFlushError::TooManyEncodeCalls.into());
+            return Err(FlushScheduleError::TooManyEncodeCalls.into());
         }
         let core_call_index = self.encode_calls;
         let expected = self.schedule.expected_encode_sample_frames(core_call_index);
         if sample_frames != expected {
-            return Err(TraceFedFlushError::WrongSampleFrameCount {
+            return Err(FlushScheduleError::WrongSampleFrameCount {
                 core_call_index,
                 expected,
                 actual: sample_frames,
@@ -653,7 +444,7 @@ impl ComputedFlushScheduler {
             self.output_frames_emitted += 1;
         }
         Ok(self.result(
-            TraceFedFrameSource::Encode,
+            FrameSource::Encode,
             Some(core_call_index),
             output_frame_index,
             frame,
@@ -661,19 +452,18 @@ impl ComputedFlushScheduler {
         ))
     }
 
-    /// One flush wrapper call. The schedule is identical in shape to
-    /// [`TraceFedFlushScheduler::flush`], derived from the schedule; the frame
-    /// bytes are COMPUTED from the stored zero-PCM flush frame for this core call.
+    /// One flush wrapper call. The frame bytes are computed from the stored
+    /// zero-PCM flush frame for this core call.
     pub fn flush(&mut self) -> Result<ComputedFrameResult, ComputedFlushError> {
         if !self.input_exhausted {
-            return Err(TraceFedFlushError::FlushBeforeInputExhausted {
+            return Err(FlushScheduleError::FlushBeforeInputExhausted {
                 encode_calls: self.encode_calls,
                 expected: self.schedule.encode_calls(),
             }
             .into());
         }
         if self.flush_done {
-            return Err(TraceFedFlushError::FlushAlreadyDone.into());
+            return Err(FlushScheduleError::FlushAlreadyDone.into());
         }
 
         self.flush_started = true;
@@ -696,7 +486,7 @@ impl ComputedFlushScheduler {
                 self.output_frames_emitted += 1;
             }
             Ok(self.result(
-                TraceFedFrameSource::Flush,
+                FrameSource::Flush,
                 Some(core_call_index),
                 output_frame_index,
                 frame,
@@ -706,7 +496,7 @@ impl ComputedFlushScheduler {
             // The trailing flush wrapper call is the "done" call — no PCM, no
             // output.
             self.flush_done = true;
-            Ok(self.result(TraceFedFrameSource::Flush, None, None, None, true))
+            Ok(self.result(FrameSource::Flush, None, None, None, true))
         }
     }
 
@@ -743,7 +533,7 @@ impl ComputedFlushScheduler {
 
     fn result(
         &self,
-        source: TraceFedFrameSource,
+        source: FrameSource,
         core_call_index: Option<u32>,
         output_frame_index: Option<u32>,
         frame_bytes: Option<Vec<u8>>,
@@ -819,15 +609,15 @@ impl IncrementalComputedFlushScheduler {
         frame: &[Vec<f32>],
     ) -> Result<ComputedFrameResult, ComputedFlushError> {
         if self.flush_started {
-            return Err(TraceFedFlushError::EncodeAfterFlushStarted.into());
+            return Err(FlushScheduleError::EncodeAfterFlushStarted.into());
         }
         if self.encode_calls >= self.schedule.encode_calls() {
-            return Err(TraceFedFlushError::TooManyEncodeCalls.into());
+            return Err(FlushScheduleError::TooManyEncodeCalls.into());
         }
         let core_call_index = self.encode_calls;
         let expected = self.schedule.expected_encode_sample_frames(core_call_index);
         if sample_frames != expected {
-            return Err(TraceFedFlushError::WrongSampleFrameCount {
+            return Err(FlushScheduleError::WrongSampleFrameCount {
                 core_call_index,
                 expected,
                 actual: sample_frames,
@@ -848,7 +638,7 @@ impl IncrementalComputedFlushScheduler {
             self.output_frames_emitted += 1;
         }
         Ok(self.result(
-            TraceFedFrameSource::Encode,
+            FrameSource::Encode,
             Some(core_call_index),
             output_frame_index,
             computed,
@@ -860,14 +650,14 @@ impl IncrementalComputedFlushScheduler {
     /// one fixed all-zero frame; the final done call consumes no PCM.
     pub fn flush(&mut self) -> Result<ComputedFrameResult, ComputedFlushError> {
         if !self.input_exhausted {
-            return Err(TraceFedFlushError::FlushBeforeInputExhausted {
+            return Err(FlushScheduleError::FlushBeforeInputExhausted {
                 encode_calls: self.encode_calls,
                 expected: self.schedule.encode_calls(),
             }
             .into());
         }
         if self.flush_done {
-            return Err(TraceFedFlushError::FlushAlreadyDone.into());
+            return Err(FlushScheduleError::FlushAlreadyDone.into());
         }
 
         self.flush_started = true;
@@ -882,7 +672,7 @@ impl IncrementalComputedFlushScheduler {
                 self.output_frames_emitted += 1;
             }
             Ok(self.result(
-                TraceFedFrameSource::Flush,
+                FrameSource::Flush,
                 Some(core_call_index),
                 output_frame_index,
                 computed,
@@ -890,7 +680,7 @@ impl IncrementalComputedFlushScheduler {
             ))
         } else {
             self.flush_done = true;
-            Ok(self.result(TraceFedFrameSource::Flush, None, None, None, true))
+            Ok(self.result(FrameSource::Flush, None, None, None, true))
         }
     }
 
@@ -952,7 +742,7 @@ impl IncrementalComputedFlushScheduler {
 
     fn result(
         &self,
-        source: TraceFedFrameSource,
+        source: FrameSource,
         core_call_index: Option<u32>,
         output_frame_index: Option<u32>,
         frame_bytes: Option<Vec<u8>>,

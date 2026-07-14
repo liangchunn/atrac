@@ -7,7 +7,7 @@
 //!
 //! The encoder's `qmf` leaf (`0x6a0ac`) consumes this window directly without
 //! any additional scale factor, so the Rust encoder must use the same
-//! un-doubled values to match `libatrac.so` traces byte-for-byte (within float
+//! un-doubled values to match `libatrac.so` byte-for-byte (within float
 //! tolerance).
 
 #![allow(clippy::excessive_precision)]

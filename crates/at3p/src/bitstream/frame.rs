@@ -244,69 +244,6 @@ pub struct FramePrepackerState {
     pub groups: Vec<BlockGroup>,
 }
 
-/// A recorded bit cursor at a native family checkpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FamilyCursor {
-    pub checkpoint: &'static str,
-    pub block_index: Option<usize>,
-    pub bit_cursor: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FramePackSummary {
-    pub frame_bytes: usize,
-    pub cursors: Vec<FamilyCursor>,
-    pub final_bit_pos: usize,
-}
-
-/// One decisive integer input recorded for a development-only pack element.
-///
-/// These are selector/count/gate values, not a dump of the pre-packer state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PackLedgerInput {
-    pub name: &'static str,
-    pub value: i64,
-}
-
-/// One compact syntax-element cursor interval from the diagnostic pack path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PackLedgerRow {
-    pub core_call: u32,
-    pub element: &'static str,
-    pub group_index: Option<usize>,
-    pub block_index: Option<usize>,
-    pub start_bit: usize,
-    /// Bits successfully emitted by this element. On error this can be smaller
-    /// than the attempted element because `BitWriter` rejects the overflowing
-    /// scalar write without advancing its cursor.
-    pub bit_count: usize,
-    pub end_bit: usize,
-    pub capacity_bits: usize,
-    pub inputs: Vec<PackLedgerInput>,
-    /// The nested typed pack error for the element that stopped. `None` means
-    /// the element completed.
-    pub error: Option<String>,
-}
-
-/// Development-only compact pack cursor ledger for one output-bearing core
-/// call. The shipping path calls [`pack_frame_at5`] and never constructs this.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PackCursorLedger {
-    pub core_call: u32,
-    pub capacity_bits: usize,
-    pub rows: Vec<PackLedgerRow>,
-}
-
-impl PackCursorLedger {
-    pub fn new(core_call: u32, capacity_bits: usize) -> Self {
-        Self {
-            core_call,
-            capacity_bits,
-            rows: Vec::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameAssemblyError {
     MissingObjectWord {
@@ -326,14 +263,6 @@ pub enum FrameAssemblyError {
     /// the 352 stereo path (fully pinned); kept per the plan.
     UnpinnedOrdering {
         section: &'static str,
-    },
-    /// A section whose native order is pinned but whose Rust composition is not
-    /// yet landed. Carries the cursors reached before it so progressive parity
-    /// is checkable at the family boundary.
-    SectionPending {
-        section: &'static str,
-        cursors: Vec<FamilyCursor>,
-        bit_pos: usize,
     },
     /// A spectral descriptor slot index derived from the object state falls
     /// outside the native 112-slot `g_aaa_hcspec` matrix.
@@ -408,118 +337,24 @@ fn dispatch_index(mode_low_bits: u32, channel_parity: u32) -> usize {
 /// Assemble one whole ATRAC3plus frame from captured pre-packer state, walking
 /// the pinned native emission order and composing the existing packer leaves.
 ///
-/// On reaching a not-yet-composed section this returns
-/// `FrameAssemblyError::SectionPending` with the family cursors reached so far;
-/// the `BitWriter` retains every byte and bit written up to that boundary.
 pub fn pack_frame_at5(
     state: &FramePrepackerState,
     writer: &mut BitWriter<'_>,
-) -> Result<FramePackSummary, FrameAssemblyError> {
-    pack_frame_at5_impl(state, writer, None)
-}
-
-/// Diagnostic sibling of [`pack_frame_at5`] used by the development probe.
-/// It walks the identical implementation and records compact cursor intervals;
-/// the ledger is observational and never changes the emitted bytes or errors.
-pub fn pack_frame_at5_with_ledger(
-    state: &FramePrepackerState,
-    writer: &mut BitWriter<'_>,
-    ledger: &mut PackCursorLedger,
-) -> Result<FramePackSummary, FrameAssemblyError> {
-    debug_assert_eq!(ledger.capacity_bits, writer.capacity_bits());
-    pack_frame_at5_impl(state, writer, Some(ledger))
-}
-
-fn record_pack_element<T, F, I>(
-    writer: &mut BitWriter<'_>,
-    ledger: &mut Option<&mut PackCursorLedger>,
-    element: &'static str,
-    group_index: Option<usize>,
-    block_index: Option<usize>,
-    inputs: I,
-    pack: F,
-) -> Result<T, FrameAssemblyError>
-where
-    F: FnOnce(&mut BitWriter<'_>) -> Result<T, FrameAssemblyError>,
-    I: FnOnce() -> Vec<PackLedgerInput>,
-{
-    if ledger.is_none() {
-        return pack(writer);
-    }
-    let start_bit = writer.bit_pos();
-    let inputs = inputs();
-    let result = pack(writer);
-    let end_bit = writer.bit_pos();
-    let error = result.as_ref().err().map(|error| format!("{error:?}"));
-    let target = ledger.as_deref_mut().expect("ledger checked above");
-    target.rows.push(PackLedgerRow {
-        core_call: target.core_call,
-        element,
-        group_index,
-        block_index,
-        start_bit,
-        bit_count: end_bit - start_bit,
-        end_bit,
-        capacity_bits: target.capacity_bits,
-        inputs,
-        error,
-    });
-    result
-}
-
-fn input(name: &'static str, value: impl Into<i64>) -> PackLedgerInput {
-    PackLedgerInput {
-        name,
-        value: value.into(),
-    }
-}
-
-/// Stable scalar digest for compact development-ledger comparisons of native
-/// decision arrays. This is diagnostic-only and never participates in packing.
-fn diagnostic_word_hash(words: &[u32]) -> i64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for word in words {
-        for byte in word.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    hash as i64
-}
-
-fn diagnostic_object_words_hash(obj: &ObjectState, offset: usize, count: usize) -> i64 {
-    obj.u32_array(offset, count)
-        .map(|words| diagnostic_word_hash(&words))
-        .unwrap_or(-1)
+) -> Result<(), FrameAssemblyError> {
+    pack_frame_at5_impl(state, writer)
 }
 
 fn pack_frame_at5_impl(
     state: &FramePrepackerState,
     writer: &mut BitWriter<'_>,
-    mut ledger: Option<&mut PackCursorLedger>,
-) -> Result<FramePackSummary, FrameAssemblyError> {
-    let mut cursors: Vec<FamilyCursor> = Vec::new();
-
+) -> Result<(), FrameAssemblyError> {
     // Frame prologue: one reserved bit, value 0.
-    record_pack_element(
-        writer,
-        &mut ledger,
-        "frame.prologue",
-        None,
-        None,
-        Vec::new,
-        |writer| {
-            writer.write_bits(0, 1)?;
-            Ok(())
-        },
-    )?;
-    cursors.push(FamilyCursor {
-        checkpoint: "prologue",
-        block_index: None,
-        bit_cursor: writer.bit_pos(),
-    });
+    {
+        writer.write_bits(0, 1)?;
+        Ok::<(), FrameAssemblyError>(())
+    }?;
 
-    for (group_index, group) in state.groups.iter().enumerate() {
+    for group in &state.groups {
         let cfg_source = &group
             .objects
             .first()
@@ -531,27 +366,12 @@ fn pack_frame_at5_impl(
         let channel_mode = cfg_source.cfg_u32(0xa0)?;
         let quant_header = cfg_source.cfg_u32(0xc4)?;
         let header_flag = cfg_source.cfg_u32(0x118)?;
-        record_pack_element(
-            writer,
-            &mut ledger,
-            "group.header",
-            Some(group_index),
-            None,
-            || {
-                vec![
-                    input("channel_mode", channel_mode),
-                    input("quant_header", quant_header),
-                    input("flag_118", header_flag),
-                    input("nblk", group.nblk as i64),
-                ]
-            },
-            |writer| {
-                writer.write_bits(channel_mode, 2)?;
-                writer.write_bits(quant_header.wrapping_sub(1), 5)?;
-                writer.write_bits(header_flag, 1)?;
-                Ok(())
-            },
-        )?;
+        {
+            writer.write_bits(channel_mode, 2)?;
+            writer.write_bits(quant_header.wrapping_sub(1), 5)?;
+            writer.write_bits(header_flag, 1)?;
+            Ok::<(), FrameAssemblyError>(())
+        }?;
 
         let nblk = group.nblk;
         let quant_unit_count = cfg_source.cfg_u32(0xb0)? as usize;
@@ -559,308 +379,68 @@ fn pack_frame_at5_impl(
         // IDWL section (native 46226..46260).
         for (i, obj) in group.objects.iter().enumerate().take(nblk) {
             let mode = obj.u32(0x1c70c)?;
-            let dispatch = dispatch_index(mode, obj.channel_index & 1);
-            record_pack_element(
-                writer,
-                &mut ledger,
-                "idwl.mode",
-                Some(group_index),
-                Some(i),
-                || {
-                    vec![
-                        input("mode", mode),
-                        input("dispatch", dispatch as i64),
-                        input("channel", obj.channel_index),
-                    ]
-                },
-                |writer| {
-                    writer.write_bits(mode, 2)?;
-                    Ok(())
-                },
-            )?;
-            cursors.push(FamilyCursor {
-                checkpoint: "idwl",
-                block_index: Some(i),
-                bit_cursor: writer.bit_pos(),
-            });
-            record_pack_element(
-                writer,
-                &mut ledger,
-                "idwl.body",
-                Some(group_index),
-                Some(i),
-                || {
-                    let config_count_word = obj.cfg_u32(0xc4).ok();
-                    let count_word = obj.u32(0x1c728).ok();
-                    let config_count = config_count_word.unwrap_or(0) as usize;
-                    let count = count_word.unwrap_or(0) as usize;
-                    let previous_hash = previous_object(group, obj)
-                        .map(|previous| {
-                            diagnostic_object_words_hash(previous, 0x1b5f8, config_count)
-                        })
-                        .unwrap_or(-1);
-                    vec![
-                        input("mode", mode),
-                        input("dispatch", dispatch as i64),
-                        input("channel", obj.channel_index),
-                        input(
-                            "config_count",
-                            config_count_word.map(i64::from).unwrap_or(-1),
-                        ),
-                        input("count", count_word.map(i64::from).unwrap_or(-1)),
-                        input("selector_a", obj.u32(0x1c71c).unwrap_or(u32::MAX)),
-                        input("huffman_selector", obj.u32(0x1c720).unwrap_or(u32::MAX)),
-                        input("selector_b", obj.u32(0x1c724).unwrap_or(u32::MAX)),
-                        input("mode3_value", obj.u32(0x1c72c).unwrap_or(u32::MAX)),
-                        input(
-                            "current_word_lengths_hash",
-                            diagnostic_object_words_hash(obj, 0x1b5f8, config_count),
-                        ),
-                        input("previous_word_lengths_hash", previous_hash),
-                        input(
-                            "aux_values_hash",
-                            diagnostic_object_words_hash(obj, 0x1c7f0, config_count.max(count)),
-                        ),
-                    ]
-                },
-                |writer| pack_idwl(writer, group, i, obj),
-            )?;
+            {
+                writer.write_bits(mode, 2)?;
+                Ok::<(), FrameAssemblyError>(())
+            }?;
+            pack_idwl(writer, group, i, obj)?;
         }
 
         // IDSF section (native 46261..46294).
         if quant_unit_count > 0 {
             for (i, obj) in group.objects.iter().enumerate().take(nblk) {
                 let mode = obj.u32(0x1c73c)?;
-                let dispatch = dispatch_index(mode, obj.channel_index & 1);
-                record_pack_element(
-                    writer,
-                    &mut ledger,
-                    "idsf.mode",
-                    Some(group_index),
-                    Some(i),
-                    || {
-                        vec![
-                            input("mode", mode),
-                            input("dispatch", dispatch as i64),
-                            input("quant_units", quant_unit_count as i64),
-                            input("channel", obj.channel_index),
-                        ]
-                    },
-                    |writer| {
-                        writer.write_bits(mode, 2)?;
-                        Ok(())
-                    },
-                )?;
-                cursors.push(FamilyCursor {
-                    checkpoint: "idsf",
-                    block_index: Some(i),
-                    bit_cursor: writer.bit_pos(),
-                });
-                record_pack_element(
-                    writer,
-                    &mut ledger,
-                    "idsf.body",
-                    Some(group_index),
-                    Some(i),
-                    || {
-                        let current_hash =
-                            diagnostic_object_words_hash(obj, 0x1b678, quant_unit_count);
-                        let previous_hash = previous_object(group, obj)
-                            .map(|previous| {
-                                diagnostic_object_words_hash(previous, 0x1b678, quant_unit_count)
-                            })
-                            .unwrap_or(-1);
-                        vec![
-                            input("mode", mode),
-                            input("dispatch", dispatch as i64),
-                            input("quant_units", quant_unit_count as i64),
-                            input("channel", obj.channel_index),
-                            input("current_scalefactors_hash", current_hash),
-                            input("previous_scalefactors_hash", previous_hash),
-                            input(
-                                "side_words_hash",
-                                diagnostic_object_words_hash(obj, 0x1c740, 12),
-                            ),
-                        ]
-                    },
-                    |writer| pack_idsf(writer, group, i, obj),
-                )?;
+                {
+                    writer.write_bits(mode, 2)?;
+                    Ok::<(), FrameAssemblyError>(())
+                }?;
+                pack_idsf(writer, group, i, obj)?;
             }
         }
 
         // IDCT section (native 46295..46377).
         if quant_unit_count > 0 {
             let bandwidth_gate = cfg_source.cfg_u32(0x90)?;
-            record_pack_element(
-                writer,
-                &mut ledger,
-                "idct.header",
-                Some(group_index),
-                None,
-                || vec![input("bandwidth_gate", bandwidth_gate)],
-                |writer| {
-                    writer.write_bits(bandwidth_gate, 1)?;
-                    Ok(())
-                },
-            )?;
+            {
+                writer.write_bits(bandwidth_gate, 1)?;
+                Ok::<(), FrameAssemblyError>(())
+            }?;
             for (i, obj) in group.objects.iter().enumerate().take(nblk) {
                 let bandwidth = obj.u32(0x1074)?;
                 let mode = obj.u32(0x1078)?;
-                let dispatch = dispatch_index(mode, obj.channel_index & 1);
-                record_pack_element(
-                    writer,
-                    &mut ledger,
-                    "idct.mode",
-                    Some(group_index),
-                    Some(i),
-                    || {
-                        vec![
-                            input("bandwidth", bandwidth),
-                            input("mode", mode),
-                            input("dispatch", dispatch as i64),
-                            input("quant_units", quant_unit_count as i64),
-                            input("channel", obj.channel_index),
-                        ]
-                    },
-                    |writer| {
-                        writer.write_bits(bandwidth, 1)?;
-                        writer.write_bits(mode, 2)?;
-                        Ok(())
-                    },
-                )?;
-                cursors.push(FamilyCursor {
-                    checkpoint: "idct",
-                    block_index: Some(i),
-                    bit_cursor: writer.bit_pos(),
-                });
-                record_pack_element(
-                    writer,
-                    &mut ledger,
-                    "idct.body",
-                    Some(group_index),
-                    Some(i),
-                    || {
-                        vec![
-                            input("bandwidth", bandwidth),
-                            input("mode", mode),
-                            input("dispatch", dispatch as i64),
-                            input("quant_units", quant_unit_count as i64),
-                            input("channel", obj.channel_index),
-                        ]
-                    },
-                    |writer| pack_idct(writer, group, i, obj, quant_unit_count),
-                )?;
+                {
+                    writer.write_bits(bandwidth, 1)?;
+                    writer.write_bits(mode, 2)?;
+                    Ok::<(), FrameAssemblyError>(())
+                }?;
+                pack_idct(writer, group, i, obj, quant_unit_count)?;
             }
         }
-
-        cursors.push(FamilyCursor {
-            checkpoint: "spectral",
-            block_index: None,
-            bit_cursor: writer.bit_pos(),
-        });
 
         // Spectral payload + per-block IDSPCQU tail (native 46378..46632). Each
         // block emits its descriptor-unit stream then its 4-bit level-word tail.
         let bandwidth_remap = cfg_source.cfg_u32(0x90)? == 0;
-        for (i, obj) in group.objects.iter().enumerate().take(nblk) {
-            let bandwidth = obj.u32(0x1074)?;
-            let active_units = (0..quant_unit_count)
-                .map(|qu| obj.u32(0x1b5f8 + qu * 4))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .filter(|&word_length| word_length as i32 > 0)
-                .count();
-            record_pack_element(
-                writer,
-                &mut ledger,
-                "spectral",
-                Some(group_index),
-                Some(i),
-                || {
-                    vec![
-                        input("quant_units", quant_unit_count as i64),
-                        input("active_units", active_units as i64),
-                        input("bandwidth", bandwidth),
-                        input("bandwidth_remap", i64::from(bandwidth_remap)),
-                    ]
-                },
-                |writer| pack_spectral_block(writer, obj, quant_unit_count, bandwidth_remap),
-            )?;
-            let tail_index = cfg_source.cfg_u32(0xc0)? as usize + 0x1f;
-            let tail_count = idspcqu_tail_count_at(tail_index).unwrap_or(0);
-            record_pack_element(
-                writer,
-                &mut ledger,
-                "spectral.idspcqu",
-                Some(group_index),
-                Some(i),
-                || {
-                    vec![
-                        input("table_index", tail_index as i64),
-                        input("level_count", tail_count as i64),
-                    ]
-                },
-                |writer| pack_spectral_idspcqu_block(writer, obj, cfg_source, quant_unit_count),
-            )?;
-            cursors.push(FamilyCursor {
-                checkpoint: "spectral_block_end",
-                block_index: Some(i),
-                bit_cursor: writer.bit_pos(),
-            });
+        for obj in group.objects.iter().take(nblk) {
+            pack_spectral_block(writer, obj, quant_unit_count, bandwidth_remap)?;
+            pack_spectral_idspcqu_block(writer, obj, cfg_source, quant_unit_count)?;
         }
 
         // Stereo config side data (native 46633..46781, gated `iVar19 == 2`).
         if nblk == 2 {
-            let count = cfg_source.cfg_u32(0xc0)?;
-            record_pack_element(
-                writer,
-                &mut ledger,
-                "stereo_config",
-                Some(group_index),
-                None,
-                || {
-                    vec![
-                        input("count", count),
-                        input("group1_head", cfg_source.cfg_u32(0x48).unwrap_or(0)),
-                        input("group1_inner", cfg_source.cfg_u32(0x4c).unwrap_or(0)),
-                        input("group2_head", cfg_source.cfg_u32(0x00).unwrap_or(0)),
-                        input("group2_inner", cfg_source.cfg_u32(0x04).unwrap_or(0)),
-                    ]
-                },
-                |writer| pack_stereo_config_block(writer, cfg_source),
-            )?;
+            pack_stereo_config_block(writer, cfg_source)?;
         }
-        cursors.push(FamilyCursor {
-            checkpoint: "stereo_config_end",
-            block_index: None,
-            bit_cursor: writer.bit_pos(),
-        });
 
         // Section 6: secondary-gain "gainB" flags (native 46786..46865). Per
         // block, `*(obj+8)+0x980` (1 bit), then `+0x984` (1 bit) and `+0x988+k*4`
         // (1 bit each, k in 0..`*(cfg+0xc8)`) when the previous flag is nonzero.
         let gainb_count = cfg_source.cfg_u32(0xc8)? as usize;
-        for (i, obj) in group.objects.iter().enumerate().take(nblk) {
-            record_pack_element(
-                writer,
-                &mut ledger,
-                "gainb",
-                Some(group_index),
-                Some(i),
-                || {
-                    vec![
-                        input("count", gainb_count as i64),
-                        input("flag0", obj.gainb_u32(0x980).unwrap_or(0)),
-                        input("flag1", obj.gainb_u32(0x984).unwrap_or(0)),
-                    ]
-                },
-                |writer| pack_gain_side_gainb(writer, obj, gainb_count),
-            )?;
+        for obj in group.objects.iter().take(nblk) {
+            pack_gain_side_gainb(writer, obj, gainb_count)?;
         }
 
         // Section 7: gain NGC/IDLEV/IDLOC side data (native 46866..47053).
-        for (i, obj) in group.objects.iter().enumerate().take(nblk) {
-            pack_gain_block(writer, group, obj, group_index, i, &mut ledger)?;
+        for obj in group.objects.iter().take(nblk) {
+            pack_gain_block(writer, group, obj)?;
         }
 
         // Section 8: GHA header (native 47055..47348), once per group, from the
@@ -873,97 +453,32 @@ fn pack_frame_at5_impl(
         // (`calc_nbits_for_gha_at5` absent arm == 1 bit, decompile 6813); first
         // ported this slice (docs/13 §5.1).
         let arena_flag0 = cfg_source.arena_u32(0)?;
-        record_pack_element(
-            writer,
-            &mut ledger,
-            "gha.header",
-            Some(group_index),
-            None,
-            || {
-                vec![
-                    input("enabled", arena_flag0),
-                    input("header_mode", cfg_source.arena_u32(1).unwrap_or(0)),
-                    input("record_count", cfg_source.arena_u32(2).unwrap_or(0)),
-                    input("nblk", nblk as i64),
-                ]
-            },
-            |writer| pack_gha_header(writer, cfg_source, nblk),
-        )?;
-        cursors.push(FamilyCursor {
-            checkpoint: "gha_chan",
-            block_index: None,
-            bit_cursor: writer.bit_pos(),
-        });
+        pack_gha_header(writer, cfg_source, nblk)?;
 
         // Sections 9 + 10: per-channel GHA side data then the per-wave payload
         // loop (native 47349..47568), gated on `arena_root[0] != 0` (the same
         // native `if (*piVar22 != 0)` gate). The idam gate is `arena_root[1] == 0`.
         if arena_flag0 != 0 {
             let arena_flag1 = cfg_source.arena_u32(1)?;
-            for (i, obj) in group.objects.iter().enumerate().take(nblk) {
-                pack_gha_channel(
-                    writer,
-                    group,
-                    obj,
-                    arena_flag1,
-                    group_index,
-                    i,
-                    &mut cursors,
-                    &mut ledger,
-                )?;
+            for obj in group.objects.iter().take(nblk) {
+                pack_gha_channel(writer, group, obj, arena_flag1)?;
             }
         }
 
         // Section D: post-payload gate (native 47570..47647). OUTSIDE the GHA
         // `arena_root[0]` gate (decompile 47566+): the 1-bit `cfg+0x94` gate and
         // its two 4-bit words pack even on GHA-absent frames.
-        cursors.push(FamilyCursor {
-            checkpoint: "post_payload",
-            block_index: None,
-            bit_cursor: writer.bit_pos(),
-        });
-        record_pack_element(
-            writer,
-            &mut ledger,
-            "post_payload",
-            Some(group_index),
-            None,
-            || {
-                vec![
-                    input("flag", cfg_source.cfg_u32(0x94).unwrap_or(0)),
-                    input("word_98", cfg_source.cfg_u32(0x98).unwrap_or(0)),
-                    input("word_9c", cfg_source.cfg_u32(0x9c).unwrap_or(0)),
-                ]
-            },
-            |writer| pack_post_payload(writer, cfg_source),
-        )?;
+        pack_post_payload(writer, cfg_source)?;
     }
 
     // Frame tail (native 47651..47713): 2-bit marker `3`, byte align, then `0x01`
     // stuffing to `frame_bytes`.
-    cursors.push(FamilyCursor {
-        checkpoint: "tail_start",
-        block_index: None,
-        bit_cursor: writer.bit_pos(),
-    });
-    record_pack_element(
-        writer,
-        &mut ledger,
-        "frame.tail",
-        None,
-        None,
-        || vec![input("target_bits", (state.frame_bytes * 8) as i64)],
-        |writer| {
-            writer.write_frame_tail(state.frame_bytes * 8)?;
-            Ok(())
-        },
-    )?;
+    {
+        writer.write_frame_tail(state.frame_bytes * 8)?;
+        Ok::<(), FrameAssemblyError>(())
+    }?;
 
-    Ok(FramePackSummary {
-        frame_bytes: state.frame_bytes,
-        final_bit_pos: writer.bit_pos(),
-        cursors,
-    })
+    Ok(())
 }
 
 fn pack_idwl(
@@ -1527,41 +1042,22 @@ fn pack_gain_block(
     writer: &mut BitWriter<'_>,
     group: &BlockGroup,
     obj: &ObjectState,
-    group_index: usize,
-    block_index: usize,
-    ledger: &mut Option<&mut PackCursorLedger>,
 ) -> Result<(), FrameAssemblyError> {
     let present = obj.u32(0x1b484)?;
     let row_count_word = obj.u32(0x1b490)?;
     let flag = obj.u32(0x1b488)?;
     let gain_band_count = obj.u32(0x1b48c)?;
-    record_pack_element(
-        writer,
-        ledger,
-        "gain.header",
-        Some(group_index),
-        Some(block_index),
-        || {
-            vec![
-                input("present", present),
-                input("row_count", row_count_word),
-                input("band_count_flag", flag),
-                input("gain_band_count", gain_band_count),
-                input("channel", obj.channel_index),
-            ]
-        },
-        |writer| {
-            writer.write_bits(present, 1)?;
-            if present != 0 {
-                writer.write_bits(row_count_word.wrapping_sub(1), 4)?;
-                writer.write_bits(flag, 1)?;
-                if flag != 0 {
-                    writer.write_bits(gain_band_count.wrapping_sub(1), 4)?;
-                }
+    {
+        writer.write_bits(present, 1)?;
+        if present != 0 {
+            writer.write_bits(row_count_word.wrapping_sub(1), 4)?;
+            writer.write_bits(flag, 1)?;
+            if flag != 0 {
+                writer.write_bits(gain_band_count.wrapping_sub(1), 4)?;
             }
-            Ok(())
-        },
-    )?;
+        }
+        Ok::<(), FrameAssemblyError>(())
+    }?;
     if present == 0 {
         return Ok(());
     }
@@ -1575,169 +1071,124 @@ fn pack_gain_block(
 
     let ngc_mode = obj.u32(0x1b494)?;
     let ngc_dispatch = dispatch_index(ngc_mode, parity);
-    record_pack_element(
-        writer,
-        ledger,
-        "gain.ngc",
-        Some(group_index),
-        Some(block_index),
-        || {
-            vec![
-                input("mode", ngc_mode),
-                input("dispatch", ngc_dispatch as i64),
-                input("row_count", row_count as i64),
-                input("channel", obj.channel_index),
-            ]
-        },
-        |writer| {
-            writer.write_bits(ngc_mode, 2)?;
-            match ngc_dispatch {
-                0 | 4 => pack_gain_ngc_0_at5(writer, &rows.counts)?,
-                1 | 5 => pack_gain_ngc_1_at5(writer, &rows.counts)?,
-                2 => pack_gain_ngc_2_at5(writer, &rows.counts)?,
-                3 => {
-                    let values: Vec<i32> = rows.counts.iter().map(|&value| value as i32).collect();
-                    let fields = Ngc3Fields {
-                        bit_width: obj.u32(0x1b498)? as u8,
-                        base: obj.u32(0x1b49c)? as i32,
-                        values: &values,
-                    };
-                    pack_gain_ngc_3_at5(writer, &fields)?;
-                }
-                6 => {
-                    let prev = parse_gain_rows(previous_object(group, obj)?, row_count)?;
-                    pack_gain_ngc_4_at5(writer, &rows.counts, &prev.counts)?;
-                }
-                7 => pack_gain_ngc_5_at5(writer)?,
-                other => {
-                    return Err(FrameAssemblyError::UnsupportedDispatchIndex {
-                        family: "gain_ngc",
-                        index: other,
-                    });
-                }
+    {
+        writer.write_bits(ngc_mode, 2)?;
+        match ngc_dispatch {
+            0 | 4 => pack_gain_ngc_0_at5(writer, &rows.counts)?,
+            1 | 5 => pack_gain_ngc_1_at5(writer, &rows.counts)?,
+            2 => pack_gain_ngc_2_at5(writer, &rows.counts)?,
+            3 => {
+                let values: Vec<i32> = rows.counts.iter().map(|&value| value as i32).collect();
+                let fields = Ngc3Fields {
+                    bit_width: obj.u32(0x1b498)? as u8,
+                    base: obj.u32(0x1b49c)? as i32,
+                    values: &values,
+                };
+                pack_gain_ngc_3_at5(writer, &fields)?;
             }
-            Ok(())
-        },
-    )?;
+            6 => {
+                let prev = parse_gain_rows(previous_object(group, obj)?, row_count)?;
+                pack_gain_ngc_4_at5(writer, &rows.counts, &prev.counts)?;
+            }
+            7 => pack_gain_ngc_5_at5(writer)?,
+            other => {
+                return Err(FrameAssemblyError::UnsupportedDispatchIndex {
+                    family: "gain_ngc",
+                    index: other,
+                });
+            }
+        }
+        Ok::<(), FrameAssemblyError>(())
+    }?;
 
     let idlev_mode = obj.u32(0x1b4a0)?;
     let idlev_dispatch = dispatch_index(idlev_mode, parity);
-    record_pack_element(
-        writer,
-        ledger,
-        "gain.idlev",
-        Some(group_index),
-        Some(block_index),
-        || {
-            vec![
-                input("mode", idlev_mode),
-                input("dispatch", idlev_dispatch as i64),
-                input("row_count", row_count as i64),
-                input("channel", obj.channel_index),
-            ]
-        },
-        |writer| {
-            writer.write_bits(idlev_mode, 2)?;
-            match idlev_dispatch {
-                0 | 4 => pack_gain_idlev_0_at5(writer, &level_rows)?,
-                1 => pack_gain_idlev_1_at5(writer, &level_rows)?,
-                2 => pack_gain_idlev_2_at5(writer, &level_rows)?,
-                3 => {
-                    let level_rows_i32: Vec<&[i32]> =
-                        rows.levels_i32.iter().map(Vec::as_slice).collect();
-                    let fields = Idlev3Fields {
-                        bit_width: obj.u32(0x1b4a4)? as u8,
-                        base: obj.u32(0x1b4a8)? as i32,
-                        rows: &level_rows_i32,
-                    };
-                    pack_gain_idlev_3_at5(writer, &fields)?;
-                }
-                5 => {
-                    let prev = parse_gain_rows(previous_object(group, obj)?, row_count)?;
-                    let prv: Vec<&[u32]> = prev.levels_u32.iter().map(Vec::as_slice).collect();
-                    pack_gain_idlev_4_at5(writer, &level_rows, &prv)?;
-                }
-                6 => {
-                    let flags = obj.u32_array(0x1b4ac, rows.counts.len())?;
-                    pack_gain_idlev_5_at5(writer, &level_rows, &flags)?;
-                }
-                7 => pack_gain_idlev_6_at5(writer)?,
-                other => {
-                    return Err(FrameAssemblyError::UnsupportedDispatchIndex {
-                        family: "gain_idlev",
-                        index: other,
-                    });
-                }
+    {
+        writer.write_bits(idlev_mode, 2)?;
+        match idlev_dispatch {
+            0 | 4 => pack_gain_idlev_0_at5(writer, &level_rows)?,
+            1 => pack_gain_idlev_1_at5(writer, &level_rows)?,
+            2 => pack_gain_idlev_2_at5(writer, &level_rows)?,
+            3 => {
+                let level_rows_i32: Vec<&[i32]> =
+                    rows.levels_i32.iter().map(Vec::as_slice).collect();
+                let fields = Idlev3Fields {
+                    bit_width: obj.u32(0x1b4a4)? as u8,
+                    base: obj.u32(0x1b4a8)? as i32,
+                    rows: &level_rows_i32,
+                };
+                pack_gain_idlev_3_at5(writer, &fields)?;
             }
-            Ok(())
-        },
-    )?;
+            5 => {
+                let prev = parse_gain_rows(previous_object(group, obj)?, row_count)?;
+                let prv: Vec<&[u32]> = prev.levels_u32.iter().map(Vec::as_slice).collect();
+                pack_gain_idlev_4_at5(writer, &level_rows, &prv)?;
+            }
+            6 => {
+                let flags = obj.u32_array(0x1b4ac, rows.counts.len())?;
+                pack_gain_idlev_5_at5(writer, &level_rows, &flags)?;
+            }
+            7 => pack_gain_idlev_6_at5(writer)?,
+            other => {
+                return Err(FrameAssemblyError::UnsupportedDispatchIndex {
+                    family: "gain_idlev",
+                    index: other,
+                });
+            }
+        }
+        Ok::<(), FrameAssemblyError>(())
+    }?;
 
     let idloc_mode = obj.u32(0x1b4ec)?;
     let idloc_dispatch = dispatch_index(idloc_mode, parity);
-    record_pack_element(
-        writer,
-        ledger,
-        "gain.idloc",
-        Some(group_index),
-        Some(block_index),
-        || {
-            vec![
-                input("mode", idloc_mode),
-                input("dispatch", idloc_dispatch as i64),
-                input("row_count", row_count as i64),
-                input("channel", obj.channel_index),
-            ]
-        },
-        |writer| {
-            writer.write_bits(idloc_mode, 2)?;
-            match idloc_dispatch {
-                0 | 4 => pack_gain_idloc_0_at5(writer, &location_rows)?,
-                1 => {
-                    let idloc_rows = idloc_rows(&rows);
-                    pack_gain_idloc_1_at5(writer, &idloc_rows)?;
-                }
-                2 => {
-                    let idloc_rows = idloc_rows(&rows);
-                    pack_gain_idloc_2_at5(writer, &idloc_rows)?;
-                }
-                3 => {
-                    let fields = Idloc3Fields {
-                        bit_width: obj.u32(0x1b4f0)? as u8,
-                        base: obj.u32(0x1b4f4)? as i32,
-                        rows: &location_rows,
-                    };
-                    pack_gain_idloc_3_at5(writer, &fields)?;
-                }
-                5 => {
-                    let prev = parse_gain_rows(previous_object(group, obj)?, row_count)?;
-                    let idloc_rows = idloc_rows(&rows);
-                    let prv: Vec<&[u32]> = prev.locations.iter().map(Vec::as_slice).collect();
-                    pack_gain_idloc_4_at5(writer, &idloc_rows, &prv)?;
-                }
-                6 => {
-                    let prev = parse_gain_rows(previous_object(group, obj)?, row_count)?;
-                    let prv: Vec<&[u32]> = prev.locations.iter().map(Vec::as_slice).collect();
-                    let idloc_rows = idloc_rows(&rows);
-                    let flags = obj.u32_array(0x1b4f8, rows.counts.len())?;
-                    pack_gain_idloc_5_at5(writer, &idloc_rows, &prv, &flags)?;
-                }
-                7 => {
-                    let prev = parse_gain_rows(previous_object(group, obj)?, row_count)?;
-                    let prv: Vec<&[u32]> = prev.locations.iter().map(Vec::as_slice).collect();
-                    let flags = obj.u32_array(0x1b538, rows.counts.len())?;
-                    pack_gain_idloc_6_at5(writer, &location_rows, &prv, &flags)?;
-                }
-                other => {
-                    return Err(FrameAssemblyError::UnsupportedDispatchIndex {
-                        family: "gain_idloc",
-                        index: other,
-                    });
-                }
+    {
+        writer.write_bits(idloc_mode, 2)?;
+        match idloc_dispatch {
+            0 | 4 => pack_gain_idloc_0_at5(writer, &location_rows)?,
+            1 => {
+                let idloc_rows = idloc_rows(&rows);
+                pack_gain_idloc_1_at5(writer, &idloc_rows)?;
             }
-            Ok(())
-        },
-    )?;
+            2 => {
+                let idloc_rows = idloc_rows(&rows);
+                pack_gain_idloc_2_at5(writer, &idloc_rows)?;
+            }
+            3 => {
+                let fields = Idloc3Fields {
+                    bit_width: obj.u32(0x1b4f0)? as u8,
+                    base: obj.u32(0x1b4f4)? as i32,
+                    rows: &location_rows,
+                };
+                pack_gain_idloc_3_at5(writer, &fields)?;
+            }
+            5 => {
+                let prev = parse_gain_rows(previous_object(group, obj)?, row_count)?;
+                let idloc_rows = idloc_rows(&rows);
+                let prv: Vec<&[u32]> = prev.locations.iter().map(Vec::as_slice).collect();
+                pack_gain_idloc_4_at5(writer, &idloc_rows, &prv)?;
+            }
+            6 => {
+                let prev = parse_gain_rows(previous_object(group, obj)?, row_count)?;
+                let prv: Vec<&[u32]> = prev.locations.iter().map(Vec::as_slice).collect();
+                let idloc_rows = idloc_rows(&rows);
+                let flags = obj.u32_array(0x1b4f8, rows.counts.len())?;
+                pack_gain_idloc_5_at5(writer, &idloc_rows, &prv, &flags)?;
+            }
+            7 => {
+                let prev = parse_gain_rows(previous_object(group, obj)?, row_count)?;
+                let prv: Vec<&[u32]> = prev.locations.iter().map(Vec::as_slice).collect();
+                let flags = obj.u32_array(0x1b538, rows.counts.len())?;
+                pack_gain_idloc_6_at5(writer, &location_rows, &prv, &flags)?;
+            }
+            other => {
+                return Err(FrameAssemblyError::UnsupportedDispatchIndex {
+                    family: "gain_idloc",
+                    index: other,
+                });
+            }
+        }
+        Ok::<(), FrameAssemblyError>(())
+    }?;
 
     Ok(())
 }
@@ -1798,10 +1249,6 @@ fn pack_gha_channel(
     group: &BlockGroup,
     obj: &ObjectState,
     arena_flag1: u32,
-    group_index: usize,
-    block_index: usize,
-    cursors: &mut Vec<FamilyCursor>,
-    ledger: &mut Option<&mut PackCursorLedger>,
 ) -> Result<(), FrameAssemblyError> {
     let channel = obj.channel_index;
     let nrec = obj.gha_records.len();
@@ -1811,43 +1258,22 @@ fn pack_gha_channel(
 
     // IDLOC: 1-bit gate only for channel 1, then dispatch.
     let idloc_mode = obj.u32(0x1c75c)?;
-    let active_records = active.iter().filter(|&&value| value).count();
-    record_pack_element(
-        writer,
-        ledger,
-        "gha.idloc",
-        Some(group_index),
-        Some(block_index),
-        || {
-            vec![
-                input("mode", idloc_mode),
-                input("record_count", nrec as i64),
-                input("active_records", active_records as i64),
-                input("channel", channel),
-            ]
-        },
-        |writer| {
-            if channel == 1 {
-                writer.write_bits(idloc_mode, 1)?;
+    {
+        if channel == 1 {
+            writer.write_bits(idloc_mode, 1)?;
+        }
+        match (idloc_mode & 1) as usize {
+            0 => {
+                let rows = gha_idloc_rows(obj, &active)?;
+                pack_gh_idloc_0_at5(writer, &rows)?;
             }
-            match (idloc_mode & 1) as usize {
-                0 => {
-                    let rows = gha_idloc_rows(obj, &active)?;
-                    pack_gh_idloc_0_at5(writer, &rows)?;
-                }
-                _ => pack_gh_idloc_1_at5(writer)?,
-            }
-            Ok(())
-        },
-    )?;
+            _ => pack_gh_idloc_1_at5(writer)?,
+        }
+        Ok::<(), FrameAssemblyError>(())
+    }?;
 
     // NWAVS: the checkpoint sits before the prefix write.
     let nwavs_mode = obj.u32(0x1c760)?;
-    cursors.push(FamilyCursor {
-        checkpoint: "gha_nwavs",
-        block_index: Some(block_index),
-        bit_cursor: writer.bit_pos(),
-    });
     let nb = pmodebits(channel);
     let nwavs_rows: Vec<GhNwavsRow> = (0..nrec)
         .map(|r| GhNwavsRow {
@@ -1855,52 +1281,32 @@ fn pack_gha_channel(
             value: obj.gha_records[r].len() as u32,
         })
         .collect();
-    record_pack_element(
-        writer,
-        ledger,
-        "gha.nwavs",
-        Some(group_index),
-        Some(block_index),
-        || {
-            vec![
-                input("mode", nwavs_mode),
-                input("mode_bits", nb),
-                input("record_count", nrec as i64),
-                input("active_records", active_records as i64),
-                input(
-                    "wave_count",
-                    obj.gha_records.iter().map(Vec::len).sum::<usize>() as i64,
-                ),
-                input("channel", channel),
-            ]
-        },
-        |writer| {
-            if nb != 0 {
-                writer.write_bits(nwavs_mode, nb)?;
+    {
+        if nb != 0 {
+            writer.write_bits(nwavs_mode, nb)?;
+        }
+        match (nwavs_mode & 3) as usize {
+            0 => pack_gh_nwavs_0_at5(writer, &nwavs_rows)?,
+            1 => pack_gh_nwavs_1_at5(writer, &nwavs_rows)?,
+            2 => {
+                let previous = previous_object(group, obj)?;
+                let previous_values: Vec<u32> = previous
+                    .gha_records
+                    .iter()
+                    .map(|waves| waves.len() as u32)
+                    .collect();
+                pack_gh_nwavs_2_at5(writer, &nwavs_rows, &previous_values)?;
             }
-            match (nwavs_mode & 3) as usize {
-                0 => pack_gh_nwavs_0_at5(writer, &nwavs_rows)?,
-                1 => pack_gh_nwavs_1_at5(writer, &nwavs_rows)?,
-                2 => {
-                    let previous = previous_object(group, obj)?;
-                    let previous_values: Vec<u32> = previous
-                        .gha_records
-                        .iter()
-                        .map(|waves| waves.len() as u32)
-                        .collect();
-                    pack_gh_nwavs_2_at5(writer, &nwavs_rows, &previous_values)?;
-                }
-                3 => pack_gh_nwavs_3_at5(writer)?,
-                other => {
-                    return Err(FrameAssemblyError::UnsupportedDispatchIndex {
-                        family: "gha_nwavs",
-                        index: other,
-                    });
-                }
+            3 => pack_gh_nwavs_3_at5(writer)?,
+            other => {
+                return Err(FrameAssemblyError::UnsupportedDispatchIndex {
+                    family: "gha_nwavs",
+                    index: other,
+                });
             }
-            Ok(())
-        },
-    )?;
+        }
+        Ok::<(), FrameAssemblyError>(())
+    }?;
 
     // FREQ: 1-bit gate only for channel 1, then dispatch. The current rows (freq
     // per wave, `+0xc`) feed both the intra-block leaf (mode 0) and the
@@ -1917,50 +1323,31 @@ fn pack_gha_channel(
             values: &freq_value_rows[r],
         })
         .collect();
-    record_pack_element(
-        writer,
-        ledger,
-        "gha.freq",
-        Some(group_index),
-        Some(block_index),
-        || {
-            vec![
-                input("mode", freq_mode),
-                input("record_count", nrec as i64),
-                input("active_records", active_records as i64),
-                input(
-                    "wave_count",
-                    obj.gha_records.iter().map(Vec::len).sum::<usize>() as i64,
-                ),
-                input("channel", channel),
-            ]
-        },
-        |writer| {
-            if channel == 1 {
-                writer.write_bits(freq_mode, 1)?;
+    {
+        if channel == 1 {
+            writer.write_bits(freq_mode, 1)?;
+        }
+        match (freq_mode & 1) as usize {
+            0 => {
+                let modes: Vec<u32> = (0..nrec)
+                    .map(|r| obj.u32(0x1c770 + r * 4))
+                    .collect::<Result<_, _>>()?;
+                pack_gh_freq_0_at5(writer, &freq_rows, &modes)?;
             }
-            match (freq_mode & 1) as usize {
-                0 => {
-                    let modes: Vec<u32> = (0..nrec)
-                        .map(|r| obj.u32(0x1c770 + r * 4))
-                        .collect::<Result<_, _>>()?;
-                    pack_gh_freq_0_at5(writer, &freq_rows, &modes)?;
-                }
-                _ => {
-                    let previous = previous_object(group, obj)?;
-                    let previous_value_rows: Vec<Vec<u32>> = previous
-                        .gha_records
-                        .iter()
-                        .map(|waves| waves.iter().map(|w| w.freq).collect())
-                        .collect();
-                    let previous_rows: Vec<&[u32]> =
-                        previous_value_rows.iter().map(Vec::as_slice).collect();
-                    pack_gh_freq_1_at5(writer, &freq_rows, &previous_rows)?;
-                }
+            _ => {
+                let previous = previous_object(group, obj)?;
+                let previous_value_rows: Vec<Vec<u32>> = previous
+                    .gha_records
+                    .iter()
+                    .map(|waves| waves.iter().map(|w| w.freq).collect())
+                    .collect();
+                let previous_rows: Vec<&[u32]> =
+                    previous_value_rows.iter().map(Vec::as_slice).collect();
+                pack_gh_freq_1_at5(writer, &freq_rows, &previous_rows)?;
             }
-            Ok(())
-        },
-    )?;
+        }
+        Ok::<(), FrameAssemblyError>(())
+    }?;
 
     // IDSF: prefix, then dispatch. header_mode = arena_root[1].
     let idsf_mode = obj.u32(0x1c768)?;
@@ -1975,74 +1362,53 @@ fn pack_gha_channel(
             values: &idsf_value_rows[r],
         })
         .collect();
-    record_pack_element(
-        writer,
-        ledger,
-        "gha.idsf",
-        Some(group_index),
-        Some(block_index),
-        || {
-            vec![
-                input("mode", idsf_mode),
-                input("mode_bits", nb),
-                input("header_mode", arena_flag1),
-                input("record_count", nrec as i64),
-                input("active_records", active_records as i64),
-                input(
-                    "wave_count",
-                    obj.gha_records.iter().map(Vec::len).sum::<usize>() as i64,
-                ),
-                input("channel", channel),
-            ]
-        },
-        |writer| {
-            if nb != 0 {
-                writer.write_bits(idsf_mode, nb)?;
+    {
+        if nb != 0 {
+            writer.write_bits(idsf_mode, nb)?;
+        }
+        match (idsf_mode & 3) as usize {
+            0 => pack_gh_idsf_0_at5(writer, arena_flag1, &idsf_rows)?,
+            1 => pack_gh_idsf_1_at5(writer, arena_flag1, &idsf_rows)?,
+            // Mode 2 is the inter-channel differential IDSF leaf (native `0x1a840`):
+            // idsf per wave (`+0x0`) deltaed against the previous object's
+            // (`*(obj+0x28)`) record arena, indexed through the `*(obj+4)+0x11c`
+            // predictor map (see `gha_idsf_predictor_indices`).
+            2 => {
+                let previous = previous_object(group, obj)?;
+                let previous_value_rows: Vec<Vec<u32>> = previous
+                    .gha_records
+                    .iter()
+                    .map(|waves| waves.iter().map(|w| w.idsf).collect())
+                    .collect();
+                let previous_rows: Vec<&[u32]> =
+                    previous_value_rows.iter().map(Vec::as_slice).collect();
+                let previous_index_rows = gha_idsf_predictor_indices(obj, &active)?;
+                let previous_indices: Vec<&[i32]> =
+                    previous_index_rows.iter().map(Vec::as_slice).collect();
+                pack_gh_idsf_2_at5(
+                    writer,
+                    arena_flag1,
+                    &idsf_rows,
+                    &previous_rows,
+                    &previous_indices,
+                )?;
             }
-            match (idsf_mode & 3) as usize {
-                0 => pack_gh_idsf_0_at5(writer, arena_flag1, &idsf_rows)?,
-                1 => pack_gh_idsf_1_at5(writer, arena_flag1, &idsf_rows)?,
-                // Mode 2 is the inter-channel differential IDSF leaf (native `0x1a840`):
-                // idsf per wave (`+0x0`) deltaed against the previous object's
-                // (`*(obj+0x28)`) record arena, indexed through the `*(obj+4)+0x11c`
-                // predictor map (see `gha_idsf_predictor_indices`).
-                2 => {
-                    let previous = previous_object(group, obj)?;
-                    let previous_value_rows: Vec<Vec<u32>> = previous
-                        .gha_records
-                        .iter()
-                        .map(|waves| waves.iter().map(|w| w.idsf).collect())
-                        .collect();
-                    let previous_rows: Vec<&[u32]> =
-                        previous_value_rows.iter().map(Vec::as_slice).collect();
-                    let previous_index_rows = gha_idsf_predictor_indices(obj, &active)?;
-                    let previous_indices: Vec<&[i32]> =
-                        previous_index_rows.iter().map(Vec::as_slice).collect();
-                    pack_gh_idsf_2_at5(
-                        writer,
-                        arena_flag1,
-                        &idsf_rows,
-                        &previous_rows,
-                        &previous_indices,
-                    )?;
-                }
-                // Mode 3 is the "unchanged-from-predictor" no-op leaf (native
-                // `pack_gh_idsf_3_at5`, `0x135b0`, a bare `return`): the IDSF section is
-                // then exactly the nb-bit mode prefix and nothing else. The selection is
-                // made by the `calc_nbits_for_gha_at5` costing (candidate 3, offered only
-                // when the channel `has_previous`); native selects it only on channel 1.
-                // Native-live per the dance-the-night sweep (45 output frames).
-                3 => pack_gh_idsf_3_at5(writer)?,
-                other => {
-                    return Err(FrameAssemblyError::UnsupportedDispatchIndex {
-                        family: "gha_idsf",
-                        index: other,
-                    });
-                }
+            // Mode 3 is the "unchanged-from-predictor" no-op leaf (native
+            // `pack_gh_idsf_3_at5`, `0x135b0`, a bare `return`): the IDSF section is
+            // then exactly the nb-bit mode prefix and nothing else. The selection is
+            // made by the `calc_nbits_for_gha_at5` costing (candidate 3, offered only
+            // when the channel `has_previous`); native selects it only on channel 1.
+            // Native-live per the dance-the-night sweep (45 output frames).
+            3 => pack_gh_idsf_3_at5(writer)?,
+            other => {
+                return Err(FrameAssemblyError::UnsupportedDispatchIndex {
+                    family: "gha_idsf",
+                    index: other,
+                });
             }
-            Ok(())
-        },
-    )?;
+        }
+        Ok::<(), FrameAssemblyError>(())
+    }?;
 
     // IDAM: only when arena_root[1] == 0 (never for the 352 profile, arena[1]==1).
     if arena_flag1 == 0 {
@@ -2052,43 +1418,17 @@ fn pack_gha_channel(
     }
 
     // Section 10: per-wave payload loop.
-    cursors.push(FamilyCursor {
-        checkpoint: "payload",
-        block_index: Some(block_index),
-        bit_cursor: writer.bit_pos(),
-    });
-    let active_waves = obj
-        .gha_records
-        .iter()
-        .enumerate()
-        .filter(|(record, _)| active[*record])
-        .map(|(_, waves)| waves.len())
-        .sum::<usize>();
-    record_pack_element(
-        writer,
-        ledger,
-        "gha.payload",
-        Some(group_index),
-        Some(block_index),
-        || {
-            vec![
-                input("active_waves", active_waves as i64),
-                input("phase_bits_per_wave", 5_i64),
-                input("channel", channel),
-            ]
-        },
-        |writer| {
-            for r in 0..nrec {
-                if !active[r] {
-                    continue;
-                }
-                for wave in &obj.gha_records[r] {
-                    writer.write_bits(wave.phase, 5)?;
-                }
+    {
+        for r in 0..nrec {
+            if !active[r] {
+                continue;
             }
-            Ok(())
-        },
-    )?;
+            for wave in &obj.gha_records[r] {
+                writer.write_bits(wave.phase, 5)?;
+            }
+        }
+        Ok::<(), FrameAssemblyError>(())
+    }?;
 
     Ok(())
 }

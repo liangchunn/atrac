@@ -537,66 +537,6 @@ pub struct CalcFrameOutput {
     pub shared_wlc_window_fields: [i32; 3],
 }
 
-/// Development-only decision surfaces immediately after native section 3
-/// (second allocation + IDWL epilogue) and immediately before section 9
-/// (the first fifth pass).
-/// This is observational state for docs/15 boundary reduction; the shipping
-/// entry point does not allocate or populate it.
-#[doc(hidden)]
-#[derive(Debug, Clone, Default)]
-pub struct CalcStageLedger {
-    pub word_lengths: Vec<Vec<i32>>,
-    pub idsf_cc: Vec<Vec<i32>>,
-    pub selected_picks: Vec<Vec<i32>>,
-    pub selected_costs: Vec<Vec<i16>>,
-    pub slot46: Vec<[i16; 2]>,
-    pub mode_1074: Vec<i32>,
-    pub s_11a: i16,
-    pub s_12a: i16,
-    pub s_12e: i16,
-    pub pre_fifth_word_lengths: Vec<Vec<i32>>,
-    pub pre_fifth_idsf_cc: Vec<Vec<i32>>,
-    pub pre_fifth_selectors: Vec<Vec<i32>>,
-    pub pre_fifth_scale_factors: Vec<Vec<i32>>,
-    pub pre_fifth_selected_picks: Vec<Vec<i32>>,
-    pub pre_fifth_selected_costs: Vec<Vec<i16>>,
-    pub pre_fifth_slot46: Vec<[i16; 2]>,
-    pub pre_fifth_mode_1074: Vec<i32>,
-    pub pre_fifth_s_11a: i16,
-    pub pre_fifth_s_12a: i16,
-    pub pre_fifth_s_12e: i16,
-    pub post_fifth_word_lengths: Vec<Vec<i32>>,
-    pub post_fifth_idsf_cc: Vec<Vec<i32>>,
-    pub post_fifth_selectors: Vec<Vec<i32>>,
-    pub post_fifth_selected_costs: Vec<Vec<i16>>,
-    pub post_fifth_slot46: Vec<[i16; 2]>,
-    pub post_fifth_mode_1074: Vec<i32>,
-    pub post_fifth_s_11a: i16,
-    pub post_fifth_s_11e: i16,
-    pub post_fifth_s_12a: i16,
-    pub post_fifth_s_12e: i16,
-    pub post_sixth_idsf_cc: Vec<Vec<i32>>,
-    pub post_sixth_selectors: Vec<Vec<i32>>,
-    pub post_sixth_selected_costs: Vec<Vec<i16>>,
-    pub post_sixth_slot46: Vec<[i16; 2]>,
-    pub post_sixth_mode_1074: Vec<i32>,
-    pub post_sixth_s_11e: i16,
-    pub post_sixth_s_12a: i16,
-    pub post_sixth_s_12e: i16,
-    pub pre_adjust_word_lengths: Vec<Vec<i32>>,
-    pub pre_adjust_scale_factors: Vec<Vec<i32>>,
-    pub pre_adjust_quantized: Vec<Vec<i16>>,
-    pub pre_adjust_level_words: Vec<Vec<i32>>,
-    pub pre_adjust_s_11c: i16,
-    pub pre_adjust_s_12a: i16,
-    pub pre_adjust_s_12e: i16,
-    pub section12_acc_a: Vec<Vec<f32>>,
-    pub section12_acc_b: Vec<Vec<f32>>,
-    pub section12_acc_weight: Vec<Vec<u32>>,
-    pub section12_start_group: usize,
-    pub section12_end_group: usize,
-}
-
 fn parse_idct_block(words: &[u32]) -> IdctBlockState {
     let mut block = IdctBlockState::default();
     block.mode = words[0];
@@ -745,23 +685,11 @@ fn shell_sort_desc(keys: &mut [i32], indices: &mut [i32]) {
 pub fn calc_channel_block_frame_at5(
     entry: &CalcFrameEntry,
 ) -> Result<CalcFrameOutput, CalcBlockError> {
-    calc_channel_block_frame_impl_at5(entry, None)
-}
-
-/// Development-only calc composition with a stage decision ledger.
-/// The production encoder calls [`calc_channel_block_frame_at5`] and therefore
-/// never performs these diagnostic clones.
-#[doc(hidden)]
-pub fn calc_channel_block_frame_with_stage_ledger_at5(
-    entry: &CalcFrameEntry,
-    ledger: &mut CalcStageLedger,
-) -> Result<CalcFrameOutput, CalcBlockError> {
-    calc_channel_block_frame_impl_at5(entry, Some(ledger))
+    calc_channel_block_frame_impl_at5(entry)
 }
 
 fn calc_channel_block_frame_impl_at5(
     entry: &CalcFrameEntry,
-    mut stage_ledger: Option<&mut CalcStageLedger>,
 ) -> Result<CalcFrameOutput, CalcBlockError> {
     let n = entry.channels.len();
     if n == 0 || n > 2 {
@@ -1036,22 +964,6 @@ fn calc_channel_block_frame_impl_at5(
         let _ = out.extended_total_12e;
     }
 
-    if let Some(ledger) = stage_ledger.as_deref_mut() {
-        ledger.word_lengths = word_lengths.clone();
-        ledger.idsf_cc = idsf_cc.clone();
-        ledger.selected_picks = (0..n)
-            .map(|ch| planes[ch][mode_1074[ch] as usize].picks.clone())
-            .collect();
-        ledger.selected_costs = (0..n)
-            .map(|ch| planes[ch][mode_1074[ch] as usize].costs.clone())
-            .collect();
-        ledger.slot46 = slot46.clone();
-        ledger.mode_1074 = mode_1074.clone();
-        ledger.s_11a = s_11a;
-        ledger.s_12a = s_12a;
-        ledger.s_12e = s_12e;
-    }
-
     // --- Post-second over-budget Phase A: +0xcc high-band raise loop. ---
     if budget < i32::from(s_12e) && s_114 > 0 {
         phase_a_raise_loop(
@@ -1247,24 +1159,6 @@ fn calc_channel_block_frame_impl_at5(
     let order = idx11c;
     let stereo_order = idx19c;
 
-    if let Some(ledger) = stage_ledger.as_deref_mut() {
-        ledger.pre_fifth_word_lengths = word_lengths.clone();
-        ledger.pre_fifth_idsf_cc = idsf_cc.clone();
-        ledger.pre_fifth_selectors = selectors.clone();
-        ledger.pre_fifth_scale_factors = scale_factors.clone();
-        ledger.pre_fifth_selected_picks = (0..n)
-            .map(|ch| planes[ch][mode_1074[ch] as usize].picks.clone())
-            .collect();
-        ledger.pre_fifth_selected_costs = (0..n)
-            .map(|ch| planes[ch][mode_1074[ch] as usize].costs.clone())
-            .collect();
-        ledger.pre_fifth_slot46 = slot46.clone();
-        ledger.pre_fifth_mode_1074 = mode_1074.clone();
-        ledger.pre_fifth_s_11a = s_11a;
-        ledger.pre_fifth_s_12a = s_12a;
-        ledger.pre_fifth_s_12e = s_12e;
-    }
-
     // --- Section 9: fifth + sixth (first invocation). ---
     let mut wlc_blocks: Vec<IdwlBlockState>;
     let mut shared_side = IdwlSideState::default();
@@ -1314,7 +1208,6 @@ fn calc_channel_block_frame_impl_at5(
             &order,
             &stereo_order,
             stereo_bound,
-            stage_ledger.as_deref_mut(),
             &mut s_11a,
             &mut s_11e,
             &mut s_12a,
@@ -1356,18 +1249,7 @@ fn calc_channel_block_frame_impl_at5(
         &mut tone0,
         selector,
         bands,
-        stage_ledger.as_deref_mut(),
     )?;
-
-    if let Some(ledger) = stage_ledger.as_deref_mut() {
-        ledger.pre_adjust_word_lengths = word_lengths.clone();
-        ledger.pre_adjust_scale_factors = scale_factors.clone();
-        ledger.pre_adjust_quantized = quantized.clone();
-        ledger.pre_adjust_level_words = level_words.clone();
-        ledger.pre_adjust_s_11c = s_11c;
-        ledger.pre_adjust_s_12a = s_12a;
-        ledger.pre_adjust_s_12e = s_12e;
-    }
 
     // --- Section 13: adjust pass (+ phase C, live only when over budget). ---
     if budget < i32::from(s_12e) {
@@ -1487,7 +1369,6 @@ fn calc_channel_block_frame_impl_at5(
             &order,
             &stereo_order,
             stereo_bound,
-            None,
             &mut s_11a,
             &mut s_11e,
             &mut s_12a,
@@ -2361,7 +2242,6 @@ fn run_fifth_sixth(
     order: &[i32],
     stereo_order: &[i32],
     stereo_bound: usize,
-    mut stage_ledger: Option<&mut CalcStageLedger>,
     s_11a: &mut i16,
     s_11e: &mut i16,
     s_12a: &mut i16,
@@ -2462,21 +2342,6 @@ fn run_fifth_sixth(
         *s_12e = out.extended_total_12e;
     }
 
-    if let Some(ledger) = stage_ledger.as_deref_mut() {
-        ledger.post_fifth_word_lengths = word_lengths.to_vec();
-        ledger.post_fifth_idsf_cc = idsf_cc.to_vec();
-        ledger.post_fifth_selectors = selectors.to_vec();
-        ledger.post_fifth_selected_costs = (0..n)
-            .map(|ch| planes[ch][mode_1074[ch] as usize].costs.clone())
-            .collect();
-        ledger.post_fifth_slot46 = slot46.to_vec();
-        ledger.post_fifth_mode_1074 = mode_1074.to_vec();
-        ledger.post_fifth_s_11a = *s_11a;
-        ledger.post_fifth_s_11e = *s_11e;
-        ledger.post_fifth_s_12a = *s_12a;
-        ledger.post_fifth_s_12e = *s_12e;
-    }
-
     // --- sixth ---
     {
         let quant_raw: Vec<Vec<ZerothQuantBandRaw<'_>>> = (0..n)
@@ -2535,18 +2400,6 @@ fn run_fifth_sixth(
         *s_11e = out.idct_bits_11e;
         *s_12a = out.base_total_12a;
         *s_12e = out.extended_total_12e;
-    }
-    if let Some(ledger) = stage_ledger.as_deref_mut() {
-        ledger.post_sixth_idsf_cc = idsf_cc.to_vec();
-        ledger.post_sixth_selectors = selectors.to_vec();
-        ledger.post_sixth_selected_costs = (0..n)
-            .map(|ch| planes[ch][mode_1074[ch] as usize].costs.clone())
-            .collect();
-        ledger.post_sixth_slot46 = slot46.to_vec();
-        ledger.post_sixth_mode_1074 = mode_1074.to_vec();
-        ledger.post_sixth_s_11e = *s_11e;
-        ledger.post_sixth_s_12a = *s_12a;
-        ledger.post_sixth_s_12e = *s_12e;
     }
     Ok(())
 }
@@ -2769,7 +2622,6 @@ fn section12_levels(
     tone0: &mut [i32],
     selector: i32,
     band_count: usize,
-    mut stage_ledger: Option<&mut CalcStageLedger>,
 ) -> Result<(), CalcBlockError> {
     let n = entry.channels.len();
     let bands = band_count;
@@ -2905,14 +2757,6 @@ fn section12_levels(
         let _ = (idsf_cc, windows, planes, mode_1074);
 
         let start_g = idspcqus[spc_startqu[selector as usize] as usize] as usize;
-        if let Some(ledger) = stage_ledger.as_deref_mut() {
-            ledger.section12_acc_a.push(acc_a.to_vec());
-            ledger.section12_acc_b.push(acc_b.to_vec());
-            ledger.section12_acc_weight.push(acc_w.to_vec());
-            ledger.section12_start_group = start_g;
-            ledger.section12_end_group = end_bound;
-        }
-
         // Ladder: per group in [start, end_bound).
         if start_g < end_bound {
             for g in start_g..end_bound {

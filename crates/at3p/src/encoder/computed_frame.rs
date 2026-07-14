@@ -33,8 +33,7 @@
 //! never wires new arms; it surfaces the error to the caller.
 
 use crate::bitstream::frame::{
-    BlockGroup, FramePrepackerState, ObjectState, ObjectWindow, PackCursorLedger, pack_frame_at5,
-    pack_frame_at5_with_ledger,
+    BlockGroup, FramePrepackerState, ObjectState, ObjectWindow, pack_frame_at5,
 };
 use crate::bitstream::writer::BitWriter;
 use crate::coding::allocation::{
@@ -451,12 +450,6 @@ pub struct ComputedFrameDriver {
     params: CodingParams,
     /// The next core-call index this driver will process (starts at 0).
     next_core_call: u32,
-    /// Development probe switch. Disabled by default; the shipping encode path
-    /// never allocates or observes a cursor ledger.
-    pack_ledger_enabled: bool,
-    /// Most recent output-bearing call's compact diagnostic ledger. Keeping one
-    /// frame bounds memory on full songs; the dev probe takes it on an error.
-    last_pack_ledger: Option<PackCursorLedger>,
 }
 
 /// The first output-bearing core call (native delay/priming: calls 0..6 produce
@@ -525,23 +518,7 @@ impl ComputedFrameDriver {
             prior_level_words: vec![vec![15; 8]; channel_count],
             params,
             next_core_call: 0,
-            pack_ledger_enabled: false,
-            last_pack_ledger: None,
         }
-    }
-
-    /// Enable/disable the development-only pack cursor ledger. Disabling also
-    /// discards any retained row set.
-    pub fn set_pack_ledger_enabled(&mut self, enabled: bool) {
-        self.pack_ledger_enabled = enabled;
-        if !enabled {
-            self.last_pack_ledger = None;
-        }
-    }
-
-    /// Take the most recent output-bearing call's diagnostic ledger.
-    pub fn take_pack_ledger(&mut self) -> Option<PackCursorLedger> {
-        self.last_pack_ledger.take()
     }
 
     /// The next core-call index [`step`](Self::step) will process.
@@ -588,7 +565,7 @@ impl ComputedFrameDriver {
             return Ok(None);
         }
 
-        let frame = self.compute_output_frame(&report, &init_aux, core_call)?;
+        let frame = self.compute_output_frame(&report, &init_aux)?;
         Ok(Some(frame))
     }
 
@@ -710,7 +687,6 @@ impl ComputedFrameDriver {
         &mut self,
         report: &FrontendCoreCallReport,
         init_aux: &[crate::encoder::coding_bridge::CodingBridgeChannelAux],
-        core_call: u32,
     ) -> Result<ComputedFrame, ComputedFrameError> {
         let ComputedCalcEntry {
             mut frame,
@@ -791,15 +767,7 @@ impl ComputedFrameDriver {
 
         let mut bytes = vec![0u8; state.frame_bytes];
         let mut writer = BitWriter::new(&mut bytes);
-        let pack_result = if self.pack_ledger_enabled {
-            let mut ledger = PackCursorLedger::new(core_call, writer.capacity_bits());
-            let result = pack_frame_at5_with_ledger(&state, &mut writer, &mut ledger);
-            self.last_pack_ledger = Some(ledger);
-            result
-        } else {
-            pack_frame_at5(&state, &mut writer)
-        };
-        pack_result.map_err(ComputedFrameError::Pack)?;
+        pack_frame_at5(&state, &mut writer).map_err(ComputedFrameError::Pack)?;
 
         Ok(ComputedFrame {
             bytes,

@@ -1,7 +1,7 @@
 //! Transient detection and gain curve construction for ATRAC3.
 //!
 //! Ports the codex `dsp::transient` module, adapted to the libatrac
-//! constants. This is separate from the trace-validated libatrac gain-control
+//! constants. This is separate from the libatrac-compatible gain-control
 //! schedule-generation path in `dsp::gain`.
 //!
 //! Key components:

@@ -194,9 +194,6 @@ pub struct FifthFrameOutput {
     pub extended_total_12e: i16,
     /// The returned `+0x12e` running total.
     pub return_bits: i16,
-    /// Trial diagnostics (native: var call count / accepted trials).
-    pub trials: usize,
-    pub accepts: usize,
 }
 
 struct PassState<'a> {
@@ -223,8 +220,6 @@ struct PassState<'a> {
     bits_11e: i16,
     bits_12a: i16,
     bits_12e: i16,
-    trials: usize,
-    accepts: usize,
 }
 
 struct ChannelMeta<'a> {
@@ -280,7 +275,6 @@ impl<'a> PassState<'a> {
     /// already stored the raised word length into the row. Returns
     /// whether the trial was accepted.
     fn trial(&mut self, channel: usize, band: usize, old_wl: i32) -> Result<bool, FifthPassError> {
-        self.trials += 1;
         let saved_idct = self.idct_blocks.clone();
 
         // The nested quant refresh at the trial word length into the
@@ -417,7 +411,6 @@ impl<'a> PassState<'a> {
         self.bits_12e = self.bits_12e.wrapping_add(delta as i16);
         self.bits_11a = side_bits as i16;
         self.bits_11e = var.idct_bits as i16;
-        self.accepts += 1;
         Ok(true)
     }
 }
@@ -545,8 +538,6 @@ pub fn fifth_bit_allocation_frame_at5(
         bits_11e: state.idct_bits_11e,
         bits_12a: state.base_total_12a,
         bits_12e: state.current_bits_12e,
-        trials: 0,
-        accepts: 0,
     };
 
     // Entry stage: adopt the selector rows as IDCT aux and re-cost.
@@ -664,7 +655,5 @@ pub fn fifth_bit_allocation_frame_at5(
         base_total_12a: pass.bits_12a,
         extended_total_12e: pass.bits_12e,
         return_bits: pass.bits_12e,
-        trials: pass.trials,
-        accepts: pass.accepts,
     })
 }

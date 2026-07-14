@@ -7,4 +7,3 @@ pub mod set_gainc;
 pub mod sigproc;
 pub mod sigproc_shell;
 pub mod time2freq;
-pub mod trace;
