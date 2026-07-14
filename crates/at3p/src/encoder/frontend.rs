@@ -443,7 +443,7 @@ pub struct FrontendState {
     /// (docs/13 §3.1). Feeds [`sigproc_band_limit_writeback_at5`], which derives
     /// the QMF/gain `band_count` (`g_a_x_at5[band_limit] + 1`; 16 full-band, 13 at
     /// 192) the time2freq extent + `+0x1b48c` gain scan read. Set by the per-rate
-    /// driver ([`ComputedFrameDriver::for_params`]); defaults to
+    /// driver ([`FrameDriver::for_params`]); defaults to
     /// [`FRONTEND_BAND_LIMIT`] (32) so every existing full-band caller is
     /// unchanged.
     pub band_limit: i32,
@@ -452,7 +452,7 @@ pub struct FrontendState {
     /// `param_4 == 2` stereo band-limit path takes, byte-identical to before —
     /// and 3 at 48-256, where the `param_4 == 3` path writes the intensity
     /// band count (14 at 256) the joint-stereo producer reads. Set by the
-    /// per-rate driver ([`ComputedFrameDriver::for_params`]); defaults to 2 so
+    /// per-rate driver ([`FrameDriver::for_params`]); defaults to 2 so
     /// every existing (mode-2) caller is unchanged.
     pub sigproc_mode: u32,
     /// The per-rate GHA-enable config word (`cfg+0xd0`, docs/13 §5.1) the extract
@@ -460,7 +460,7 @@ pub struct FrontendState {
     /// analysis arms), `false` at 48/64 (the disabled fallback — the peaked-band
     /// short-circuit to header mode 3, plus the sine mask-1/2 arm which stays live
     /// under `+0xd0 == 0`). Set by the per-rate driver
-    /// ([`ComputedFrameDriver::for_params`]) from [`CodingParams::gha_enabled`];
+    /// ([`FrameDriver::for_params`]) from [`CodingParams::gha_enabled`];
     /// defaults to `true` so every existing full-band (96-352) caller is
     /// unchanged. Note this is NOT the rate-independent shell extract gate
     /// (`gha_gate_open`, evidence item 1): that stays `true` at every rate.
@@ -468,12 +468,12 @@ pub struct FrontendState {
     /// The low-rate gain-detector mode word (`cfg+0xcc`, docs/13 §5.2) the
     /// `time2freq_at5` dispatch reads: `false` at 48/64 (the `mode_cc == 0`
     /// descending `set_gainc_at5` path), `true` at 96-352 (`detect_gainc_data_new_at5`).
-    /// Set by the per-rate driver ([`ComputedFrameDriver::for_params`]) from
+    /// Set by the per-rate driver ([`FrameDriver::for_params`]) from
     /// [`CodingParams::mode_cc`]; defaults to `true` so every existing
     /// (detector-path) caller is unchanged.
     ///
     /// [`CodingParams::mode_cc`]: crate::encoder::coding_params::CodingParams::mode_cc
-    /// [`ComputedFrameDriver::for_params`]: crate::encoder::computed_frame::ComputedFrameDriver::for_params
+    /// [`FrameDriver::for_params`]: crate::encoder::frame::FrameDriver::for_params
     pub mode_cc: bool,
     pub sigproc: SigprocFrameState,
     /// `arena_ring[channel]` is the channel object's `+0x14..+0x24` ring:

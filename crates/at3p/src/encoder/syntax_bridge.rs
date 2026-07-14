@@ -13,7 +13,7 @@ use crate::coding::allocation::{
 use crate::coding::bitcount::{IdctBlockState, IdsfBlockState, IdwlBlockState};
 use crate::coding::calc_block::{CalcChannelOutput, CalcFrameOutput};
 use crate::encoder::cfg_bridge::CfgPerFrame352;
-use crate::encoder::computed_frame::{ComputedFrameError, ComputedObjectInputs};
+use crate::encoder::frame::{FrameError, ObjectInputs};
 use crate::encoder::frontend::FrontendState;
 use crate::encoder::packing_prep::{GhaBandData, GhaPackingPrep, PackingPrepError};
 use crate::pipeline::syntax::{
@@ -39,19 +39,19 @@ struct GainRowData {
 /// decisions. `band_index`/`band_count` are the per-frame fallback shape words
 /// used by the zeroth 29..=31 rounding law.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_computed_frame_syntax(
+pub(crate) fn build_frame_syntax(
     out: &CalcFrameOutput,
     per_frame: &CfgPerFrame352,
     frontend: &FrontendState,
     prep: &GhaPackingPrep,
-    objects: &[ComputedObjectInputs],
+    objects: &[ObjectInputs],
     frame_bytes: usize,
     band_index: u32,
     band_count: u32,
-) -> Result<FrameSyntax, ComputedFrameError> {
+) -> Result<FrameSyntax, FrameError> {
     let channel_count = objects.len();
     if channel_count == 0 || out.channels.len() < channel_count {
-        return Err(ComputedFrameError::GhaChannelMissing { channel: 0 });
+        return Err(FrameError::GhaChannelMissing { channel: 0 });
     }
 
     let active = per_frame.active_b0 as usize;
@@ -102,7 +102,7 @@ pub(crate) fn build_computed_frame_syntax(
     });
     let gha = build_gha_syntax(frontend, prep, channel_count)?;
     let group = BlockGroupSyntax::new(header, channels, stereo, None, gha);
-    FrameSyntax::from_parts(frame_bytes, vec![group]).map_err(ComputedFrameError::from)
+    FrameSyntax::from_parts(frame_bytes, vec![group]).map_err(FrameError::from)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -110,14 +110,14 @@ fn build_channel_syntax(
     channel: usize,
     output: &CalcChannelOutput,
     frame: &CalcFrameOutput,
-    object: &ComputedObjectInputs,
+    object: &ObjectInputs,
     gain_rows: &[Vec<GainRowData>],
     previous_gain_records: Option<&[u32]>,
     active: usize,
     stereo_units: usize,
     config_count: usize,
     gainb_count: usize,
-) -> Result<ChannelSyntax, ComputedFrameError> {
+) -> Result<ChannelSyntax, FrameError> {
     Ok(ChannelSyntax {
         channel_index: channel as u32,
         // The native object points both channels at object 0. Typed payloads
@@ -155,7 +155,7 @@ fn build_idwl(
     output: &CalcChannelOutput,
     frame: &CalcFrameOutput,
     config_count: usize,
-) -> Result<IdwlSyntax, ComputedFrameError> {
+) -> Result<IdwlSyntax, FrameError> {
     let block = &output.idwl_block;
     let mode = block.mode;
     let record = idwl_record(block)?;
@@ -382,10 +382,7 @@ fn build_spectral(
     SpectralSyntax { units, tail_values }
 }
 
-fn gain_rows_from_records(
-    records: &[u32],
-    count: usize,
-) -> Result<Vec<GainRowData>, ComputedFrameError> {
+fn gain_rows_from_records(records: &[u32], count: usize) -> Result<Vec<GainRowData>, FrameError> {
     let needed = count.saturating_mul(38);
     if records.len() < needed {
         return Err(PackingPrepError::GainRowCountExceedsMax {
@@ -432,10 +429,10 @@ fn rows_to_syntax(rows: &[GainRowData]) -> Vec<GainRowSyntax> {
 
 fn build_gain(
     channel: usize,
-    object: &ComputedObjectInputs,
+    object: &ObjectInputs,
     all_rows: &[Vec<GainRowData>],
     previous_gain_records: Option<&[u32]>,
-) -> Result<GainSyntax, ComputedFrameError> {
+) -> Result<GainSyntax, FrameError> {
     if object.init_header.obj_1b484 == 0 {
         return Ok(GainSyntax::Absent);
     }
@@ -635,10 +632,7 @@ fn gated_from_cfg_group(group: &(u32, u32, [u32; 16]), count: usize) -> GatedFla
     gated_from_summary(group.0 != 0, group.1 != 0, &flags, count)
 }
 
-fn gated_from_activity(
-    activity: &[i32],
-    count: usize,
-) -> Result<GatedFlagsSyntax, ComputedFrameError> {
+fn gated_from_activity(activity: &[i32], count: usize) -> Result<GatedFlagsSyntax, FrameError> {
     let summary = zeroth_activity_summary_at5(activity, count).map_err(PackingPrepError::from)?;
     let flags = activity.iter().map(|word| *word != 0).collect::<Vec<_>>();
     Ok(gated_from_summary(
@@ -715,7 +709,7 @@ fn build_gha_syntax(
     frontend: &FrontendState,
     prep: &GhaPackingPrep,
     channel_count: usize,
-) -> Result<GhaSyntax, ComputedFrameError> {
+) -> Result<GhaSyntax, FrameError> {
     let arena = frontend.packer_arena(0);
     if arena.header_active == 0 {
         return Ok(GhaSyntax::Absent);
@@ -759,11 +753,11 @@ fn build_gha_syntax(
             let selectors = prep
                 .channels
                 .get(channel)
-                .ok_or(ComputedFrameError::GhaChannelMissing { channel })?;
+                .ok_or(FrameError::GhaChannelMissing { channel })?;
             let rows = prep
                 .post_swap_channels
                 .get(channel)
-                .ok_or(ComputedFrameError::GhaChannelMissing { channel })?;
+                .ok_or(FrameError::GhaChannelMissing { channel })?;
             let records = gha_records(rows, &selectors.active_flags);
             let previous_rows = prep.post_swap_channels.first().unwrap_or(rows);
             let nwavs_encoding = match selectors.nwavs & 3 {
@@ -818,7 +812,7 @@ fn build_gha_syntax(
                 },
             })
         })
-        .collect::<Result<Vec<_>, ComputedFrameError>>()?;
+        .collect::<Result<Vec<_>, FrameError>>()?;
 
     Ok(GhaSyntax::Present(GhaPayloadSyntax {
         header_mode: arena.header_mode,

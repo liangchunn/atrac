@@ -197,7 +197,7 @@ pub struct CodingParams {
     /// docs/14 §0.2/§0.4. Seeds the computed driver's frontend/gain-roll channel
     /// count and the from-scratch prepacker object count in place of the hardcoded
     /// stereo [`FRONTEND_CHANNEL_COUNT`](crate::encoder::frontend::FRONTEND_CHANNEL_COUNT)
-    /// / `COMPUTED_NBLK` anchors. (Mono has no ported coding path yet — docs/14
+    /// / `DEFAULT_CHANNEL_COUNT` anchors. (Mono has no ported coding path yet — docs/14
     /// phases 1-5 — so a 1-channel driver is never stepped in any shipping path.)
     pub channels: u32,
     /// The `g_a_encode_setting_atx` row+0x14 `mode_a` config word — the zeroth

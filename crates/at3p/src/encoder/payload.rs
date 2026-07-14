@@ -1,22 +1,18 @@
+//! Buffered payload helpers and public stream error/progress value types.
 //!
-//! This module hosts the computed assembly path ([`assemble_computed_payload`] /
-//!   [`assemble_computed_atracx_file`], docs/11 Phase 3 §3.1, generalized by
-//!   docs/12 §0.1) drives the pure [`ComputedFlushScheduler`] over raw PCM and
-//!   COMPUTES every 2048-byte output frame for ANY input of
-//!   `N >= MIN_INPUT_SAMPLE_FRAMES` sample frames. The whole encode/flush/output
-//!   schedule is derived from `N` by [`EncodeSchedule`] (native contract:
-//!   left/right length mismatch, fail explicitly with a typed error instead of
-//!   guessing.
+//! The buffered helpers drive the same frame scheduler and encoder used by the
+//! streaming façade. The encode/flush/output schedule is derived from the
+//! declared input length and rejects malformed channel shapes explicitly.
 
 use std::fmt;
 use std::io::{self, Write};
 
 use super::flush::{
-    ComputedFlushError, ComputedFlushScheduler, ComputedFrameResult, EncodeSchedule, FrameSource,
-    IncrementalComputedFlushScheduler, InputTooShort,
+    BufferedFlushScheduler, EncodeSchedule, FlushError, FrameResult, FrameSource,
+    IncrementalFlushScheduler, InputTooShort,
 };
 use crate::encoder::coding_params::CodingParams;
-use crate::encoder::computed_frame::COMPUTED_FRAME_BYTES;
+use crate::encoder::frame::DEFAULT_FRAME_BYTES;
 use crate::encoder::frontend::{CurrentPcmFrameError, prepare_current_pcm_frame};
 use crate::encoder::profile::Atrac3plusProfile;
 use crate::riff::write::{
@@ -24,23 +20,22 @@ use crate::riff::write::{
     write_atracx_header_for_rate_channels,
 };
 
-/// The native wrapper phase responsible for a computed-encode progress update.
+/// The stream phase responsible for an ATRAC3plus progress update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodePhase {
-    /// A PCM-bearing `atrac_encode` wrapper call.
+    /// Work completed while PCM was being supplied to the stream.
     Encoding,
-    /// An `atrac_flush_encode` wrapper call, including the final done call.
+    /// Tail work completed after all PCM was supplied.
     Flushing,
 }
 
-/// Progress after one successful computed encode or flush wrapper call.
+/// Progress after one successful encode or flush scheduling step.
 ///
 /// `completed_steps / total_steps` is the work-oriented progress fraction. It
 /// includes priming calls that emit no frame and the final flush done call, so
 /// it advances monotonically from the first encoder call through completion.
 /// `completed_output_frames / total_output_frames` separately describes the
-/// native output schedule. Totals come from [`EncodeSchedule`], whose
-/// length-dependent call and frame counts are pinned against native traces.
+/// output schedule. Totals come from [`EncodeSchedule`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeProgress {
     pub phase: EncodePhase,
@@ -51,8 +46,8 @@ pub struct EncodeProgress {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ComputedPayloadError {
-    Scheduler(ComputedFlushError),
+pub enum PayloadError {
+    Scheduler(FlushError),
     Prepare(CurrentPcmFrameError),
     UnexpectedZeroOutput {
         source: FrameSource,
@@ -89,20 +84,20 @@ pub enum ComputedPayloadError {
     },
 }
 
-impl From<ComputedFlushError> for ComputedPayloadError {
-    fn from(value: ComputedFlushError) -> Self {
+impl From<FlushError> for PayloadError {
+    fn from(value: FlushError) -> Self {
         Self::Scheduler(value)
     }
 }
 
-impl From<CurrentPcmFrameError> for ComputedPayloadError {
+impl From<CurrentPcmFrameError> for PayloadError {
     fn from(value: CurrentPcmFrameError) -> Self {
         Self::Prepare(value)
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ComputedFileError {
+pub enum FileError {
     /// The input is shorter than the native minimum accepted length
     /// ([`MIN_INPUT_SAMPLE_FRAMES`](super::flush::MIN_INPUT_SAMPLE_FRAMES) =
     /// 6144). Native `at3tool` `checkEncodeParam`
@@ -124,7 +119,7 @@ pub enum ComputedFileError {
         left_len: usize,
         right_len: usize,
     },
-    /// The mono entry ([`assemble_computed_atracx_file_for_mono_profile`]) was
+    /// The mono entry ([`assemble_atracx_file_for_mono_profile`]) was
     /// handed a channel-vec that is not exactly one channel of
     /// `expected_sample_frames` samples (a malformed call, not a native shape;
     /// docs/14 §0.4). `channel_count` is the supplied channel count and
@@ -157,7 +152,7 @@ pub enum ComputedFileError {
         actual_sample_frames: u32,
     },
     Header(RiffWriteError),
-    Payload(ComputedPayloadError),
+    Payload(PayloadError),
     FinalFileLength {
         expected: usize,
         actual: usize,
@@ -169,19 +164,19 @@ pub enum ComputedFileError {
     },
 }
 
-impl From<RiffWriteError> for ComputedFileError {
+impl From<RiffWriteError> for FileError {
     fn from(value: RiffWriteError) -> Self {
         Self::Header(value)
     }
 }
 
-impl From<ComputedPayloadError> for ComputedFileError {
-    fn from(value: ComputedPayloadError) -> Self {
+impl From<PayloadError> for FileError {
+    fn from(value: PayloadError) -> Self {
         Self::Payload(value)
     }
 }
 
-impl From<InputTooShort> for ComputedFileError {
+impl From<InputTooShort> for FileError {
     fn from(value: InputTooShort) -> Self {
         Self::InputTooShort {
             input_sample_frames: value.input_sample_frames,
@@ -190,7 +185,7 @@ impl From<InputTooShort> for ComputedFileError {
     }
 }
 
-impl fmt::Display for ComputedFileError {
+impl fmt::Display for FileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InputTooShort {
@@ -258,7 +253,7 @@ impl fmt::Display for ComputedFileError {
     }
 }
 
-impl std::error::Error for ComputedFileError {}
+impl std::error::Error for FileError {}
 
 /// The exact streaming-file region whose `write_all` call failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,22 +266,22 @@ pub enum WriteStage {
     },
 }
 
-/// Typed failure from a frame-oriented computed file write.
+/// Typed failure from a frame-oriented file write.
 ///
-/// Codec/container validation remains represented by [`ComputedFileError`].
+/// Codec/container validation remains represented by [`FileError`].
 /// Sink failures retain both their exact write stage and the original
 /// [`io::Error`], including through [`std::error::Error::source`].
 #[derive(Debug)]
 pub enum EncodeError {
-    File(ComputedFileError),
+    File(FileError),
     Io {
         stage: WriteStage,
         source: io::Error,
     },
 }
 
-impl From<ComputedFileError> for EncodeError {
-    fn from(value: ComputedFileError) -> Self {
+impl From<FileError> for EncodeError {
+    fn from(value: FileError) -> Self {
         Self::File(value)
     }
 }
@@ -298,7 +293,7 @@ impl fmt::Display for EncodeError {
             Self::Io { stage, source } => {
                 write!(
                     formatter,
-                    "computed output write failed at {stage:?}: {source}"
+                    "ATRAC3plus output write failed at {stage:?}: {source}"
                 )
             }
         }
@@ -314,34 +309,34 @@ impl std::error::Error for EncodeError {
     }
 }
 
-/// Drive the pure [`ComputedFlushScheduler`] over the per-core-call PCM supply
+/// Drive the pure [`BufferedFlushScheduler`] over the per-core-call PCM supply
 /// for the derived schedule and assemble the computed `data` payload. Reads ZERO
 /// `input_sample_frames` that produced `frames`.
-pub fn assemble_computed_payload(
+pub fn assemble_payload(
     schedule: &EncodeSchedule,
     frames: Vec<[Vec<f32>; 2]>,
-) -> Result<Vec<u8>, ComputedPayloadError> {
-    assemble_computed_payload_with_progress(schedule, frames, |_| {})
+) -> Result<Vec<u8>, PayloadError> {
+    assemble_payload_with_progress(schedule, frames, |_| {})
 }
 
-/// [`assemble_computed_payload`] with a progress callback invoked after every
+/// [`assemble_payload`] with a progress callback invoked after every
 /// successful encode and flush wrapper call.
-pub fn assemble_computed_payload_with_progress<F>(
+pub fn assemble_payload_with_progress<F>(
     schedule: &EncodeSchedule,
     frames: Vec<[Vec<f32>; 2]>,
     on_progress: F,
-) -> Result<Vec<u8>, ComputedPayloadError>
+) -> Result<Vec<u8>, PayloadError>
 where
     F: FnMut(EncodeProgress),
 {
     // 352 params (selector 30, budget 16379, 2048 frame bytes, mode_a 2).
-    assemble_computed_payload_for_params_with_progress(
+    assemble_payload_for_params_with_progress(
         schedule,
         frames,
         CodingParams {
             selector: 30,
             budget: 16379,
-            frame_bytes: COMPUTED_FRAME_BYTES as u32,
+            frame_bytes: DEFAULT_FRAME_BYTES as u32,
             // Stereo anchor (`handle+0x94` == 2).
             channels: 2,
             mode_a: 2,
@@ -355,32 +350,32 @@ where
     )
 }
 
-/// Like [`assemble_computed_payload`] but for an explicit per-rate
+/// Like [`assemble_payload`] but for an explicit per-rate
 /// [`CodingParams`] (docs/13 §1.1): drives the per-rate
-/// [`ComputedFlushScheduler`] and sizes/validates every output frame at
+/// [`BufferedFlushScheduler`] and sizes/validates every output frame at
 /// `params.frame_bytes`. At the 352 params this equals
-/// [`assemble_computed_payload`].
+/// [`assemble_payload`].
 ///
 /// Pair-shaped for the nine stereo rates. Reshapes the `[left, right]` pair
 /// supply to the channel-vec representation (docs/14 §0.4) and delegates to
-/// [`assemble_computed_payload_for_params_channels`] — the exact delegation
-/// pattern [`ComputedFlushScheduler::new_for_params`] uses — so the stereo
+/// [`assemble_payload_for_params_channels`] — the exact delegation
+/// pattern [`BufferedFlushScheduler::new_for_params`] uses — so the stereo
 /// output stays bit-for-bit unchanged (pure reshape, no sample changes).
-pub fn assemble_computed_payload_for_params(
+pub fn assemble_payload_for_params(
     schedule: &EncodeSchedule,
     frames: Vec<[Vec<f32>; 2]>,
     params: CodingParams,
-) -> Result<Vec<u8>, ComputedPayloadError> {
-    assemble_computed_payload_for_params_with_progress(schedule, frames, params, |_| {})
+) -> Result<Vec<u8>, PayloadError> {
+    assemble_payload_for_params_with_progress(schedule, frames, params, |_| {})
 }
 
-/// [`assemble_computed_payload_for_params`] with per-wrapper-call progress.
-pub fn assemble_computed_payload_for_params_with_progress<F>(
+/// [`assemble_payload_for_params`] with per-wrapper-call progress.
+pub fn assemble_payload_for_params_with_progress<F>(
     schedule: &EncodeSchedule,
     frames: Vec<[Vec<f32>; 2]>,
     params: CodingParams,
     on_progress: F,
-) -> Result<Vec<u8>, ComputedPayloadError>
+) -> Result<Vec<u8>, PayloadError>
 where
     F: FnMut(EncodeProgress),
 {
@@ -388,7 +383,7 @@ where
         .into_iter()
         .map(|[left, right]| vec![left, right])
         .collect();
-    assemble_computed_payload_for_params_channels_with_progress(
+    assemble_payload_for_params_channels_with_progress(
         schedule,
         channel_frames,
         params,
@@ -396,30 +391,30 @@ where
     )
 }
 
-/// Like [`assemble_computed_payload_for_params`] but for a channel-vec PCM
+/// Like [`assemble_payload_for_params`] but for a channel-vec PCM
 /// supply (`frames[core_call][channel][sample]`, docs/14 §0.4): drives the
-/// per-rate [`ComputedFlushScheduler`] via
-/// [`ComputedFlushScheduler::new_for_params_channels`] (which validates each
+/// per-rate [`BufferedFlushScheduler`] via
+/// [`BufferedFlushScheduler::new_for_params_channels`] (which validates each
 /// core call's channel count against `params.channels`). The pair-shaped
-/// [`assemble_computed_payload_for_params`] delegates here after reshaping;
+/// [`assemble_payload_for_params`] delegates here after reshaping;
 /// the 128 kbps mono path (docs/14 §1.3) supplies a 1-channel frame vector.
-pub fn assemble_computed_payload_for_params_channels(
+pub fn assemble_payload_for_params_channels(
     schedule: &EncodeSchedule,
     frames: Vec<Vec<Vec<f32>>>,
     params: CodingParams,
-) -> Result<Vec<u8>, ComputedPayloadError> {
-    assemble_computed_payload_for_params_channels_with_progress(schedule, frames, params, |_| {})
+) -> Result<Vec<u8>, PayloadError> {
+    assemble_payload_for_params_channels_with_progress(schedule, frames, params, |_| {})
 }
 
-/// [`assemble_computed_payload_for_params_channels`] with a callback after each
+/// [`assemble_payload_for_params_channels`] with a callback after each
 /// successful scheduler call and output-frame append. Existing assembly entry
 /// points delegate here with a no-op callback, preserving their behavior.
-pub fn assemble_computed_payload_for_params_channels_with_progress<F>(
+pub fn assemble_payload_for_params_channels_with_progress<F>(
     schedule: &EncodeSchedule,
     frames: Vec<Vec<Vec<f32>>>,
     params: CodingParams,
     mut on_progress: F,
-) -> Result<Vec<u8>, ComputedPayloadError>
+) -> Result<Vec<u8>, PayloadError>
 where
     F: FnMut(EncodeProgress),
 {
@@ -427,7 +422,7 @@ where
     let total_output_frames = schedule.total_output_frames() as usize;
     let total_steps = schedule.encode_calls() + schedule.flush_wrapper_calls();
     let payload_bytes = total_output_frames * frame_bytes;
-    let mut scheduler = ComputedFlushScheduler::new_for_params_channels(
+    let mut scheduler = BufferedFlushScheduler::new_for_params_channels(
         schedule.input_sample_frames(),
         frames,
         params,
@@ -438,7 +433,7 @@ where
     for core_call_index in 0..schedule.encode_calls() {
         let result =
             scheduler.encode_chunk(schedule.expected_encode_sample_frames(core_call_index))?;
-        append_computed_output_frame(
+        append_output_frame(
             &mut payload,
             &mut next_output_frame_index,
             result,
@@ -455,7 +450,7 @@ where
 
     for flush_call_index in 0..schedule.flush_wrapper_calls() {
         let result = scheduler.flush()?;
-        append_computed_output_frame(
+        append_output_frame(
             &mut payload,
             &mut next_output_frame_index,
             result,
@@ -471,20 +466,20 @@ where
     }
 
     if next_output_frame_index as usize != total_output_frames {
-        return Err(ComputedPayloadError::IncompleteOutputFrames {
+        return Err(PayloadError::IncompleteOutputFrames {
             expected: total_output_frames,
             actual: next_output_frame_index as usize,
         });
     }
 
     if !scheduler.is_done() {
-        return Err(ComputedPayloadError::SchedulerNotDone {
+        return Err(PayloadError::SchedulerNotDone {
             flush_calls: scheduler.flush_calls(),
         });
     }
 
     if payload.len() != payload_bytes {
-        return Err(ComputedPayloadError::FinalPayloadLength {
+        return Err(PayloadError::FinalPayloadLength {
             expected: payload_bytes,
             actual: payload.len(),
         });
@@ -495,15 +490,15 @@ where
 
 /// Frame-oriented compatibility collector (docs/16 S3). It retains only the
 /// caller's decoded `i16` channels, prepares one converted frame, immediately
-/// advances [`IncrementalComputedFlushScheduler`], and appends at most one
+/// advances [`IncrementalFlushScheduler`], and appends at most one
 /// returned encoded frame before preparing the next call. The complete payload
 /// remains intentionally buffered for the existing `Vec<u8>` public APIs.
-fn assemble_computed_payload_from_pcm_channels_with_progress<F>(
+fn assemble_payload_from_pcm_channels_with_progress<F>(
     schedule: &EncodeSchedule,
     channels: &[&[i16]],
     params: CodingParams,
     mut on_progress: F,
-) -> Result<Vec<u8>, ComputedPayloadError>
+) -> Result<Vec<u8>, PayloadError>
 where
     F: FnMut(EncodeProgress),
 {
@@ -511,8 +506,7 @@ where
     let total_output_frames = schedule.total_output_frames() as usize;
     let total_steps = schedule.encode_calls() + schedule.flush_wrapper_calls();
     let payload_bytes = total_output_frames * frame_bytes;
-    let mut scheduler =
-        IncrementalComputedFlushScheduler::new(schedule.input_sample_frames(), params)?;
+    let mut scheduler = IncrementalFlushScheduler::new(schedule.input_sample_frames(), params)?;
     let mut payload = Vec::with_capacity(payload_bytes);
     let mut next_output_frame_index = 0u32;
 
@@ -522,7 +516,7 @@ where
         let frame =
             prepare_current_pcm_frame(channels, source_offset, valid_sample_frames as usize)?;
         let result = scheduler.encode_chunk(valid_sample_frames, &frame)?;
-        append_computed_output_frame(
+        append_output_frame(
             &mut payload,
             &mut next_output_frame_index,
             result,
@@ -539,7 +533,7 @@ where
 
     for flush_call_index in 0..schedule.flush_wrapper_calls() {
         let result = scheduler.flush()?;
-        append_computed_output_frame(
+        append_output_frame(
             &mut payload,
             &mut next_output_frame_index,
             result,
@@ -555,18 +549,18 @@ where
     }
 
     if next_output_frame_index as usize != total_output_frames {
-        return Err(ComputedPayloadError::IncompleteOutputFrames {
+        return Err(PayloadError::IncompleteOutputFrames {
             expected: total_output_frames,
             actual: next_output_frame_index as usize,
         });
     }
     if !scheduler.is_done() {
-        return Err(ComputedPayloadError::SchedulerNotDone {
+        return Err(PayloadError::SchedulerNotDone {
             flush_calls: scheduler.flush_calls(),
         });
     }
     if payload.len() != payload_bytes {
-        return Err(ComputedPayloadError::FinalPayloadLength {
+        return Err(PayloadError::FinalPayloadLength {
             expected: payload_bytes,
             actual: payload.len(),
         });
@@ -579,28 +573,28 @@ where
 /// shape, prepare and consume one PCM call at a time, compute the payload, and
 /// prepend the native header (`write_atracx_header(N,
 /// schedule.total_output_frames())`).
-pub fn assemble_computed_atracx_file(
+pub fn assemble_atracx_file(
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
-) -> Result<Vec<u8>, ComputedFileError> {
-    assemble_computed_atracx_file_with_progress(input_sample_frames, left, right, |_| {})
+) -> Result<Vec<u8>, FileError> {
+    assemble_atracx_file_with_progress(input_sample_frames, left, right, |_| {})
 }
 
-/// [`assemble_computed_atracx_file`] with per-wrapper-call progress.
-pub fn assemble_computed_atracx_file_with_progress<F>(
+/// [`assemble_atracx_file`] with per-wrapper-call progress.
+pub fn assemble_atracx_file_with_progress<F>(
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
     on_progress: F,
-) -> Result<Vec<u8>, ComputedFileError>
+) -> Result<Vec<u8>, FileError>
 where
     F: FnMut(EncodeProgress),
 {
     // The channels must both hold exactly `N` sample frames. (The native minimum
     // guard lives in `EncodeSchedule::new`, invoked below.)
     if left.len() != input_sample_frames as usize || right.len() != input_sample_frames as usize {
-        return Err(ComputedFileError::UnsupportedInputShape {
+        return Err(FileError::UnsupportedInputShape {
             expected_sample_frames: input_sample_frames,
             actual_sample_frames: input_sample_frames,
             left_len: left.len(),
@@ -611,11 +605,11 @@ where
     // Reject `N < 6144` (native minimum) with the typed too-short error.
     let schedule = EncodeSchedule::new(input_sample_frames)?;
     let total_output_frames = schedule.total_output_frames();
-    let payload_bytes = total_output_frames as usize * COMPUTED_FRAME_BYTES;
+    let payload_bytes = total_output_frames as usize * DEFAULT_FRAME_BYTES;
     let file_bytes = ATRACX_HEADER_LEN as usize + payload_bytes;
 
     let params = CodingParams::for_profile(&crate::encoder::profile::ATRAC3PLUS_352);
-    let payload = assemble_computed_payload_from_pcm_channels_with_progress(
+    let payload = assemble_payload_from_pcm_channels_with_progress(
         &schedule,
         &[left, right],
         params,
@@ -626,7 +620,7 @@ where
     bytes.extend_from_slice(&payload);
 
     if bytes.len() != file_bytes {
-        return Err(ComputedFileError::FinalFileLength {
+        return Err(FileError::FinalFileLength {
             expected: file_bytes,
             actual: bytes.len(),
         });
@@ -638,17 +632,17 @@ where
 /// Bitrate-aware entry point (docs/13 §0.1–§5.2): assemble the computed ATRACX
 /// file for `profile`. All nine native ATRAC3plus stereo rates route through the
 /// computed pipeline. 352 kbps delegates verbatim to
-/// [`assemble_computed_atracx_file`] (so its shipped output stays
+/// [`assemble_atracx_file`] (so its shipped output stays
 /// byte-identical); the other eight run
-/// [`assemble_computed_atracx_file_for_rate`]. Profiles exist only for those
+/// [`assemble_atracx_file_for_rate`]. Profiles exist only for those
 /// nine native stereo rows, so no accepted profile remains unported.
-pub fn assemble_computed_atracx_file_for_profile(
+pub fn assemble_atracx_file_for_profile(
     profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
-) -> Result<Vec<u8>, ComputedFileError> {
-    assemble_computed_atracx_file_for_profile_with_progress(
+) -> Result<Vec<u8>, FileError> {
+    assemble_atracx_file_for_profile_with_progress(
         profile,
         input_sample_frames,
         left,
@@ -657,28 +651,28 @@ pub fn assemble_computed_atracx_file_for_profile(
     )
 }
 
-/// [`assemble_computed_atracx_file_for_profile`] with per-wrapper-call
+/// [`assemble_atracx_file_for_profile`] with per-wrapper-call
 /// progress. The callback is not invoked when profile, shape, or minimum-length
 /// validation fails before the computed scheduler starts.
-pub fn assemble_computed_atracx_file_for_profile_with_progress<F>(
+pub fn assemble_atracx_file_for_profile_with_progress<F>(
     profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
     on_progress: F,
-) -> Result<Vec<u8>, ComputedFileError>
+) -> Result<Vec<u8>, FileError>
 where
     F: FnMut(EncodeProgress),
 {
     if profile.channels() != 2 {
-        return Err(ComputedFileError::UnsupportedProfile {
+        return Err(FileError::UnsupportedProfile {
             bitrate_kbps: profile.bitrate_kbps(),
         });
     }
     if profile.bitrate_kbps() == 352 {
-        assemble_computed_atracx_file_with_progress(input_sample_frames, left, right, on_progress)
+        assemble_atracx_file_with_progress(input_sample_frames, left, right, on_progress)
     } else {
-        assemble_computed_atracx_file_for_rate_with_progress(
+        assemble_atracx_file_for_rate_with_progress(
             profile,
             input_sample_frames,
             left,
@@ -690,7 +684,7 @@ where
 
 /// Stream a computed stereo ATRACX file to `writer` without buffering the
 /// compressed payload or complete output file.
-pub fn write_computed_atracx_file_for_profile<W>(
+pub fn write_atracx_file_for_profile<W>(
     writer: &mut W,
     profile: &Atrac3plusProfile,
     input_sample_frames: u32,
@@ -700,7 +694,7 @@ pub fn write_computed_atracx_file_for_profile<W>(
 where
     W: Write,
 {
-    write_computed_atracx_file_for_profile_with_progress(
+    write_atracx_file_for_profile_with_progress(
         writer,
         profile,
         input_sample_frames,
@@ -710,10 +704,10 @@ where
     )
 }
 
-/// [`write_computed_atracx_file_for_profile`] with progress after every
+/// [`write_atracx_file_for_profile`] with progress after every
 /// successful wrapper call. An output-bearing call is successful only after
 /// its complete frame has been accepted by `writer`.
-pub fn write_computed_atracx_file_for_profile_with_progress<W, F>(
+pub fn write_atracx_file_for_profile_with_progress<W, F>(
     writer: &mut W,
     profile: &Atrac3plusProfile,
     input_sample_frames: u32,
@@ -726,13 +720,13 @@ where
     F: FnMut(EncodeProgress),
 {
     if profile.channels() != 2 {
-        return Err(ComputedFileError::UnsupportedProfile {
+        return Err(FileError::UnsupportedProfile {
             bitrate_kbps: profile.bitrate_kbps(),
         }
         .into());
     }
     if left.len() != input_sample_frames as usize || right.len() != input_sample_frames as usize {
-        return Err(ComputedFileError::UnsupportedInputShape {
+        return Err(FileError::UnsupportedInputShape {
             expected_sample_frames: input_sample_frames,
             actual_sample_frames: input_sample_frames,
             left_len: left.len(),
@@ -742,7 +736,7 @@ where
     }
 
     let schedule = EncodeSchedule::new(input_sample_frames)
-        .map_err(ComputedFileError::from)
+        .map_err(FileError::from)
         .map_err(EncodeError::from)?;
     let mut stream =
         super::stream::Atrac3plusStreamEncoder::new(writer, profile, input_sample_frames)?;
@@ -762,17 +756,17 @@ where
 }
 
 /// Mono entry point (docs/14 §0.1, §0.4, §1.3, §2.1) — the channel-aware sibling of
-/// [`assemble_computed_atracx_file_for_profile`]. Validates the call in the
+/// [`assemble_atracx_file_for_profile`]. Validates the call in the
 /// native at3tool precedence order (`checkEncodeParam` runs BEFORE the
 /// `getAtracEncodeSetting` row/rate match, decompiled/at3tool.c 1787-1789; E2),
 /// then routes by rate:
 ///
 /// 1. **profile guard** — `profile` must use mono channel mode, else
-///    [`ComputedFileError::UnsupportedProfile`].
+///    [`FileError::UnsupportedProfile`].
 /// 2. **shape guard** — exactly one channel of `input_sample_frames` samples,
-///    else [`ComputedFileError::UnsupportedMonoInputShape`] (a malformed call,
+///    else [`FileError::UnsupportedMonoInputShape`] (a malformed call,
 ///    not a native shape).
-/// 3. **too-short guard** — `N >= 6144`, else [`ComputedFileError::InputTooShort`].
+/// 3. **too-short guard** — `N >= 6144`, else [`FileError::InputTooShort`].
 ///    Native `checkEncodeParam` rejects `N < 0x1800` BEFORE the rate/row match,
 ///    channel-independent (E2); the schedule law is channel-independent (E3), so
 ///    [`EncodeSchedule::new`] governs the minimum here too.
@@ -783,15 +777,15 @@ where
 ///    96: 39/77, 64: 32/77, 48: 34/77, 32: 25/77 frames byte-exact incl. frame 0
 ///    vs the native oracle) and returns the assembled ATRACX file. Guard (a)
 ///    above already rejects any other rate with
-///    [`ComputedFileError::UnsupportedProfile`], so no accepted mono profile
+///    [`FileError::UnsupportedProfile`], so no accepted mono profile
 ///    remains unported (the retired "accepted but unported" state, mirroring the
 ///    stereo close-out).
-pub fn assemble_computed_atracx_file_for_mono_profile(
+pub fn assemble_atracx_file_for_mono_profile(
     profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     channels: &[Vec<i16>],
-) -> Result<Vec<u8>, ComputedFileError> {
-    assemble_computed_atracx_file_for_mono_profile_with_progress(
+) -> Result<Vec<u8>, FileError> {
+    assemble_atracx_file_for_mono_profile_with_progress(
         profile,
         input_sample_frames,
         channels,
@@ -799,28 +793,28 @@ pub fn assemble_computed_atracx_file_for_mono_profile(
     )
 }
 
-/// [`assemble_computed_atracx_file_for_mono_profile`] with per-wrapper-call
+/// [`assemble_atracx_file_for_mono_profile`] with per-wrapper-call
 /// progress. Validation and error precedence are identical to the no-callback
 /// entry point.
-pub fn assemble_computed_atracx_file_for_mono_profile_with_progress<F>(
+pub fn assemble_atracx_file_for_mono_profile_with_progress<F>(
     profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     channels: &[Vec<i16>],
     on_progress: F,
-) -> Result<Vec<u8>, ComputedFileError>
+) -> Result<Vec<u8>, FileError>
 where
     F: FnMut(EncodeProgress),
 {
     // (a) profile guard: this entry point accepts validated mono profiles.
     if profile.channels() != 1 {
-        return Err(ComputedFileError::UnsupportedProfile {
+        return Err(FileError::UnsupportedProfile {
             bitrate_kbps: profile.bitrate_kbps(),
         });
     }
 
     // (b) shape guard: exactly one channel whose length is the declared N.
     if channels.len() != 1 || channels[0].len() != input_sample_frames as usize {
-        return Err(ComputedFileError::UnsupportedMonoInputShape {
+        return Err(FileError::UnsupportedMonoInputShape {
             expected_sample_frames: input_sample_frames,
             channel_count: channels.len(),
             channel_len: channels.first().map_or(0, Vec::len),
@@ -834,7 +828,7 @@ where
     // §2.1), 64 (docs/14 §3.1), 48 (docs/14 §4.1), 32 (docs/14 §5.1) — run the
     // shared rate-generic computed assembly path. Guard (a) already rejected any
     // other rate, so no accepted mono profile remains unported.
-    assemble_computed_mono_file_for_rate(
+    assemble_mono_file_for_rate(
         profile,
         &schedule,
         input_sample_frames,
@@ -845,7 +839,7 @@ where
 
 /// Stream a computed mono ATRACX file to `writer` without buffering the
 /// compressed payload or complete output file.
-pub fn write_computed_atracx_file_for_mono_profile<W>(
+pub fn write_atracx_file_for_mono_profile<W>(
     writer: &mut W,
     profile: &Atrac3plusProfile,
     input_sample_frames: u32,
@@ -854,7 +848,7 @@ pub fn write_computed_atracx_file_for_mono_profile<W>(
 where
     W: Write,
 {
-    write_computed_atracx_file_for_mono_profile_with_progress(
+    write_atracx_file_for_mono_profile_with_progress(
         writer,
         profile,
         input_sample_frames,
@@ -863,10 +857,10 @@ where
     )
 }
 
-/// [`write_computed_atracx_file_for_mono_profile`] with progress after every
+/// [`write_atracx_file_for_mono_profile`] with progress after every
 /// successful wrapper call. Validation order is identical to the buffered
 /// mono entry point.
-pub fn write_computed_atracx_file_for_mono_profile_with_progress<W, F>(
+pub fn write_atracx_file_for_mono_profile_with_progress<W, F>(
     writer: &mut W,
     profile: &Atrac3plusProfile,
     input_sample_frames: u32,
@@ -878,13 +872,13 @@ where
     F: FnMut(EncodeProgress),
 {
     if profile.channels() != 1 {
-        return Err(ComputedFileError::UnsupportedProfile {
+        return Err(FileError::UnsupportedProfile {
             bitrate_kbps: profile.bitrate_kbps(),
         }
         .into());
     }
     if channels.len() != 1 || channels[0].len() != input_sample_frames as usize {
-        return Err(ComputedFileError::UnsupportedMonoInputShape {
+        return Err(FileError::UnsupportedMonoInputShape {
             expected_sample_frames: input_sample_frames,
             channel_count: channels.len(),
             channel_len: channels.first().map_or(0, Vec::len),
@@ -893,7 +887,7 @@ where
     }
 
     let schedule = EncodeSchedule::new(input_sample_frames)
-        .map_err(ComputedFileError::from)
+        .map_err(FileError::from)
         .map_err(EncodeError::from)?;
     let mut stream =
         super::stream::Atrac3plusStreamEncoder::new(writer, profile, input_sample_frames)?;
@@ -910,7 +904,7 @@ where
 /// Assemble the full MONO ATRACX file for a LANDED mono rate (128 kbps docs/14
 /// §1.3; 96 kbps docs/14 §2.1; 64 kbps docs/14 §3.1; 48 kbps docs/14 §4.1;
 /// 32 kbps docs/14 §5.1): the mono sibling of
-/// [`assemble_computed_atracx_file_for_rate`], rate-generic via
+/// [`assemble_atracx_file_for_rate`], rate-generic via
 /// `profile.frame_bytes()` / [`CodingParams::for_profile`] / `profile.codec_info()`.
 /// The frame SCHEDULE is channel-independent (E3), so the caller's
 /// [`EncodeSchedule`] governs the output-frame count; one current-call
@@ -923,13 +917,13 @@ where
 /// The composed-parity anchor is `tests/computed_frames_mono.rs` (128: 51/77;
 /// 96: 39/77; 64: 32/77; 48: 34/77; 32: 25/77 frames byte-exact incl. frame 0 vs
 /// the native oracle).
-fn assemble_computed_mono_file_for_rate<F>(
+fn assemble_mono_file_for_rate<F>(
     profile: &Atrac3plusProfile,
     schedule: &EncodeSchedule,
     input_sample_frames: u32,
     channels: &[Vec<i16>],
     on_progress: F,
-) -> Result<Vec<u8>, ComputedFileError>
+) -> Result<Vec<u8>, FileError>
 where
     F: FnMut(EncodeProgress),
 {
@@ -939,7 +933,7 @@ where
     let file_bytes = ATRACX_HEADER_LEN as usize + payload_bytes;
 
     let params = CodingParams::for_profile(profile);
-    let payload = assemble_computed_payload_from_pcm_channels_with_progress(
+    let payload = assemble_payload_from_pcm_channels_with_progress(
         schedule,
         &[channels[0].as_slice()],
         params,
@@ -956,7 +950,7 @@ where
     bytes.extend_from_slice(&payload);
 
     if bytes.len() != file_bytes {
-        return Err(ComputedFileError::FinalFileLength {
+        return Err(FileError::FinalFileLength {
             expected: file_bytes,
             actual: bytes.len(),
         });
@@ -968,7 +962,7 @@ where
 /// Compute the full per-rate ATRACX file (docs/13 §1.1–§5.2): the shared
 /// pipeline behind 320/256/192/160/128/96/64/48. The final two use the
 /// mode_cc==0 low-selector `set_gainc_at5` path.
-/// Mirrors [`assemble_computed_atracx_file`] but threads the profile's per-rate
+/// Mirrors [`assemble_atracx_file`] but threads the profile's per-rate
 /// coding params ([`CodingParams::for_profile`]) into the computed pipeline and
 /// sizes the payload / RIFF header at `profile.frame_bytes()` via
 /// [`write_atracx_header_for_rate`]. The frame SCHEDULE is rate-independent
@@ -977,40 +971,34 @@ where
 /// divergence; the perceptual battery owns full-file acceptance) — this path is
 /// structurally exact (frame count / sizing / container) but not byte-pinned
 /// against native payload bytes.
-pub fn assemble_computed_atracx_file_for_rate(
+pub fn assemble_atracx_file_for_rate(
     profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
-) -> Result<Vec<u8>, ComputedFileError> {
-    assemble_computed_atracx_file_for_rate_with_progress(
-        profile,
-        input_sample_frames,
-        left,
-        right,
-        |_| {},
-    )
+) -> Result<Vec<u8>, FileError> {
+    assemble_atracx_file_for_rate_with_progress(profile, input_sample_frames, left, right, |_| {})
 }
 
-/// [`assemble_computed_atracx_file_for_rate`] with per-wrapper-call progress.
-pub fn assemble_computed_atracx_file_for_rate_with_progress<F>(
+/// [`assemble_atracx_file_for_rate`] with per-wrapper-call progress.
+pub fn assemble_atracx_file_for_rate_with_progress<F>(
     profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
     on_progress: F,
-) -> Result<Vec<u8>, ComputedFileError>
+) -> Result<Vec<u8>, FileError>
 where
     F: FnMut(EncodeProgress),
 {
     if profile.channels() != 2 {
-        return Err(ComputedFileError::UnsupportedProfile {
+        return Err(FileError::UnsupportedProfile {
             bitrate_kbps: profile.bitrate_kbps(),
         });
     }
     // Both channels must hold exactly `N` sample frames.
     if left.len() != input_sample_frames as usize || right.len() != input_sample_frames as usize {
-        return Err(ComputedFileError::UnsupportedInputShape {
+        return Err(FileError::UnsupportedInputShape {
             expected_sample_frames: input_sample_frames,
             actual_sample_frames: input_sample_frames,
             left_len: left.len(),
@@ -1026,7 +1014,7 @@ where
     let file_bytes = ATRACX_HEADER_LEN as usize + payload_bytes;
 
     let params = CodingParams::for_profile(profile);
-    let payload = assemble_computed_payload_from_pcm_channels_with_progress(
+    let payload = assemble_payload_from_pcm_channels_with_progress(
         &schedule,
         &[left, right],
         params,
@@ -1042,7 +1030,7 @@ where
     bytes.extend_from_slice(&payload);
 
     if bytes.len() != file_bytes {
-        return Err(ComputedFileError::FinalFileLength {
+        return Err(FileError::FinalFileLength {
             expected: file_bytes,
             actual: bytes.len(),
         });
@@ -1051,11 +1039,11 @@ where
     Ok(bytes)
 }
 
-pub(crate) fn write_computed_output_frame<W>(
+pub(crate) fn write_output_frame<W>(
     writer: &mut W,
     next_output_frame_index: &mut u32,
     written_payload_bytes: &mut usize,
-    result: ComputedFrameResult,
+    result: FrameResult,
     expected_frame_bytes: usize,
 ) -> Result<(), EncodeError>
 where
@@ -1064,28 +1052,26 @@ where
     match result.output_frame_index {
         Some(output_frame_index) => {
             if output_frame_index != *next_output_frame_index {
-                return Err(ComputedFileError::Payload(
-                    ComputedPayloadError::UnexpectedOutputFrameOrder {
+                return Err(
+                    FileError::Payload(PayloadError::UnexpectedOutputFrameOrder {
                         expected: *next_output_frame_index,
                         actual: output_frame_index,
-                    },
-                )
-                .into());
+                    })
+                    .into(),
+                );
             }
             if result.produced_bytes != expected_frame_bytes {
-                return Err(ComputedFileError::Payload(
-                    ComputedPayloadError::UnexpectedProducedBytes {
-                        source: result.source,
-                        core_call_index: result.core_call_index,
-                        output_frame_index,
-                        expected: expected_frame_bytes,
-                        actual: result.produced_bytes,
-                    },
-                )
+                return Err(FileError::Payload(PayloadError::UnexpectedProducedBytes {
+                    source: result.source,
+                    core_call_index: result.core_call_index,
+                    output_frame_index,
+                    expected: expected_frame_bytes,
+                    actual: result.produced_bytes,
+                })
                 .into());
             }
             let frame = result.frame_bytes.ok_or_else(|| {
-                ComputedFileError::Payload(ComputedPayloadError::MissingFrameBytes {
+                FileError::Payload(PayloadError::MissingFrameBytes {
                     source: result.source,
                     core_call_index: result.core_call_index,
                     output_frame_index,
@@ -1093,15 +1079,13 @@ where
                 })
             })?;
             if frame.len() != expected_frame_bytes {
-                return Err(ComputedFileError::Payload(
-                    ComputedPayloadError::UnexpectedProducedBytes {
-                        source: result.source,
-                        core_call_index: result.core_call_index,
-                        output_frame_index,
-                        expected: expected_frame_bytes,
-                        actual: frame.len(),
-                    },
-                )
+                return Err(FileError::Payload(PayloadError::UnexpectedProducedBytes {
+                    source: result.source,
+                    core_call_index: result.core_call_index,
+                    output_frame_index,
+                    expected: expected_frame_bytes,
+                    actual: frame.len(),
+                })
                 .into());
             }
             writer.write_all(&frame).map_err(|source| EncodeError::Io {
@@ -1117,13 +1101,11 @@ where
         }
         None => {
             if result.produced_bytes != 0 || result.frame_bytes.is_some() {
-                return Err(ComputedFileError::Payload(
-                    ComputedPayloadError::UnexpectedZeroOutput {
-                        source: result.source,
-                        core_call_index: result.core_call_index,
-                        produced_bytes: result.produced_bytes,
-                    },
-                )
+                return Err(FileError::Payload(PayloadError::UnexpectedZeroOutput {
+                    source: result.source,
+                    core_call_index: result.core_call_index,
+                    produced_bytes: result.produced_bytes,
+                })
                 .into());
             }
         }
@@ -1131,22 +1113,22 @@ where
     Ok(())
 }
 
-fn append_computed_output_frame(
+fn append_output_frame(
     payload: &mut Vec<u8>,
     next_output_frame_index: &mut u32,
-    result: ComputedFrameResult,
+    result: FrameResult,
     frame_bytes: usize,
-) -> Result<(), ComputedPayloadError> {
+) -> Result<(), PayloadError> {
     match result.output_frame_index {
         Some(output_frame_index) => {
             if output_frame_index != *next_output_frame_index {
-                return Err(ComputedPayloadError::UnexpectedOutputFrameOrder {
+                return Err(PayloadError::UnexpectedOutputFrameOrder {
                     expected: *next_output_frame_index,
                     actual: output_frame_index,
                 });
             }
             if result.produced_bytes != frame_bytes {
-                return Err(ComputedPayloadError::UnexpectedProducedBytes {
+                return Err(PayloadError::UnexpectedProducedBytes {
                     source: result.source,
                     core_call_index: result.core_call_index,
                     output_frame_index,
@@ -1154,21 +1136,18 @@ fn append_computed_output_frame(
                     actual: result.produced_bytes,
                 });
             }
-            let frame_bytes =
-                result
-                    .frame_bytes
-                    .ok_or(ComputedPayloadError::MissingFrameBytes {
-                        source: result.source,
-                        core_call_index: result.core_call_index,
-                        output_frame_index,
-                        produced_bytes: result.produced_bytes,
-                    })?;
+            let frame_bytes = result.frame_bytes.ok_or(PayloadError::MissingFrameBytes {
+                source: result.source,
+                core_call_index: result.core_call_index,
+                output_frame_index,
+                produced_bytes: result.produced_bytes,
+            })?;
             payload.extend_from_slice(&frame_bytes);
             *next_output_frame_index += 1;
         }
         None => {
             if result.produced_bytes != 0 || result.frame_bytes.is_some() {
-                return Err(ComputedPayloadError::UnexpectedZeroOutput {
+                return Err(PayloadError::UnexpectedZeroOutput {
                     source: result.source,
                     core_call_index: result.core_call_index,
                     produced_bytes: result.produced_bytes,

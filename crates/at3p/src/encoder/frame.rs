@@ -1,12 +1,11 @@
-//! docs/11 Phase 2 §2.2 — the fully computed single-frame assembly and the
-//! rolling computed driver.
+//! Single-frame coding, typed-syntax assembly, and rolling encoder driver.
 //!
-//! Phase 1 proved every packer window computable by SUBSTITUTING computed
+//! Reference work proved every packer window computable by substituting derived
 //! windows into a CAPTURED call-7 prepacker state
 //! (`tests/composed_frame.rs::phase1_computed_pipeline_from_pcm_packs_byte_exact`).
-//! This module removes the captured scaffold: [`build_computed_prepacker_state`]
-//! assembles the whole [`FramePrepackerState`] FROM SCRATCH out of the computed
-//! per-call outputs, and [`ComputedFrameDriver`] drives the single-call assembly
+//! This module removes the captured scaffold: [`build_reference_prepacker_state`]
+//! assembles the whole [`FramePrepackerState`] from scratch out of the derived
+//! per-call outputs, and [`FrameDriver`] drives the single-call assembly
 //! over every core call with owned rolling state.
 //!
 //!
@@ -18,8 +17,8 @@
 //! 0x1780; `cfg` mem_offset 0 len 0x400; `gainb` mem_offset 0 len 0xb00;
 //! `gha_arena` mem_offset 0 len 0x800; `gha_p1` mem_offset 0 len 0x1000.
 //!
-//! Windows are zero-filled to that geometry, then the EXISTING serializers write
-//! their computed content onto them, mirroring the substitution order of the
+//! Windows are zero-filled to that geometry, then the existing serializers write
+//! their derived content onto them, mirroring the substitution order of the
 //! Phase-1 capstone (`substitute_calc_surface`, then cfg, IDCT, gain modes,
 //! IDWL/IDSF, GHA), plus the two new §2.2 windows (`gainb`, init header).
 //!
@@ -60,7 +59,7 @@ use crate::encoder::packing_prep::{
     GHA_HAS_PREVIOUS, GhaPackingPrep, PackingPrepError, gha_packing_prep_from_frontend,
 };
 use crate::encoder::profile::ATRAC3PLUS_352;
-use crate::encoder::syntax_bridge::build_computed_frame_syntax;
+use crate::encoder::syntax_bridge::build_frame_syntax;
 #[cfg(any(test, debug_assertions))]
 use crate::pipeline::syntax::FrameSyntax;
 use crate::pipeline::syntax::FrameSyntaxError;
@@ -75,11 +74,11 @@ use crate::reference::native_layout::{
 };
 
 /// Frame byte length of the 352 stereo single-block frame.
-pub const COMPUTED_FRAME_BYTES: usize = 2048;
+pub const DEFAULT_FRAME_BYTES: usize = 2048;
 /// Block-group count for the 352 stereo path (`atx_state + 0xc`).
-pub const COMPUTED_BLOCK_COUNT: usize = 1;
+pub const BLOCK_GROUP_COUNT: usize = 1;
 /// Blocks per group (`cfg + 0xa8`).
-pub const COMPUTED_NBLK: usize = 2;
+pub const DEFAULT_CHANNEL_COUNT: usize = 2;
 /// `range_a` window length (`[0, 0x1110)`).
 pub const RANGE_A_LEN: usize = 0x1110;
 /// `range_b` window base (`[0x1b480, 0x1cc00)`).
@@ -103,7 +102,7 @@ pub const SYNTHETIC_ARENA_HEADER: i32 = 0x1000_0000;
 
 /// The error surface of the computed single-frame assembly + rolling driver.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ComputedFrameError {
+pub enum FrameError {
     /// The frontend core call failed.
     Frontend(FrontendError),
     /// The coding bridge (init roll / calc-entry assembly) failed.
@@ -130,28 +129,28 @@ pub enum ComputedFrameError {
     Syntax(FrameSyntaxError),
 }
 
-impl From<FrontendError> for ComputedFrameError {
+impl From<FrontendError> for FrameError {
     fn from(error: FrontendError) -> Self {
-        ComputedFrameError::Frontend(error)
+        FrameError::Frontend(error)
     }
 }
-impl From<CodingBridgeError> for ComputedFrameError {
+impl From<CodingBridgeError> for FrameError {
     fn from(error: CodingBridgeError) -> Self {
-        ComputedFrameError::Coding(error)
+        FrameError::Coding(error)
     }
 }
-impl From<PackingPrepError> for ComputedFrameError {
+impl From<PackingPrepError> for FrameError {
     fn from(error: PackingPrepError) -> Self {
-        ComputedFrameError::Packing(error)
+        FrameError::Packing(error)
     }
 }
 #[cfg(any(test, debug_assertions))]
-impl From<PackerBridgeError> for ComputedFrameError {
+impl From<PackerBridgeError> for FrameError {
     fn from(error: PackerBridgeError) -> Self {
-        ComputedFrameError::ReferenceLayout(error)
+        FrameError::ReferenceLayout(error)
     }
 }
-impl From<FrameSyntaxError> for ComputedFrameError {
+impl From<FrameSyntaxError> for FrameError {
     fn from(error: FrameSyntaxError) -> Self {
         Self::Syntax(error)
     }
@@ -160,7 +159,7 @@ impl From<FrameSyntaxError> for ComputedFrameError {
 /// The computed per-object windows the from-scratch state builder needs, one per
 /// channel. Everything is produced by the existing computed pipeline; this is a
 /// plain carrier so the builder stays a pure assembler.
-pub struct ComputedObjectInputs {
+pub struct ObjectInputs {
     /// Init gain-classification header words (`range_b [0x1b484, 0x1b494)`).
     pub init_header: InitGainHeaderWords,
     /// This channel's assembled 16×38-word gain-A records (point prefix + zero
@@ -172,7 +171,7 @@ pub struct ComputedObjectInputs {
 
 /// Assemble the whole [`FramePrepackerState`] FROM SCRATCH (docs/11 §2.2 (a)3)
 /// from the computed calc entry/output, the per-frame cfg fields, the GHA prep,
-/// and the per-object [`ComputedObjectInputs`].
+/// and the per-object [`ObjectInputs`].
 ///
 /// Windows are zero-filled to the frame-invariant geometry, then the existing
 /// serializers write their computed content onto them (calc surface first, then
@@ -183,15 +182,15 @@ pub struct ComputedObjectInputs {
 /// capstone's `substitute_gha_from_frontend` does; `prep` is the SAME
 /// `gha_packing_prep_from_frontend` result whose `total_bits` fed `gha_bits`.
 #[cfg(any(test, debug_assertions))]
-pub fn build_computed_prepacker_state(
+pub fn build_reference_prepacker_state(
     out: &CalcFrameOutput,
     per_frame: &CfgPerFrame352,
     frontend: &FrontendState,
     prep: &GhaPackingPrep,
-    objects: &[ComputedObjectInputs],
-) -> Result<FramePrepackerState, ComputedFrameError> {
+    objects: &[ObjectInputs],
+) -> Result<FramePrepackerState, FrameError> {
     // 352 wrapper: selector 30, budget 16379, 2048 frame bytes.
-    build_computed_prepacker_state_for_params(
+    build_reference_prepacker_state_for_params(
         out,
         per_frame,
         frontend,
@@ -199,7 +198,7 @@ pub fn build_computed_prepacker_state(
         objects,
         30,
         16379,
-        COMPUTED_FRAME_BYTES,
+        DEFAULT_FRAME_BYTES,
         0x20,
         16,
     )
@@ -254,7 +253,7 @@ fn reference_prep(prep: &GhaPackingPrep) -> crate::reference::native_layout::Gha
     }
 }
 
-/// Like [`build_computed_prepacker_state`] but with an explicit per-rate block
+/// Like [`build_reference_prepacker_state`] but with an explicit per-rate block
 /// `selector`, frame bit `budget`, and `frame_bytes` (docs/13 §1.1). The window
 /// geometry (`range_a`/`range_b`/`cfg`/`gainb`/`gha_*`) is rate-INDEPENDENT
 /// (heap-block shapes, docs/13 §2.2); only the cfg selector/budget words and the
@@ -262,28 +261,28 @@ fn reference_prep(prep: &GhaPackingPrep) -> crate::reference::native_layout::Gha
 /// the shipped 352 path.
 #[allow(clippy::too_many_arguments)]
 #[cfg(any(test, debug_assertions))]
-pub fn build_computed_prepacker_state_for_params(
+pub fn build_reference_prepacker_state_for_params(
     out: &CalcFrameOutput,
     per_frame: &CfgPerFrame352,
     frontend: &FrontendState,
     prep: &GhaPackingPrep,
-    objects: &[ComputedObjectInputs],
+    objects: &[ObjectInputs],
     selector: i32,
     budget: i32,
     frame_bytes: usize,
     band_index: u32,
     band_count: u32,
-) -> Result<FramePrepackerState, ComputedFrameError> {
+) -> Result<FramePrepackerState, FrameError> {
     let prep = reference_prep(prep);
     // Object count is profile-driven (docs/14 §0.4): the `nblk` written into the
-    // block group is `objects.len()` (2 for the nine stereo rows == COMPUTED_NBLK,
+    // block group is `objects.len()` (2 for the nine stereo rows == DEFAULT_CHANNEL_COUNT,
     // 1 for the five mono rows). The caller (`compute_output_frame`) builds exactly
     // `params.channels` objects, so this is where the driver's channel count is
     // realized. Fail-explicit on an empty group rather than pack a headerless
     // block. Only stereo (2) reaches here in any shipping/test path.
     let nblk = objects.len();
     if nblk == 0 {
-        return Err(ComputedFrameError::GhaChannelMissing { channel: 0 });
+        return Err(FrameError::GhaChannelMissing { channel: 0 });
     }
 
     // Shared cfg window (both objects carry the identical block). The per-FRAME
@@ -454,7 +453,7 @@ pub fn build_computed_prepacker_state_for_params(
 
     Ok(FramePrepackerState {
         frame_bytes,
-        block_count: COMPUTED_BLOCK_COUNT,
+        block_count: BLOCK_GROUP_COUNT,
         groups: vec![BlockGroup {
             nblk,
             objects: group_objects,
@@ -487,11 +486,11 @@ fn gain_mode_rows_from_records(
 }
 
 /// The coding-side inputs assembled up to the calc ENTRY for one output frame
-/// (returned by [`ComputedFrameDriver::assemble_calc_entry`]). The per-frame
+/// (returned by [`FrameDriver::assemble_calc_entry`]). The per-frame
 /// packed `quant_unit_count` (`frame.channels[0].config_b0` = the zeroth
 /// active-band trim capped by this frame's effective band extent) is already
 /// fixed here; the calc/pack stages consume the rest without changing it.
-struct ComputedCalcEntry {
+struct CalcEntry {
     frame: CalcFrameEntry,
     init_headers: Vec<InitGainHeaderWords>,
     tone_primary_effective: Vec<i32>,
@@ -504,7 +503,7 @@ struct ComputedCalcEntry {
 
 /// One computed output frame: the packed 2048 bytes plus the pieces used to
 /// build them (returned for test pins).
-pub struct ComputedFrame {
+pub struct EncodedFrame {
     /// The packed 2048-byte ATRAC3plus frame.
     pub bytes: Vec<u8>,
     /// The computed calc output.
@@ -518,7 +517,7 @@ pub struct ComputedFrame {
 /// roll carries per-call). For output-bearing calls (7..=83) it additionally
 /// builds the zeroth aux from the frontend, assembles the calc entry (with the
 /// init header), runs calc, builds the from-scratch state, and packs.
-pub struct ComputedFrameDriver {
+pub struct FrameDriver {
     frontend: FrontendState,
     roll: GainRollState,
     /// Persistent object `+0x1c6f8` rows read by section 12 before its
@@ -537,21 +536,21 @@ pub struct ComputedFrameDriver {
 /// no output frame).
 pub const FIRST_OUTPUT_CORE_CALL: u32 = 7;
 
-impl Default for ComputedFrameDriver {
+impl Default for FrameDriver {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ComputedFrameDriver {
+impl FrameDriver {
     /// A fresh 352 driver with calloc-zero rolling state (matching the native
     /// handle-init start).
     pub fn new() -> Self {
         Self::for_params(CodingParams {
             selector: 30,
             budget: 16379,
-            frame_bytes: COMPUTED_FRAME_BYTES as u32,
-            // Stereo anchor (`handle+0x94` == 2 == COMPUTED_NBLK).
+            frame_bytes: DEFAULT_FRAME_BYTES as u32,
+            // Stereo anchor (`handle+0x94` == 2 == DEFAULT_CHANNEL_COUNT).
             channels: 2,
             mode_a: 2,
             band_index: crate::encoder::coding_params::FULL_BAND_INDEX,
@@ -593,7 +592,7 @@ impl ComputedFrameDriver {
         // dispatch), threaded into the frontend `time2freq_at5` mode_cc argument
         // (docs/13 §5.2). Defaults to true, so 96-352 are unchanged.
         frontend.mode_cc = params.mode_cc;
-        ComputedFrameDriver {
+        FrameDriver {
             frontend,
             roll: GainRollState::new_zeroed(channel_count),
             prior_level_words: vec![vec![15; 8]; channel_count],
@@ -616,7 +615,7 @@ impl ComputedFrameDriver {
     pub fn step(
         &mut self,
         inputs: [&[f32]; FRONTEND_CHANNEL_COUNT],
-    ) -> Result<Option<ComputedFrame>, ComputedFrameError> {
+    ) -> Result<Option<EncodedFrame>, FrameError> {
         // Stereo wrapper: delegate to the channel-slice core (docs/14 §0.4). The
         // fixed-arity `[&[f32]; 2]` signature keeps every existing stereo call
         // site (`driver.step([&l, &r])`) compiling unchanged.
@@ -631,10 +630,7 @@ impl ComputedFrameDriver {
     /// this is byte-identical to the previous `step` body. All five mono
     /// shipping paths (docs/14 §1.3/§2.1/§3.1/§4.1/§5.1) step a 1-channel driver
     /// here.
-    pub fn step_channels(
-        &mut self,
-        inputs: &[&[f32]],
-    ) -> Result<Option<ComputedFrame>, ComputedFrameError> {
+    pub fn step_channels(&mut self, inputs: &[&[f32]]) -> Result<Option<EncodedFrame>, FrameError> {
         let core_call = self.next_core_call;
         let report = frontend_core_call_at5(&mut self.frontend, inputs, SYNTHETIC_ARENA_HEADER)?;
         // The init roll carries per-call; run it for EVERY call (priming too), so
@@ -674,7 +670,7 @@ impl ComputedFrameDriver {
     pub fn step_qu_count(
         &mut self,
         inputs: [&[f32]; FRONTEND_CHANNEL_COUNT],
-    ) -> Result<Option<u32>, ComputedFrameError> {
+    ) -> Result<Option<u32>, FrameError> {
         let core_call = self.next_core_call;
         let report = frontend_core_call_at5(&mut self.frontend, &inputs, SYNTHETIC_ARENA_HEADER)?;
         let init_aux = init_roll_step(&mut self.roll, &self.frontend, &report)?;
@@ -699,7 +695,7 @@ impl ComputedFrameDriver {
         &self,
         report: &FrontendCoreCallReport,
         init_aux: &[crate::encoder::coding_bridge::CodingBridgeChannelAux],
-    ) -> Result<ComputedCalcEntry, ComputedFrameError> {
+    ) -> Result<CalcEntry, FrameError> {
         // Zeroth aux entirely from the rolling frontend.
         let (primary, secondary) = zeroth_tone_activity_from_frontend(&self.frontend);
         let (tone_primary_words, tone_secondary_words, tone_flag_25) =
@@ -748,7 +744,7 @@ impl ComputedFrameDriver {
                 effective_band_limit,
                 Some(&self.frontend),
             )?;
-        Ok(ComputedCalcEntry {
+        Ok(CalcEntry {
             frame,
             init_headers,
             tone_primary_effective,
@@ -768,8 +764,8 @@ impl ComputedFrameDriver {
         &mut self,
         report: &FrontendCoreCallReport,
         init_aux: &[crate::encoder::coding_bridge::CodingBridgeChannelAux],
-    ) -> Result<ComputedFrame, ComputedFrameError> {
-        let ComputedCalcEntry {
+    ) -> Result<EncodedFrame, FrameError> {
+        let CalcEntry {
             mut frame,
             init_headers,
             tone_primary_effective,
@@ -780,7 +776,7 @@ impl ComputedFrameDriver {
             effective_band_count,
         } = self.assemble_calc_entry(report, init_aux)?;
         frame.prior_level_words.clone_from(&self.prior_level_words);
-        let out = calc_channel_block_frame_at5(&frame).map_err(ComputedFrameError::Calc)?;
+        let out = calc_channel_block_frame_at5(&frame).map_err(FrameError::Calc)?;
         self.prior_level_words = out
             .channels
             .iter()
@@ -813,9 +809,9 @@ impl ComputedFrameDriver {
         let channels_t2f = report
             .time2freq
             .as_ref()
-            .ok_or(ComputedFrameError::Coding(CodingBridgeError::NoTime2Freq))?;
+            .ok_or(FrameError::Coding(CodingBridgeError::NoTime2Freq))?;
         // Object count is profile-driven (`params.channels`, docs/14 §0.4): 2 for
-        // the nine stereo rows (== COMPUTED_NBLK, so byte-identical), 1 for the
+        // the nine stereo rows (== DEFAULT_CHANNEL_COUNT, so byte-identical), 1 for the
         // five mono rows. All five mono rows — 128 kbps (docs/14 §1.3), 96 kbps
         // (docs/14 §2.1), 64 kbps (docs/14 §3.1), 48 kbps (docs/14 §4.1), and
         // 32 kbps (docs/14 §5.1) — reach here with a single object.
@@ -823,14 +819,14 @@ impl ComputedFrameDriver {
         let mut objects = Vec::with_capacity(channel_count);
         for ch in 0..channel_count {
             let gain_a_records = assemble_gain_a_records(ch, &channels_t2f[ch])?;
-            objects.push(ComputedObjectInputs {
+            objects.push(ObjectInputs {
                 init_header: init_headers[ch],
                 gain_a_records,
                 band_activity: zeroth_channel_aux[ch].band_activity.clone(),
             });
         }
 
-        let syntax = build_computed_frame_syntax(
+        let syntax = build_frame_syntax(
             &out,
             &per_frame,
             &self.frontend,
@@ -843,12 +839,12 @@ impl ComputedFrameDriver {
 
         let mut bytes = vec![0u8; syntax.frame_bytes()];
         let mut writer = BitWriter::new(&mut bytes);
-        pack_frame_at5(&syntax, &mut writer).map_err(ComputedFrameError::Pack)?;
+        pack_frame_at5(&syntax, &mut writer).map_err(FrameError::Pack)?;
 
         #[cfg(debug_assertions)]
         {
             let typed_bit_pos = writer.bit_pos();
-            let state = build_computed_prepacker_state_for_params(
+            let state = build_reference_prepacker_state_for_params(
                 &out,
                 &per_frame,
                 &self.frontend,
@@ -865,13 +861,12 @@ impl ComputedFrameDriver {
             debug_assert_eq!(syntax.groups(), reference_syntax.groups());
             let mut reference_bytes = vec![0u8; state.frame_bytes];
             let mut reference_writer = BitWriter::new(&mut reference_bytes);
-            pack_frame_reference_at5(&state, &mut reference_writer)
-                .map_err(ComputedFrameError::Pack)?;
+            pack_frame_reference_at5(&state, &mut reference_writer).map_err(FrameError::Pack)?;
             debug_assert_eq!(typed_bit_pos, reference_writer.bit_pos());
             debug_assert_eq!(bytes, reference_bytes);
         }
 
-        Ok(ComputedFrame {
+        Ok(EncodedFrame {
             bytes,
             calc_out: out,
         })
@@ -896,7 +891,7 @@ impl ComputedFrameDriver {
 pub fn stereo_group_at5(
     words: &[i32],
     active_count: usize,
-) -> Result<(u32, u32, [u32; 16]), ComputedFrameError> {
+) -> Result<(u32, u32, [u32; 16]), FrameError> {
     let summary: ZerothActivitySummary =
         zeroth_activity_summary_at5(words, active_count).map_err(PackingPrepError::from)?;
     let mut k = [0u32; 16];
@@ -910,6 +905,6 @@ pub fn stereo_group_at5(
 /// caller cannot silently pass a different profile (the geometry constants above
 /// are 352-only; assert the profile still names the scoped stereo path).
 const _: () = {
-    assert!(ATRAC3PLUS_352.channels() as usize == COMPUTED_NBLK);
+    assert!(ATRAC3PLUS_352.channels() as usize == DEFAULT_CHANNEL_COUNT);
     assert!(!GHA_HAS_PREVIOUS[0] && GHA_HAS_PREVIOUS[1]);
 };

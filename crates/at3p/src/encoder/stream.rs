@@ -1,11 +1,11 @@
 use std::io::Write;
 
 use super::coding_params::CodingParams;
-use super::flush::{EncodeSchedule, IncrementalComputedFlushScheduler};
+use super::flush::{EncodeSchedule, IncrementalFlushScheduler};
 use super::frontend::FRONTEND_FRAME_SAMPLES;
 use super::payload::{
-    ComputedFileError, ComputedPayloadError, EncodeError, EncodePhase, EncodeProgress, WriteStage,
-    write_computed_output_frame,
+    EncodeError, EncodePhase, EncodeProgress, FileError, PayloadError, WriteStage,
+    write_output_frame,
 };
 use super::profile::Atrac3plusProfile;
 use crate::riff::write::{
@@ -29,7 +29,7 @@ pub struct Atrac3plusStreamSummary {
 pub struct Atrac3plusStreamEncoder<W: Write> {
     writer: W,
     schedule: EncodeSchedule,
-    scheduler: IncrementalComputedFlushScheduler,
+    scheduler: IncrementalFlushScheduler,
     channel_count: usize,
     frame_bytes: usize,
     total_steps: u32,
@@ -48,7 +48,7 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
         input_sample_frames: u32,
     ) -> Result<Self, EncodeError> {
         let schedule = EncodeSchedule::new(input_sample_frames)
-            .map_err(ComputedFileError::from)
+            .map_err(FileError::from)
             .map_err(EncodeError::from)?;
         let header = match profile.channels() {
             2 if profile.bitrate_kbps() == 352 => {
@@ -69,7 +69,7 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
             ),
             _ => unreachable!("validated ATRAC3plus channel count"),
         }
-        .map_err(ComputedFileError::from)?;
+        .map_err(FileError::from)?;
         writer
             .write_all(&header)
             .map_err(|source| EncodeError::Io {
@@ -78,9 +78,9 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
             })?;
 
         let params = CodingParams::for_profile(profile);
-        let scheduler = IncrementalComputedFlushScheduler::new(input_sample_frames, params)
-            .map_err(ComputedPayloadError::from)
-            .map_err(ComputedFileError::from)?;
+        let scheduler = IncrementalFlushScheduler::new(input_sample_frames, params)
+            .map_err(PayloadError::from)
+            .map_err(FileError::from)?;
         let total_steps = schedule.encode_calls() + schedule.flush_wrapper_calls();
         Ok(Self {
             writer,
@@ -119,10 +119,10 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
     {
         let core_call_index = self.scheduler.encode_calls();
         let Some(expected) = self.expected_next_chunk_frames() else {
-            return Err(ComputedFileError::StreamInputAlreadyComplete.into());
+            return Err(FileError::StreamInputAlreadyComplete.into());
         };
         if channels.len() != self.channel_count {
-            return Err(ComputedFileError::UnexpectedInputChannelCount {
+            return Err(FileError::UnexpectedInputChannelCount {
                 expected: self.channel_count,
                 actual: channels.len(),
             }
@@ -130,7 +130,7 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
         }
         let actual = channels.first().map_or(0, |channel| channel.len());
         if actual != expected {
-            return Err(ComputedFileError::UnexpectedInputChunkFrames {
+            return Err(FileError::UnexpectedInputChunkFrames {
                 core_call_index,
                 expected,
                 actual,
@@ -139,7 +139,7 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
         }
         for (channel_index, channel) in channels.iter().enumerate().skip(1) {
             if channel.len() != expected {
-                return Err(ComputedFileError::MismatchedInputChunkFrames {
+                return Err(FileError::MismatchedInputChunkFrames {
                     core_call_index,
                     channel: channel_index,
                     expected,
@@ -160,9 +160,9 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
         let result = self
             .scheduler
             .encode_chunk(expected as u32, &self.pcm_frame)
-            .map_err(ComputedPayloadError::from)
-            .map_err(ComputedFileError::from)?;
-        write_computed_output_frame(
+            .map_err(PayloadError::from)
+            .map_err(FileError::from)?;
+        write_output_frame(
             &mut self.writer,
             &mut self.next_output_frame_index,
             &mut self.written_payload_bytes,
@@ -192,7 +192,7 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
         F: FnMut(EncodeProgress),
     {
         if self.consumed_sample_frames != self.input_sample_frames {
-            return Err(ComputedFileError::IncompleteStreamInput {
+            return Err(FileError::IncompleteStreamInput {
                 expected_sample_frames: self.input_sample_frames,
                 actual_sample_frames: self.consumed_sample_frames,
             }
@@ -202,9 +202,9 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
             let result = self
                 .scheduler
                 .flush()
-                .map_err(ComputedPayloadError::from)
-                .map_err(ComputedFileError::from)?;
-            write_computed_output_frame(
+                .map_err(PayloadError::from)
+                .map_err(FileError::from)?;
+            write_output_frame(
                 &mut self.writer,
                 &mut self.next_output_frame_index,
                 &mut self.written_payload_bytes,
@@ -222,36 +222,30 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
 
         let expected_output_frames = self.schedule.total_output_frames() as usize;
         if self.next_output_frame_index as usize != expected_output_frames {
-            return Err(
-                ComputedFileError::Payload(ComputedPayloadError::IncompleteOutputFrames {
-                    expected: expected_output_frames,
-                    actual: self.next_output_frame_index as usize,
-                })
-                .into(),
-            );
+            return Err(FileError::Payload(PayloadError::IncompleteOutputFrames {
+                expected: expected_output_frames,
+                actual: self.next_output_frame_index as usize,
+            })
+            .into());
         }
         if !self.scheduler.is_done() {
-            return Err(
-                ComputedFileError::Payload(ComputedPayloadError::SchedulerNotDone {
-                    flush_calls: self.scheduler.flush_calls(),
-                })
-                .into(),
-            );
+            return Err(FileError::Payload(PayloadError::SchedulerNotDone {
+                flush_calls: self.scheduler.flush_calls(),
+            })
+            .into());
         }
         let expected_payload_bytes = expected_output_frames * self.frame_bytes;
         if self.written_payload_bytes != expected_payload_bytes {
-            return Err(
-                ComputedFileError::Payload(ComputedPayloadError::FinalPayloadLength {
-                    expected: expected_payload_bytes,
-                    actual: self.written_payload_bytes,
-                })
-                .into(),
-            );
+            return Err(FileError::Payload(PayloadError::FinalPayloadLength {
+                expected: expected_payload_bytes,
+                actual: self.written_payload_bytes,
+            })
+            .into());
         }
         let expected_file_bytes = ATRACX_HEADER_LEN as usize + expected_payload_bytes;
         let actual_file_bytes = self.header_len + self.written_payload_bytes;
         if actual_file_bytes != expected_file_bytes {
-            return Err(ComputedFileError::FinalFileLength {
+            return Err(FileError::FinalFileLength {
                 expected: expected_file_bytes,
                 actual: actual_file_bytes,
             }
@@ -274,7 +268,7 @@ mod tests {
 
     use super::*;
     use crate::encoder::payload::{
-        assemble_computed_atracx_file_for_mono_profile, assemble_computed_atracx_file_for_profile,
+        assemble_atracx_file_for_mono_profile, assemble_atracx_file_for_profile,
     };
     use crate::encoder::profile::{ATRAC3PLUS_352, profile_by_bitrate_and_channels};
 
@@ -336,8 +330,7 @@ mod tests {
     fn streaming_matches_buffered_stereo_with_partial_final_block() {
         let pcm = generated_pcm(2, 6145);
         let expected =
-            assemble_computed_atracx_file_for_profile(&ATRAC3PLUS_352, 6145, &pcm[0], &pcm[1])
-                .unwrap();
+            assemble_atracx_file_for_profile(&ATRAC3PLUS_352, 6145, &pcm[0], &pcm[1]).unwrap();
         assert_eq!(stream(&ATRAC3PLUS_352, &pcm), expected);
     }
 
@@ -345,8 +338,7 @@ mod tests {
     fn streaming_matches_buffered_mono_with_exact_final_block() {
         let profile = profile_by_bitrate_and_channels(128, 1).unwrap();
         let pcm = generated_pcm(1, 6144);
-        let expected =
-            assemble_computed_atracx_file_for_mono_profile(&profile, 6144, &pcm).unwrap();
+        let expected = assemble_atracx_file_for_mono_profile(&profile, 6144, &pcm).unwrap();
         assert_eq!(stream(&profile, &pcm), expected);
     }
 
@@ -382,12 +374,10 @@ mod tests {
         encoder.push_pcm(&[&pcm[0], &pcm[1]]).unwrap();
         assert!(matches!(
             encoder.finish(),
-            Err(EncodeError::File(
-                ComputedFileError::IncompleteStreamInput {
-                    expected_sample_frames: 6144,
-                    actual_sample_frames: 2048,
-                }
-            ))
+            Err(EncodeError::File(FileError::IncompleteStreamInput {
+                expected_sample_frames: 6144,
+                actual_sample_frames: 2048,
+            }))
         ));
     }
 

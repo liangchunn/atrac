@@ -68,25 +68,23 @@ pub fn encode_to_vec(
     channels: &[Vec<i16>],
 ) -> Result<Vec<u8>, EncodeError> {
     if channels.len() != profile.channels() as usize {
-        return Err(
-            encoder::payload::ComputedFileError::UnexpectedInputChannelCount {
-                expected: profile.channels() as usize,
-                actual: channels.len(),
-            }
-            .into(),
-        );
+        return Err(encoder::payload::FileError::UnexpectedInputChannelCount {
+            expected: profile.channels() as usize,
+            actual: channels.len(),
+        }
+        .into());
     }
     if channels
         .iter()
         .any(|channel| channel.len() != input_sample_frames as usize)
     {
         let error = match profile.channel_mode() {
-            ChannelMode::Mono => encoder::payload::ComputedFileError::UnsupportedMonoInputShape {
+            ChannelMode::Mono => encoder::payload::FileError::UnsupportedMonoInputShape {
                 expected_sample_frames: input_sample_frames,
                 channel_count: channels.len(),
                 channel_len: channels.first().map_or(0, Vec::len),
             },
-            ChannelMode::Stereo => encoder::payload::ComputedFileError::UnsupportedInputShape {
+            ChannelMode::Stereo => encoder::payload::FileError::UnsupportedInputShape {
                 expected_sample_frames: input_sample_frames,
                 actual_sample_frames: input_sample_frames,
                 left_len: channels.first().map_or(0, Vec::len),

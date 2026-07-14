@@ -982,7 +982,7 @@ pub fn serialize_idwl_object_range_b(
 ///
 /// This runs ONCE per block on the shared cfg (both channels' cfg clones must
 /// see it), so the caller invokes it before cloning the shared window
-/// (`src/encoder/computed_frame.rs`).
+/// (`src/encoder/frame.rs`).
 pub fn serialize_idwl_mode2_cfg_words(
     cfg: &mut ObjectWindow,
     block: &IdwlBlockState,

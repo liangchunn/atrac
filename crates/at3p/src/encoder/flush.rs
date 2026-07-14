@@ -1,4 +1,4 @@
-//! Native frame-count, encode, and flush scheduling for the computed encoder.
+//! Frame-count, encode, and flush scheduling for the ATRAC3plus encoder.
 //!
 //! Evidence:
 //! - `atrac_encode` wrapper native `0x000096d0` / decompile comment `0x196d0`
@@ -37,8 +37,8 @@ pub struct InputTooShort {
     pub minimum: u32,
 }
 
-/// The generalized COMPUTED 352 kbps encode/flush/output schedule for ANY input
-/// of `input_sample_frames >= MIN_INPUT_SAMPLE_FRAMES` PCM sample frames per
+/// The encode/flush/output schedule for any supported profile and input of
+/// `input_sample_frames >= MIN_INPUT_SAMPLE_FRAMES` PCM sample frames per
 ///
 /// `len_edges_batch_v1`; sibling `syn_len_*_api_trace.ndjson` per-call traces):
 ///
@@ -180,7 +180,7 @@ pub enum FlushScheduleError {
 // ===========================================================================
 // docs/11 Phase 2 §2.2 (c) / docs/12 §0.1 — computed-frame flush scheduler.
 //
-// Computes each output frame from PCM via [`ComputedFrameDriver`]. It reproduces
+// Computes each output frame from PCM via [`FrameDriver`]. It reproduces
 // the native schedule contract for ANY input of
 // `N >= MIN_INPUT_SAMPLE_FRAMES` sample frames per channel, driven by a
 // [`EncodeSchedule`] (see its doc comment for the native sources): encode
@@ -196,14 +196,12 @@ pub enum FlushScheduleError {
 // ===========================================================================
 
 use crate::encoder::coding_params::CodingParams;
-use crate::encoder::computed_frame::{
-    COMPUTED_FRAME_BYTES, ComputedFrameDriver, ComputedFrameError,
-};
+use crate::encoder::frame::{DEFAULT_FRAME_BYTES, FrameDriver, FrameError};
 use crate::encoder::frontend::FRONTEND_FRAME_SAMPLES;
 
 /// Errors from the computed flush scheduler.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ComputedFlushError {
+pub enum FlushError {
     /// The input is shorter than the native minimum (`N < MIN_INPUT_SAMPLE_FRAMES`;
     /// native `at3tool` rejects it before any library call — fail explicit).
     InputTooShort(InputTooShort),
@@ -229,25 +227,25 @@ pub enum ComputedFlushError {
     /// The computed single-frame assembly failed at this core call.
     Compute {
         core_call_index: u32,
-        error: ComputedFrameError,
+        error: FrameError,
     },
 }
 
-impl From<FlushScheduleError> for ComputedFlushError {
+impl From<FlushScheduleError> for FlushError {
     fn from(error: FlushScheduleError) -> Self {
-        ComputedFlushError::Schedule(error)
+        FlushError::Schedule(error)
     }
 }
 
-impl From<InputTooShort> for ComputedFlushError {
+impl From<InputTooShort> for FlushError {
     fn from(error: InputTooShort) -> Self {
-        ComputedFlushError::InputTooShort(error)
+        FlushError::InputTooShort(error)
     }
 }
 
 /// A computed output-frame result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ComputedFrameResult {
+pub struct FrameResult {
     pub source: FrameSource,
     pub core_call_index: Option<u32>,
     pub output_frame_index: Option<u32>,
@@ -259,10 +257,10 @@ pub struct ComputedFrameResult {
     pub flush_remaining: u32,
 }
 
-/// Computed-frame flush scheduler. Owns the [`ComputedFrameDriver`], the derived
+/// Computed-frame flush scheduler. Owns the [`FrameDriver`], the derived
 /// [`EncodeSchedule`], and the per-call PCM supply; computes each output
 /// frame at its scheduled call.
-pub struct ComputedFlushScheduler {
+pub struct BufferedFlushScheduler {
     schedule: EncodeSchedule,
     /// Per-core-call PCM frames indexed `[core_call][channel][sample]`
     /// (`encode_calls + flush_processing_calls` entries: encode + PCM-processing
@@ -270,7 +268,7 @@ pub struct ComputedFlushScheduler {
     /// PCM). Channel-vec (docs/14 §0.4): the pair-shaped `new`/`new_for_params`
     /// constructors convert to this internally so stereo callers are unchanged.
     frames: Vec<Vec<Vec<f32>>>,
-    driver: ComputedFrameDriver,
+    driver: FrameDriver,
     encode_calls: u32,
     flush_calls: u32,
     flush_remaining: u32,
@@ -280,7 +278,7 @@ pub struct ComputedFlushScheduler {
     flush_done: bool,
 }
 
-impl ComputedFlushScheduler {
+impl BufferedFlushScheduler {
     /// Total core-call PCM frames the driver expects for a schedule:
     /// `encode_calls + flush_processing_calls` (the trailing flush wrapper call
     /// is the "done" call and processes no PCM).
@@ -295,10 +293,7 @@ impl ComputedFlushScheduler {
     /// [`expected_frame_supply`](Self::expected_frame_supply) frames for the
     /// derived schedule, each a `[left, right]` pair of [`FRONTEND_FRAME_SAMPLES`]
     /// f32 samples.
-    pub fn new(
-        input_sample_frames: u32,
-        frames: Vec<[Vec<f32>; 2]>,
-    ) -> Result<Self, ComputedFlushError> {
+    pub fn new(input_sample_frames: u32, frames: Vec<[Vec<f32>; 2]>) -> Result<Self, FlushError> {
         // 352 params (selector 30, budget 16379, 2048 frame bytes, mode_a 2).
         Self::new_for_params(
             input_sample_frames,
@@ -306,7 +301,7 @@ impl ComputedFlushScheduler {
             CodingParams {
                 selector: 30,
                 budget: 16379,
-                frame_bytes: COMPUTED_FRAME_BYTES as u32,
+                frame_bytes: DEFAULT_FRAME_BYTES as u32,
                 // Stereo anchor (`handle+0x94` == 2).
                 channels: 2,
                 mode_a: 2,
@@ -320,7 +315,7 @@ impl ComputedFlushScheduler {
     }
 
     /// Like [`new`](Self::new) but for an explicit per-rate [`CodingParams`]
-    /// (docs/13 §1.1): the owned [`ComputedFrameDriver`] is seeded with `params`
+    /// (docs/13 §1.1): the owned [`FrameDriver`] is seeded with `params`
     /// so every computed frame is per-rate (selector/budget/frame_bytes). The
     /// encode/flush/output SCHEDULE is rate-independent (docs/13 §2.3), so the
     /// same [`EncodeSchedule`] governs. At the 352 params this equals
@@ -329,7 +324,7 @@ impl ComputedFlushScheduler {
         input_sample_frames: u32,
         frames: Vec<[Vec<f32>; 2]>,
         params: CodingParams,
-    ) -> Result<Self, ComputedFlushError> {
+    ) -> Result<Self, FlushError> {
         // Stereo pair → channel-vec converter (docs/14 §0.4): every existing
         // caller/test keeps the `[left, right]` pair supply and this reshapes it
         // to the channel-vec representation without touching the samples.
@@ -352,11 +347,11 @@ impl ComputedFlushScheduler {
         input_sample_frames: u32,
         frames: Vec<Vec<Vec<f32>>>,
         params: CodingParams,
-    ) -> Result<Self, ComputedFlushError> {
+    ) -> Result<Self, FlushError> {
         let schedule = EncodeSchedule::new(input_sample_frames)?;
         let expected = Self::expected_frame_supply(&schedule);
         if frames.len() != expected {
-            return Err(ComputedFlushError::FrameSupplyLen {
+            return Err(FlushError::FrameSupplyLen {
                 expected,
                 actual: frames.len(),
             });
@@ -364,7 +359,7 @@ impl ComputedFlushScheduler {
         let channel_count = params.channels as usize;
         for (call, frame) in frames.iter().enumerate() {
             if frame.len() != channel_count {
-                return Err(ComputedFlushError::FrameChannelCount {
+                return Err(FlushError::FrameChannelCount {
                     core_call_index: call as u32,
                     expected: channel_count,
                     actual: frame.len(),
@@ -372,7 +367,7 @@ impl ComputedFlushScheduler {
             }
             for channel in frame {
                 if channel.len() != FRONTEND_FRAME_SAMPLES {
-                    return Err(ComputedFlushError::FrameSampleLen {
+                    return Err(FlushError::FrameSampleLen {
                         core_call_index: call as u32,
                         expected: FRONTEND_FRAME_SAMPLES,
                         actual: channel.len(),
@@ -383,7 +378,7 @@ impl ComputedFlushScheduler {
         Ok(Self {
             schedule,
             frames,
-            driver: ComputedFrameDriver::for_params(params),
+            driver: FrameDriver::for_params(params),
             encode_calls: 0,
             flush_calls: 0,
             // Before input is exhausted, the eventual flush drain length is the
@@ -405,10 +400,7 @@ impl ComputedFlushScheduler {
     /// One encode wrapper call for a chunk of `sample_frames` samples. The
     /// sample-count contract is derived from the schedule; the frame bytes are
     /// computed from the stored PCM for this core call.
-    pub fn encode_chunk(
-        &mut self,
-        sample_frames: u32,
-    ) -> Result<ComputedFrameResult, ComputedFlushError> {
+    pub fn encode_chunk(&mut self, sample_frames: u32) -> Result<FrameResult, FlushError> {
         if self.flush_started {
             return Err(FlushScheduleError::EncodeAfterFlushStarted.into());
         }
@@ -454,7 +446,7 @@ impl ComputedFlushScheduler {
 
     /// One flush wrapper call. The frame bytes are computed from the stored
     /// zero-PCM flush frame for this core call.
-    pub fn flush(&mut self) -> Result<ComputedFrameResult, ComputedFlushError> {
+    pub fn flush(&mut self) -> Result<FrameResult, FlushError> {
         if !self.input_exhausted {
             return Err(FlushScheduleError::FlushBeforeInputExhausted {
                 encode_calls: self.encode_calls,
@@ -502,16 +494,16 @@ impl ComputedFlushScheduler {
 
     /// Drive the computed pipeline one core call and return the computed frame
     /// bytes for an output-bearing call (`None` for a priming call).
-    fn drive(&mut self, core_call_index: u32) -> Result<Option<Vec<u8>>, ComputedFlushError> {
+    fn drive(&mut self, core_call_index: u32) -> Result<Option<Vec<u8>>, FlushError> {
         let frame = &self.frames[core_call_index as usize];
         let inputs: Vec<&[f32]> = frame.iter().map(Vec::as_slice).collect();
-        let computed =
-            self.driver
-                .step_channels(&inputs)
-                .map_err(|error| ComputedFlushError::Compute {
-                    core_call_index,
-                    error,
-                })?;
+        let computed = self
+            .driver
+            .step_channels(&inputs)
+            .map_err(|error| FlushError::Compute {
+                core_call_index,
+                error,
+            })?;
         Ok(computed.map(|c| c.bytes))
     }
 
@@ -538,9 +530,9 @@ impl ComputedFlushScheduler {
         output_frame_index: Option<u32>,
         frame_bytes: Option<Vec<u8>>,
         done: bool,
-    ) -> ComputedFrameResult {
+    ) -> FrameResult {
         let produced_bytes = frame_bytes.as_ref().map_or(0, Vec::len);
-        ComputedFrameResult {
+        FrameResult {
             source,
             core_call_index,
             output_frame_index,
@@ -554,15 +546,15 @@ impl ComputedFlushScheduler {
 
 /// Frame-oriented computed scheduler (docs/16 S2).
 ///
-/// Unlike [`ComputedFlushScheduler`], this scheduler owns no PCM collection
+/// Unlike [`BufferedFlushScheduler`], this scheduler owns no PCM collection
 /// indexed by core call. The caller supplies exactly one converted channel frame
 /// to [`encode_chunk`](Self::encode_chunk), and the scheduler drives it
-/// immediately through its persistent [`ComputedFrameDriver`]. A single
+/// immediately through its persistent [`FrameDriver`]. A single
 /// channel-count-sized zero frame is retained for native processing-flush calls;
 /// the trailing done call performs no core processing.
-pub struct IncrementalComputedFlushScheduler {
+pub struct IncrementalFlushScheduler {
     schedule: EncodeSchedule,
-    driver: ComputedFrameDriver,
+    driver: FrameDriver,
     channel_count: usize,
     zero_frame: Vec<Vec<f32>>,
     encode_calls: u32,
@@ -574,15 +566,15 @@ pub struct IncrementalComputedFlushScheduler {
     flush_done: bool,
 }
 
-impl IncrementalComputedFlushScheduler {
+impl IncrementalFlushScheduler {
     /// Construct only the native-derived schedule, persistent codec driver, and
     /// fixed-width flush storage. No caller PCM is retained here.
-    pub fn new(input_sample_frames: u32, params: CodingParams) -> Result<Self, ComputedFlushError> {
+    pub fn new(input_sample_frames: u32, params: CodingParams) -> Result<Self, FlushError> {
         let schedule = EncodeSchedule::new(input_sample_frames)?;
         let channel_count = params.channels as usize;
         Ok(Self {
             schedule,
-            driver: ComputedFrameDriver::for_params(params),
+            driver: FrameDriver::for_params(params),
             channel_count,
             zero_frame: vec![vec![0.0; FRONTEND_FRAME_SAMPLES]; channel_count],
             encode_calls: 0,
@@ -607,7 +599,7 @@ impl IncrementalComputedFlushScheduler {
         &mut self,
         sample_frames: u32,
         frame: &[Vec<f32>],
-    ) -> Result<ComputedFrameResult, ComputedFlushError> {
+    ) -> Result<FrameResult, FlushError> {
         if self.flush_started {
             return Err(FlushScheduleError::EncodeAfterFlushStarted.into());
         }
@@ -648,7 +640,7 @@ impl IncrementalComputedFlushScheduler {
 
     /// Advance one flush wrapper call. Processing calls consume the scheduler's
     /// one fixed all-zero frame; the final done call consumes no PCM.
-    pub fn flush(&mut self) -> Result<ComputedFrameResult, ComputedFlushError> {
+    pub fn flush(&mut self) -> Result<FrameResult, FlushError> {
         if !self.input_exhausted {
             return Err(FlushScheduleError::FlushBeforeInputExhausted {
                 encode_calls: self.encode_calls,
@@ -700,13 +692,9 @@ impl IncrementalComputedFlushScheduler {
         self.flush_done
     }
 
-    fn validate_frame(
-        &self,
-        core_call_index: u32,
-        frame: &[Vec<f32>],
-    ) -> Result<(), ComputedFlushError> {
+    fn validate_frame(&self, core_call_index: u32, frame: &[Vec<f32>]) -> Result<(), FlushError> {
         if frame.len() != self.channel_count {
-            return Err(ComputedFlushError::FrameChannelCount {
+            return Err(FlushError::FrameChannelCount {
                 core_call_index,
                 expected: self.channel_count,
                 actual: frame.len(),
@@ -714,7 +702,7 @@ impl IncrementalComputedFlushScheduler {
         }
         for channel in frame {
             if channel.len() != FRONTEND_FRAME_SAMPLES {
-                return Err(ComputedFlushError::FrameSampleLen {
+                return Err(FlushError::FrameSampleLen {
                     core_call_index,
                     expected: FRONTEND_FRAME_SAMPLES,
                     actual: channel.len(),
@@ -725,18 +713,17 @@ impl IncrementalComputedFlushScheduler {
     }
 
     fn drive(
-        driver: &mut ComputedFrameDriver,
+        driver: &mut FrameDriver,
         core_call_index: u32,
         frame: &[Vec<f32>],
-    ) -> Result<Option<Vec<u8>>, ComputedFlushError> {
+    ) -> Result<Option<Vec<u8>>, FlushError> {
         let inputs: Vec<&[f32]> = frame.iter().map(Vec::as_slice).collect();
-        let computed =
-            driver
-                .step_channels(&inputs)
-                .map_err(|error| ComputedFlushError::Compute {
-                    core_call_index,
-                    error,
-                })?;
+        let computed = driver
+            .step_channels(&inputs)
+            .map_err(|error| FlushError::Compute {
+                core_call_index,
+                error,
+            })?;
         Ok(computed.map(|computed| computed.bytes))
     }
 
@@ -747,9 +734,9 @@ impl IncrementalComputedFlushScheduler {
         output_frame_index: Option<u32>,
         frame_bytes: Option<Vec<u8>>,
         done: bool,
-    ) -> ComputedFrameResult {
+    ) -> FrameResult {
         let produced_bytes = frame_bytes.as_ref().map_or(0, Vec::len);
-        ComputedFrameResult {
+        FrameResult {
             source,
             core_call_index,
             output_frame_index,

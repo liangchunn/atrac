@@ -1,8 +1,8 @@
 pub mod cfg_bridge;
 pub mod coding_bridge;
 pub mod coding_params;
-pub mod computed_frame;
 pub mod flush;
+pub mod frame;
 pub mod frontend;
 pub(crate) mod packing_prep;
 pub mod payload;
