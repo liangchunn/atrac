@@ -34,6 +34,7 @@
 
 use crate::bitstream::frame::{
     BlockGroup, FramePrepackerState, ObjectState, ObjectWindow, pack_frame_at5,
+    pack_frame_reference_at5,
 };
 use crate::bitstream::writer::BitWriter;
 use crate::coding::allocation::{
@@ -781,7 +782,18 @@ impl ComputedFrameDriver {
 
         let mut bytes = vec![0u8; state.frame_bytes];
         let mut writer = BitWriter::new(&mut bytes);
-        pack_frame_at5(&state, &mut writer).map_err(ComputedFrameError::Pack)?;
+        pack_frame_at5(&state, &syntax, &mut writer).map_err(ComputedFrameError::Pack)?;
+        let typed_bit_pos = writer.bit_pos();
+
+        #[cfg(debug_assertions)]
+        {
+            let mut reference_bytes = vec![0u8; state.frame_bytes];
+            let mut reference_writer = BitWriter::new(&mut reference_bytes);
+            pack_frame_reference_at5(&state, &mut reference_writer)
+                .map_err(ComputedFrameError::Pack)?;
+            debug_assert_eq!(typed_bit_pos, reference_writer.bit_pos());
+            debug_assert_eq!(bytes, reference_bytes);
+        }
 
         Ok(ComputedFrame {
             bytes,

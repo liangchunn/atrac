@@ -101,6 +101,7 @@ use super::pack_spectral::{
     PackSpectralError, pack_spectral_descriptor_unit, pack_spectral_idspcqu_tail,
 };
 use super::writer::{BitWriter, BitWriterError};
+use crate::pipeline::syntax::{FrameSyntax, IdctCountSyntax, IdctEncodingSyntax, IdctSyntax};
 use crate::tables::at5::{isps_at5, nsps_at5};
 use crate::tables::generated::{G_A_IDSPCBANDS_AT5, G_A_IDSPCQUS_AT5};
 use crate::tables::spectral::SPECTRAL_DESCRIPTOR_SLOTS;
@@ -339,13 +340,24 @@ fn dispatch_index(mode_low_bits: u32, channel_parity: u32) -> usize {
 ///
 pub fn pack_frame_at5(
     state: &FramePrepackerState,
+    syntax: &FrameSyntax,
     writer: &mut BitWriter<'_>,
 ) -> Result<(), FrameAssemblyError> {
-    pack_frame_at5_impl(state, writer)
+    pack_frame_at5_impl(state, Some(syntax), writer)
+}
+
+/// Temporary offset-driven parity oracle retained while payload families move
+/// to owned frame syntax. Production packing must use [`pack_frame_at5`].
+pub(crate) fn pack_frame_reference_at5(
+    state: &FramePrepackerState,
+    writer: &mut BitWriter<'_>,
+) -> Result<(), FrameAssemblyError> {
+    pack_frame_at5_impl(state, None, writer)
 }
 
 fn pack_frame_at5_impl(
     state: &FramePrepackerState,
+    syntax: Option<&FrameSyntax>,
     writer: &mut BitWriter<'_>,
 ) -> Result<(), FrameAssemblyError> {
     // Frame prologue: one reserved bit, value 0.
@@ -354,7 +366,13 @@ fn pack_frame_at5_impl(
         Ok::<(), FrameAssemblyError>(())
     }?;
 
-    for group in &state.groups {
+    for (group_index, group) in state.groups.iter().enumerate() {
+        let syntax_group = syntax.and_then(|syntax| syntax.groups().get(group_index));
+        if syntax.is_some() && syntax_group.is_none() {
+            return Err(FrameAssemblyError::UnpinnedOrdering {
+                section: "typed_group_count",
+            });
+        }
         let cfg_source = &group
             .objects
             .first()
@@ -399,21 +417,39 @@ fn pack_frame_at5_impl(
         }
 
         // IDCT section (native 46295..46377).
-        if quant_unit_count > 0 {
-            let bandwidth_gate = cfg_source.cfg_u32(0x90)?;
+        let idct_quant_unit_count = syntax_group
+            .map(|group| group.header().quant_unit_count)
+            .unwrap_or(quant_unit_count);
+        if idct_quant_unit_count > 0 {
+            let bandwidth_gate = match syntax_group {
+                Some(group) => u32::from(group.header().bandwidth_gate),
+                None => cfg_source.cfg_u32(0x90)?,
+            };
             {
                 writer.write_bits(bandwidth_gate, 1)?;
                 Ok::<(), FrameAssemblyError>(())
             }?;
             for (i, obj) in group.objects.iter().enumerate().take(nblk) {
-                let bandwidth = obj.u32(0x1074)?;
-                let mode = obj.u32(0x1078)?;
+                let typed = syntax_group.and_then(|group| group.channels().get(i));
+                if syntax_group.is_some() && typed.is_none() {
+                    return Err(FrameAssemblyError::UnpinnedOrdering {
+                        section: "typed_channel_count",
+                    });
+                }
+                let (bandwidth, mode) = match typed {
+                    Some(channel) => (u32::from(channel.idct().bandwidth), channel.idct().mode),
+                    None => (obj.u32(0x1074)?, obj.u32(0x1078)?),
+                };
                 {
                     writer.write_bits(bandwidth, 1)?;
                     writer.write_bits(mode, 2)?;
                     Ok::<(), FrameAssemblyError>(())
                 }?;
-                pack_idct(writer, group, i, obj, quant_unit_count)?;
+                if let Some(channel) = typed {
+                    pack_idct_syntax(writer, channel.idct())?;
+                } else {
+                    pack_idct(writer, group, i, obj, quant_unit_count)?;
+                }
             }
         }
 
@@ -809,6 +845,37 @@ fn pack_idct(
         }
     }
     let _ = index;
+    Ok(())
+}
+
+fn pack_idct_syntax(
+    writer: &mut BitWriter<'_>,
+    syntax: &IdctSyntax,
+) -> Result<(), FrameAssemblyError> {
+    let count = match syntax.count {
+        IdctCountSyntax::FullBand(count) => Idct0Count::FullBandCount(count),
+        IdctCountSyntax::Explicit(count) => Idct0Count::ExplicitCount(count),
+    };
+    let rows = syntax
+        .rows
+        .iter()
+        .map(|row| Idct0Row {
+            mode: row.mode,
+            value: row.value,
+        })
+        .collect::<Vec<_>>();
+
+    match &syntax.encoding {
+        IdctEncodingSyntax::Fixed => pack_idct_0_at5(writer, count, syntax.bandwidth_mode, &rows)?,
+        IdctEncodingSyntax::Huffman => {
+            pack_idct_1_at5(writer, count, syntax.bandwidth_mode, &rows)?
+        }
+        IdctEncodingSyntax::Delta => pack_idct_2_at5(writer, count, syntax.bandwidth_mode, &rows)?,
+        IdctEncodingSyntax::Empty => {}
+        IdctEncodingSyntax::Previous { values } => {
+            pack_idct_4_at5(writer, count, syntax.bandwidth_mode, &rows, values)?
+        }
+    }
     Ok(())
 }
 

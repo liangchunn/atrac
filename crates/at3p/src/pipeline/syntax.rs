@@ -34,18 +34,55 @@ pub(crate) struct BlockHeaderSyntax {
     pub post_payload_gate: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChannelSyntax {
     pub channel_index: u32,
     pub previous_channel: Option<usize>,
     pub idwl_mode: u32,
     pub idsf_mode: u32,
-    pub idct_mode: u32,
-    pub bandwidth: bool,
-    pub idct_explicit_count: Option<usize>,
+    pub idct: IdctSyntax,
     pub gain_present: bool,
     pub gha_present: bool,
     pub gha_idam_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdctSyntax {
+    pub bandwidth: bool,
+    pub mode: u32,
+    pub bandwidth_mode: usize,
+    pub count: IdctCountSyntax,
+    pub rows: Vec<IdctRowSyntax>,
+    pub encoding: IdctEncodingSyntax,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdctCountSyntax {
+    FullBand(usize),
+    Explicit(usize),
+}
+
+impl IdctCountSyntax {
+    pub(crate) fn active(self) -> usize {
+        match self {
+            Self::FullBand(count) | Self::Explicit(count) => count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdctRowSyntax {
+    pub mode: u32,
+    pub value: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdctEncodingSyntax {
+    Fixed,
+    Huffman,
+    Delta,
+    Empty,
+    Previous { values: Vec<u32> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +122,39 @@ pub enum FrameSyntaxError {
         count: usize,
         quant_units: usize,
     },
+    InvalidFullBandIdctCount {
+        group: usize,
+        channel: usize,
+        count: usize,
+        quant_units: usize,
+    },
+    InvalidIdctBandwidthMode {
+        group: usize,
+        channel: usize,
+        mode: usize,
+    },
+    InvalidIdctEncoding {
+        group: usize,
+        channel: usize,
+        expected: &'static str,
+        actual: &'static str,
+    },
+    MissingPreviousChannel {
+        group: usize,
+        channel: usize,
+    },
+    InvalidIdctRows {
+        group: usize,
+        channel: usize,
+        expected: usize,
+        actual: usize,
+    },
+    InvalidPreviousIdctValues {
+        group: usize,
+        channel: usize,
+        expected: usize,
+        actual: usize,
+    },
     EmptyFrame,
 }
 
@@ -99,7 +169,7 @@ impl FrameSyntax {
         reference: &FramePrepackerState,
     ) -> Result<Self, FrameSyntaxError> {
         let mut groups = Vec::with_capacity(reference.groups.len());
-        for group in &reference.groups {
+        for (group_index, group) in reference.groups.iter().enumerate() {
             let source = group
                 .objects
                 .first()
@@ -122,24 +192,63 @@ impl FrameSyntax {
                 .objects
                 .iter()
                 .take(group.nblk)
-                .map(|object| {
-                    let explicit = (object.u32(0x1080)? != 0)
-                        .then(|| object.u32(0x107c).map(|value| value as usize))
-                        .transpose()?;
+                .enumerate()
+                .map(|(channel_index, object)| {
+                    let mode = object.u32(0x1078)?;
+                    let count = if object.u32(0x1080)? == 0 {
+                        IdctCountSyntax::FullBand(header.quant_unit_count)
+                    } else {
+                        IdctCountSyntax::Explicit(object.u32(0x107c)? as usize)
+                    };
+                    let active = count.active();
+                    let rows = (0..active)
+                        .map(|index| {
+                            Ok(IdctRowSyntax {
+                                mode: object.u32(0x1084 + index * 4)?,
+                                value: object.u32(0x1b578 + index * 4)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, FrameAssemblyError>>()?;
+                    let dispatch = (mode & 3) + ((object.channel_index & 1) << 2);
+                    let encoding = match dispatch {
+                        0 | 4 => IdctEncodingSyntax::Fixed,
+                        1 | 5 => IdctEncodingSyntax::Huffman,
+                        2 | 6 => IdctEncodingSyntax::Delta,
+                        3 => IdctEncodingSyntax::Empty,
+                        7 => {
+                            let previous = object
+                                .previous_index
+                                .and_then(|index| group.objects.get(index))
+                                .ok_or(FrameSyntaxError::MissingPreviousChannel {
+                                    group: group_index,
+                                    channel: channel_index,
+                                })?;
+                            let values = (0..active)
+                                .map(|index| previous.u32(0x1b578 + index * 4))
+                                .collect::<Result<Vec<_>, FrameAssemblyError>>()?;
+                            IdctEncodingSyntax::Previous { values }
+                        }
+                        _ => unreachable!("masked IDCT dispatch index"),
+                    };
                     Ok(ChannelSyntax {
                         channel_index: object.channel_index,
                         previous_channel: object.previous_index,
                         idwl_mode: object.u32(0x1c70c)?,
                         idsf_mode: object.u32(0x1c73c)?,
-                        idct_mode: object.u32(0x1078)?,
-                        bandwidth: object.u32(0x1074)? != 0,
-                        idct_explicit_count: explicit,
+                        idct: IdctSyntax {
+                            bandwidth: object.u32(0x1074)? != 0,
+                            mode,
+                            bandwidth_mode: object.cfg_u32(0x90)? as usize,
+                            count,
+                            rows,
+                            encoding,
+                        },
                         gain_present: object.u32(0x1b484)? != 0,
                         gha_present: object.arena_u32(0)? != 0,
                         gha_idam_enabled: object.arena_u32(1)? == 0,
                     })
                 })
-                .collect::<Result<Vec<_>, FrameAssemblyError>>()?;
+                .collect::<Result<Vec<_>, FrameSyntaxError>>()?;
             groups.push(BlockGroupSyntax { header, channels });
         }
         let syntax = Self {
@@ -190,7 +299,7 @@ impl FrameSyntax {
                 for (section, mode) in [
                     ("idwl", channel.idwl_mode),
                     ("idsf", channel.idsf_mode),
-                    ("idct", channel.idct_mode),
+                    ("idct", channel.idct.mode),
                 ] {
                     if mode > 3 {
                         return Err(FrameSyntaxError::InvalidMode {
@@ -210,7 +319,7 @@ impl FrameSyntax {
                         previous,
                     });
                 }
-                if let Some(count) = channel.idct_explicit_count
+                if let IdctCountSyntax::Explicit(count) = channel.idct.count
                     && count > syntax.header.quant_unit_count
                 {
                     return Err(FrameSyntaxError::InvalidExplicitIdctCount {
@@ -218,6 +327,52 @@ impl FrameSyntax {
                         channel: channel_index,
                         count,
                         quant_units: syntax.header.quant_unit_count,
+                    });
+                }
+                if let IdctCountSyntax::FullBand(count) = channel.idct.count
+                    && count != syntax.header.quant_unit_count
+                {
+                    return Err(FrameSyntaxError::InvalidFullBandIdctCount {
+                        group: group_index,
+                        channel: channel_index,
+                        count,
+                        quant_units: syntax.header.quant_unit_count,
+                    });
+                }
+                if channel.idct.bandwidth_mode > 1 {
+                    return Err(FrameSyntaxError::InvalidIdctBandwidthMode {
+                        group: group_index,
+                        channel: channel_index,
+                        mode: channel.idct.bandwidth_mode,
+                    });
+                }
+                let expected_encoding =
+                    IdctEncodingSyntax::for_dispatch(channel.idct.mode, channel.channel_index);
+                if channel.idct.encoding.kind() != expected_encoding.kind() {
+                    return Err(FrameSyntaxError::InvalidIdctEncoding {
+                        group: group_index,
+                        channel: channel_index,
+                        expected: expected_encoding.kind(),
+                        actual: channel.idct.encoding.kind(),
+                    });
+                }
+                let active = channel.idct.count.active();
+                if channel.idct.rows.len() != active {
+                    return Err(FrameSyntaxError::InvalidIdctRows {
+                        group: group_index,
+                        channel: channel_index,
+                        expected: active,
+                        actual: channel.idct.rows.len(),
+                    });
+                }
+                if let IdctEncodingSyntax::Previous { values } = &channel.idct.encoding
+                    && values.len() != active
+                {
+                    return Err(FrameSyntaxError::InvalidPreviousIdctValues {
+                        group: group_index,
+                        channel: channel_index,
+                        expected: active,
+                        actual: values.len(),
                     });
                 }
             }
@@ -246,6 +401,35 @@ impl BlockGroupSyntax {
 
     pub(crate) fn channels(&self) -> &[ChannelSyntax] {
         &self.channels
+    }
+}
+
+impl ChannelSyntax {
+    pub(crate) fn idct(&self) -> &IdctSyntax {
+        &self.idct
+    }
+}
+
+impl IdctEncodingSyntax {
+    fn for_dispatch(mode: u32, channel_index: u32) -> Self {
+        match (mode & 3) + ((channel_index & 1) << 2) {
+            0 | 4 => Self::Fixed,
+            1 | 5 => Self::Huffman,
+            2 | 6 => Self::Delta,
+            3 => Self::Empty,
+            7 => Self::Previous { values: Vec::new() },
+            _ => unreachable!("masked IDCT dispatch index"),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Huffman => "huffman",
+            Self::Delta => "delta",
+            Self::Empty => "empty",
+            Self::Previous { .. } => "previous",
+        }
     }
 }
 
@@ -317,8 +501,8 @@ mod tests {
         assert_eq!(syntax.frame_bytes(), 2048);
         assert_eq!(syntax.groups()[0].header().quant_unit_count, 16);
         assert_eq!(
-            syntax.groups()[0].channels()[0].idct_explicit_count,
-            Some(12)
+            syntax.groups()[0].channels()[0].idct.count,
+            IdctCountSyntax::Explicit(12)
         );
         assert_eq!(syntax.to_reference().unwrap(), reference);
     }
@@ -334,5 +518,38 @@ mod tests {
                 actual: 1
             })
         ));
+    }
+
+    #[test]
+    fn idct_mode_requires_the_matching_typed_payload() {
+        let reference = reference_state();
+        let mut syntax = FrameSyntax::from_reference(&reference).unwrap();
+        syntax.groups[0].channels[0].idct.encoding = IdctEncodingSyntax::Fixed;
+
+        assert_eq!(
+            syntax.validate(),
+            Err(FrameSyntaxError::InvalidIdctEncoding {
+                group: 0,
+                channel: 0,
+                expected: "delta",
+                actual: "fixed",
+            })
+        );
+    }
+
+    #[test]
+    fn idct_dispatch_mapping_covers_every_mode_and_channel_parity() {
+        let expected = [
+            "fixed", "huffman", "delta", "empty", "fixed", "huffman", "delta", "previous",
+        ];
+        for channel_index in 0..2 {
+            for mode in 0..4 {
+                let index = mode + channel_index * 4;
+                assert_eq!(
+                    IdctEncodingSyntax::for_dispatch(mode as u32, channel_index as u32).kind(),
+                    expected[index]
+                );
+            }
+        }
     }
 }
