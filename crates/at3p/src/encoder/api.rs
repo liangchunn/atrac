@@ -102,7 +102,7 @@ impl PublicEncoderHandle {
         if self.encode_initialized {
             return self.fail(ERROR_WRONG_INITIALIZED_STATE);
         }
-        if !self.codec_info_set || self.encode_algorithm != ATRAC3PLUS_352.encode_algorithm {
+        if !self.codec_info_set || self.encode_algorithm != ATRAC3PLUS_352.encode_algorithm() {
             return self.unsupported_target();
         }
 
@@ -143,7 +143,7 @@ impl PublicEncoderHandle {
         Ok(BufferRequest {
             input_unit_bytes: input_bytes,
             input_buffer_bytes: input_bytes,
-            frame_bytes: self.frame_bytes.unwrap_or(ATRAC3PLUS_352.frame_bytes),
+            frame_bytes: self.frame_bytes.unwrap_or(ATRAC3PLUS_352.frame_bytes()),
             output_buffer_bytes: 8194,
         })
     }

@@ -3,25 +3,16 @@ use std::io::{self, IsTerminal, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use at3p::encoder::payload::{ComputedFileError, ComputedWriteError, EncodePhase, EncodeProgress};
-use at3p::encoder::profile::{EncodeProfile, profile_by_bitrate_and_channels};
+use at3p::encoder::profile::{
+    ATRAC3PLUS_MONO_PROFILES, ATRAC3PLUS_STEREO_PROFILES, Atrac3plusProfile,
+    profile_by_bitrate_and_channels,
+};
 use at3p::encoder::stream::{Atrac3plusStreamEncoder, PCM_BLOCK_FRAMES};
 use at3p::riff::read::{RiffReadError, inspect_target_pcm_wave_for_channels, inspect_wave_format};
 
 use crate::args::EncodeArgs;
 use crate::output::create_pending_output;
 use crate::pcm::PcmWaveStream;
-
-/// The nine native ATRAC3plus stereo 44.1 kHz bitrates (gAtracCodecParam stereo
-/// rows 10-18). All nine encode end-to-end via the computed pipeline.
-const SUPPORTED_BITRATES_KBPS: [u32; 9] = [48, 64, 96, 128, 160, 192, 256, 320, 352];
-
-/// The five native ATRAC3plus MONO 44.1 kHz bitrates (gAtracCodecParam rows
-/// 5-9, docs/14 §2.1). All five are accepted for MONO input at the config
-/// layer. 128 kbps (docs/14 §1.3), 96 kbps (docs/14 §2.1), 64 kbps
-/// (docs/14 §3.1), and 48 kbps (docs/14 §4.1) mono are LANDED: each encodes
-/// end-to-end through the computed pipeline and writes output. 32 kbps is also
-/// landed (docs/14 §5.1), closing all five native mono rows.
-const SUPPORTED_MONO_BITRATES_KBPS: [u32; 5] = [32, 48, 64, 96, 128];
 
 /// Interactive CLI renderer for the library's exact native-schedule progress.
 /// Redirected stderr stays clean; callers embedding the library receive every
@@ -167,23 +158,23 @@ fn atrac3_family_message(bitrate: u32) -> String {
 }
 
 fn supported_bitrates_list() -> String {
-    SUPPORTED_BITRATES_KBPS
+    ATRAC3PLUS_STEREO_PROFILES
         .iter()
-        .map(|rate| rate.to_string())
+        .map(|profile| profile.bitrate_kbps().to_string())
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 fn mono_bitrates_list() -> String {
-    SUPPORTED_MONO_BITRATES_KBPS
+    ATRAC3PLUS_MONO_PROFILES
         .iter()
-        .map(|rate| rate.to_string())
+        .map(|profile| profile.bitrate_kbps().to_string())
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 fn encode_computed(
-    profile: &EncodeProfile,
+    profile: &Atrac3plusProfile,
     mut pcm: PcmWaveStream,
     output: &Path,
 ) -> Result<(), String> {
@@ -192,7 +183,7 @@ fn encode_computed(
     let mut progress = CliProgress::new();
     let mut encoder = Atrac3plusStreamEncoder::new(file, profile, input_sample_frames)
         .map_err(|error| describe_computed_write_error(output, &error))?;
-    let mut blocks: Vec<Vec<i16>> = (0..profile.channels)
+    let mut blocks: Vec<Vec<i16>> = (0..profile.channels())
         .map(|_| Vec::with_capacity(PCM_BLOCK_FRAMES))
         .collect();
     loop {
@@ -206,7 +197,7 @@ fn encode_computed(
         if frames == 0 {
             break;
         }
-        let result = match profile.channels {
+        let result = match profile.channels() {
             1 => encoder.push_pcm(&[blocks[0].as_slice()]),
             2 => encoder.push_pcm(&[blocks[0].as_slice(), blocks[1].as_slice()]),
             channels => unreachable!("validated ATRAC3plus profile has {channels} channels"),

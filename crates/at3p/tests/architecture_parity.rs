@@ -1,7 +1,9 @@
 use at3p::encoder::payload::{
     assemble_computed_atracx_file_for_mono_profile, assemble_computed_atracx_file_for_profile,
 };
-use at3p::encoder::profile::{ATRAC3PLUS_MONO_PROFILES, ATRAC3PLUS_STEREO_PROFILES, EncodeProfile};
+use at3p::encoder::profile::{
+    ATRAC3PLUS_MONO_PROFILES, ATRAC3PLUS_STEREO_PROFILES, Atrac3plusProfile,
+};
 use at3p::encoder::stream::Atrac3plusStreamEncoder;
 
 fn generated_pcm(channels: usize, frames: usize) -> Vec<Vec<i16>> {
@@ -14,7 +16,7 @@ fn generated_pcm(channels: usize, frames: usize) -> Vec<Vec<i16>> {
         .collect()
 }
 
-fn stream(profile: &EncodeProfile, pcm: &[Vec<i16>]) -> Vec<u8> {
+fn stream(profile: &Atrac3plusProfile, pcm: &[Vec<i16>]) -> Vec<u8> {
     let mut encoder =
         Atrac3plusStreamEncoder::new(Vec::new(), profile, pcm[0].len() as u32).unwrap();
     let mut offset = 0;
@@ -29,8 +31,8 @@ fn stream(profile: &EncodeProfile, pcm: &[Vec<i16>]) -> Vec<u8> {
     encoder.finish().unwrap().0
 }
 
-fn buffered(profile: &EncodeProfile, pcm: &[Vec<i16>]) -> Vec<u8> {
-    match profile.channels {
+fn buffered(profile: &Atrac3plusProfile, pcm: &[Vec<i16>]) -> Vec<u8> {
+    match profile.channels() {
         1 => assemble_computed_atracx_file_for_mono_profile(profile, pcm[0].len() as u32, pcm)
             .unwrap(),
         2 => assemble_computed_atracx_file_for_profile(
@@ -73,15 +75,15 @@ fn every_supported_profile_matches_buffered_and_recorded_output() {
         .chain(ATRAC3PLUS_STEREO_PROFILES.iter())
         .zip(expected)
     {
-        let pcm = generated_pcm(profile.channels as usize, 6144);
+        let pcm = generated_pcm(profile.channels() as usize, 6144);
         let streamed = stream(profile, &pcm);
         assert_eq!(streamed, buffered(profile, &pcm));
         assert_eq!(
             (streamed.len(), fnv1a64(&streamed)),
             expected,
             "{} kbps, {} channel(s)",
-            profile.bitrate_kbps,
-            profile.channels
+            profile.bitrate_kbps(),
+            profile.channels()
         );
     }
 }
@@ -99,15 +101,15 @@ fn low_middle_and_high_rates_preserve_partial_final_blocks() {
         (10340, 0xc930_c331_c4c9_e8e9),
     ];
     for (profile, expected) in profiles.into_iter().zip(expected) {
-        let pcm = generated_pcm(profile.channels as usize, 6145);
+        let pcm = generated_pcm(profile.channels() as usize, 6145);
         let streamed = stream(&profile, &pcm);
         assert_eq!(streamed, buffered(&profile, &pcm));
         assert_eq!(
             (streamed.len(), fnv1a64(&streamed)),
             expected,
             "{} kbps, {} channel(s)",
-            profile.bitrate_kbps,
-            profile.channels
+            profile.bitrate_kbps(),
+            profile.channels()
         );
     }
 }

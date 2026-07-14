@@ -809,6 +809,6 @@ pub fn stereo_group_at5(
 /// caller cannot silently pass a different profile (the geometry constants above
 /// are 352-only; assert the profile still names the scoped stereo path).
 const _: () = {
-    assert!(ATRAC3PLUS_352.channels as usize == COMPUTED_NBLK);
+    assert!(ATRAC3PLUS_352.channels() as usize == COMPUTED_NBLK);
     assert!(!GHA_HAS_PREVIOUS_352[0] && GHA_HAS_PREVIOUS_352[1]);
 };

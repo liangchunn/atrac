@@ -18,7 +18,7 @@ use super::flush::{
 use crate::encoder::coding_params::CodingParams;
 use crate::encoder::computed_frame::COMPUTED_FRAME_BYTES;
 use crate::encoder::frontend::{CurrentPcmFrameError, prepare_current_pcm_frame};
-use crate::encoder::profile::EncodeProfile;
+use crate::encoder::profile::Atrac3plusProfile;
 use crate::riff::write::{
     ATRACX_HEADER_LEN, RiffWriteError, write_atracx_header, write_atracx_header_for_rate,
     write_atracx_header_for_rate_channels,
@@ -162,10 +162,8 @@ pub enum ComputedFileError {
         expected: usize,
         actual: usize,
     },
-    /// A caller manually constructed an [`EncodeProfile`] that is not one of
-    /// the nine native stereo rows. Normal callers obtain profiles through the
-    /// validated lookup, so this is distinct from the retired "accepted but
-    /// unported" state.
+    /// A bitrate lookup failed or a channel-specific helper received a profile
+    /// for the other channel mode.
     UnsupportedProfile {
         bitrate_kbps: u32,
     },
@@ -575,7 +573,7 @@ where
 /// [`assemble_computed_atracx_file_for_rate`]. Profiles exist only for those
 /// nine native stereo rows, so no accepted profile remains unported.
 pub fn assemble_computed_atracx_file_for_profile(
-    profile: &EncodeProfile,
+    profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
@@ -593,7 +591,7 @@ pub fn assemble_computed_atracx_file_for_profile(
 /// progress. The callback is not invoked when profile, shape, or minimum-length
 /// validation fails before the computed scheduler starts.
 pub fn assemble_computed_atracx_file_for_profile_with_progress<F>(
-    profile: &EncodeProfile,
+    profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
@@ -602,73 +600,21 @@ pub fn assemble_computed_atracx_file_for_profile_with_progress<F>(
 where
     F: FnMut(EncodeProgress),
 {
-    match profile.bitrate_kbps {
-        // 352 stays on the shipped path (byte-identical).
-        352 => assemble_computed_atracx_file_with_progress(
-            input_sample_frames,
-            left,
-            right,
-            on_progress,
-        ),
-        // 320 runs the per-rate pipeline (docs/13 §1.1).
-        320 => assemble_computed_atracx_file_for_rate_with_progress(
+    if profile.channels() != 2 {
+        return Err(ComputedFileError::UnsupportedProfile {
+            bitrate_kbps: profile.bitrate_kbps(),
+        });
+    }
+    if profile.bitrate_kbps() == 352 {
+        assemble_computed_atracx_file_with_progress(input_sample_frames, left, right, on_progress)
+    } else {
+        assemble_computed_atracx_file_for_rate_with_progress(
             profile,
             input_sample_frames,
             left,
             right,
             on_progress,
-        ),
-        // 256 runs the per-rate pipeline (docs/13 §2.3, joint-stereo coding path).
-        256 => assemble_computed_atracx_file_for_rate_with_progress(
-            profile,
-            input_sample_frames,
-            left,
-            right,
-            on_progress,
-        ),
-        // 192 runs the per-rate pipeline (docs/13 §3.1, reduced-band joint-stereo path).
-        192 => assemble_computed_atracx_file_for_rate_with_progress(
-            profile,
-            input_sample_frames,
-            left,
-            right,
-            on_progress,
-        ),
-        // 160 runs the per-rate pipeline (docs/13 §3.2, reduced 28-band joint-stereo path).
-        160 => assemble_computed_atracx_file_for_rate_with_progress(
-            profile,
-            input_sample_frames,
-            left,
-            right,
-            on_progress,
-        ),
-        // 128 runs the per-rate pipeline (docs/13 §3.3, reduced 27-band joint-stereo path).
-        128 => assemble_computed_atracx_file_for_rate_with_progress(
-            profile,
-            input_sample_frames,
-            left,
-            right,
-            on_progress,
-        ),
-        // 96 runs the per-rate pipeline (docs/13 §4.1, reduced 27-band joint-stereo path with the sel-19 transient arms).
-        96 => assemble_computed_atracx_file_for_rate_with_progress(
-            profile,
-            input_sample_frames,
-            left,
-            right,
-            on_progress,
-        ),
-        // 64/48 run the low-rate mode_cc==0 pipeline (docs/13 §5.2).
-        64 | 48 => assemble_computed_atracx_file_for_rate_with_progress(
-            profile,
-            input_sample_frames,
-            left,
-            right,
-            on_progress,
-        ),
-        // `EncodeProfile` has public fields, so fail typed if a caller bypasses
-        // the validated profile lookup and manually constructs another rate.
-        bitrate_kbps => Err(ComputedFileError::UnsupportedProfile { bitrate_kbps }),
+        )
     }
 }
 
@@ -676,7 +622,7 @@ where
 /// compressed payload or complete output file.
 pub fn write_computed_atracx_file_for_profile<W>(
     writer: &mut W,
-    profile: &EncodeProfile,
+    profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
@@ -699,7 +645,7 @@ where
 /// its complete frame has been accepted by `writer`.
 pub fn write_computed_atracx_file_for_profile_with_progress<W, F>(
     writer: &mut W,
-    profile: &EncodeProfile,
+    profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
@@ -709,12 +655,9 @@ where
     W: Write,
     F: FnMut(EncodeProgress),
 {
-    if !matches!(
-        profile.bitrate_kbps,
-        48 | 64 | 96 | 128 | 160 | 192 | 256 | 320 | 352
-    ) {
+    if profile.channels() != 2 {
         return Err(ComputedFileError::UnsupportedProfile {
-            bitrate_kbps: profile.bitrate_kbps,
+            bitrate_kbps: profile.bitrate_kbps(),
         }
         .into());
     }
@@ -754,10 +697,8 @@ where
 /// `getAtracEncodeSetting` row/rate match, decompiled/at3tool.c 1787-1789; E2),
 /// then routes by rate:
 ///
-/// 1. **profile guard** — only the five native mono rows (32/48/64/96/128 kbps
-///    at `channels == 1`) proceed; anything else is
-///    [`ComputedFileError::UnsupportedProfile`] (a manually constructed profile
-///    that missed the validated channel-aware lookup).
+/// 1. **profile guard** — `profile` must use mono channel mode, else
+///    [`ComputedFileError::UnsupportedProfile`].
 /// 2. **shape guard** — exactly one channel of `input_sample_frames` samples,
 ///    else [`ComputedFileError::UnsupportedMonoInputShape`] (a malformed call,
 ///    not a native shape).
@@ -776,7 +717,7 @@ where
 ///    remains unported (the retired "accepted but unported" state, mirroring the
 ///    stereo close-out).
 pub fn assemble_computed_atracx_file_for_mono_profile(
-    profile: &EncodeProfile,
+    profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     channels: &[Vec<i16>],
 ) -> Result<Vec<u8>, ComputedFileError> {
@@ -792,7 +733,7 @@ pub fn assemble_computed_atracx_file_for_mono_profile(
 /// progress. Validation and error precedence are identical to the no-callback
 /// entry point.
 pub fn assemble_computed_atracx_file_for_mono_profile_with_progress<F>(
-    profile: &EncodeProfile,
+    profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     channels: &[Vec<i16>],
     on_progress: F,
@@ -800,10 +741,10 @@ pub fn assemble_computed_atracx_file_for_mono_profile_with_progress<F>(
 where
     F: FnMut(EncodeProgress),
 {
-    // (a) profile guard: only the five native mono rows at 1 channel proceed.
-    if !(matches!(profile.bitrate_kbps, 32 | 48 | 64 | 96 | 128) && profile.channels == 1) {
+    // (a) profile guard: this entry point accepts validated mono profiles.
+    if profile.channels() != 1 {
         return Err(ComputedFileError::UnsupportedProfile {
-            bitrate_kbps: profile.bitrate_kbps,
+            bitrate_kbps: profile.bitrate_kbps(),
         });
     }
 
@@ -836,7 +777,7 @@ where
 /// compressed payload or complete output file.
 pub fn write_computed_atracx_file_for_mono_profile<W>(
     writer: &mut W,
-    profile: &EncodeProfile,
+    profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     channels: &[Vec<i16>],
 ) -> Result<(), ComputedWriteError>
@@ -857,7 +798,7 @@ where
 /// mono entry point.
 pub fn write_computed_atracx_file_for_mono_profile_with_progress<W, F>(
     writer: &mut W,
-    profile: &EncodeProfile,
+    profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     channels: &[Vec<i16>],
     on_progress: F,
@@ -866,9 +807,9 @@ where
     W: Write,
     F: FnMut(EncodeProgress),
 {
-    if !(matches!(profile.bitrate_kbps, 32 | 48 | 64 | 96 | 128) && profile.channels == 1) {
+    if profile.channels() != 1 {
         return Err(ComputedFileError::UnsupportedProfile {
-            bitrate_kbps: profile.bitrate_kbps,
+            bitrate_kbps: profile.bitrate_kbps(),
         }
         .into());
     }
@@ -900,7 +841,7 @@ where
 /// §1.3; 96 kbps docs/14 §2.1; 64 kbps docs/14 §3.1; 48 kbps docs/14 §4.1;
 /// 32 kbps docs/14 §5.1): the mono sibling of
 /// [`assemble_computed_atracx_file_for_rate`], rate-generic via
-/// `profile.frame_bytes` / [`CodingParams::for_profile`] / `profile.codec_info`.
+/// `profile.frame_bytes()` / [`CodingParams::for_profile`] / `profile.codec_info()`.
 /// The frame SCHEDULE is channel-independent (E3), so the caller's
 /// [`ComputedSchedule352`] governs the output-frame count; one current-call
 /// scalar frame is prepared and immediately driven through the incremental
@@ -913,7 +854,7 @@ where
 /// 96: 39/77; 64: 32/77; 48: 34/77; 32: 25/77 frames byte-exact incl. frame 0 vs
 /// the native oracle).
 fn assemble_computed_mono_file_for_rate<F>(
-    profile: &EncodeProfile,
+    profile: &Atrac3plusProfile,
     schedule: &ComputedSchedule352,
     input_sample_frames: u32,
     channels: &[Vec<i16>],
@@ -923,7 +864,7 @@ where
     F: FnMut(EncodeProgress),
 {
     let total_output_frames = schedule.total_output_frames();
-    let frame_bytes = profile.frame_bytes;
+    let frame_bytes = profile.frame_bytes();
     let payload_bytes = total_output_frames as usize * frame_bytes as usize;
     let file_bytes = ATRACX_HEADER_LEN as usize + payload_bytes;
 
@@ -940,7 +881,7 @@ where
         input_sample_frames,
         total_output_frames,
         frame_bytes as u16,
-        profile.codec_info,
+        profile.codec_info(),
     )?;
     bytes.extend_from_slice(&payload);
 
@@ -959,7 +900,7 @@ where
 /// mode_cc==0 low-selector `set_gainc_at5` path.
 /// Mirrors [`assemble_computed_atracx_file`] but threads the profile's per-rate
 /// coding params ([`CodingParams::for_profile`]) into the computed pipeline and
-/// sizes the payload / RIFF header at `profile.frame_bytes` via
+/// sizes the payload / RIFF header at `profile.frame_bytes()` via
 /// [`write_atracx_header_for_rate`]. The frame SCHEDULE is rate-independent
 /// (docs/13 §2.3), so [`ComputedSchedule352`] governs the output-frame count.
 /// There is NO packer-boundary byte oracle at a non-352 rate by design (x87
@@ -967,7 +908,7 @@ where
 /// structurally exact (frame count / sizing / container) but not byte-pinned
 /// against native payload bytes.
 pub fn assemble_computed_atracx_file_for_rate(
-    profile: &EncodeProfile,
+    profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
@@ -983,7 +924,7 @@ pub fn assemble_computed_atracx_file_for_rate(
 
 /// [`assemble_computed_atracx_file_for_rate`] with per-wrapper-call progress.
 pub fn assemble_computed_atracx_file_for_rate_with_progress<F>(
-    profile: &EncodeProfile,
+    profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
@@ -992,6 +933,11 @@ pub fn assemble_computed_atracx_file_for_rate_with_progress<F>(
 where
     F: FnMut(EncodeProgress),
 {
+    if profile.channels() != 2 {
+        return Err(ComputedFileError::UnsupportedProfile {
+            bitrate_kbps: profile.bitrate_kbps(),
+        });
+    }
     // Both channels must hold exactly `N` sample frames.
     if left.len() != input_sample_frames as usize || right.len() != input_sample_frames as usize {
         return Err(ComputedFileError::UnsupportedInputShape {
@@ -1005,7 +951,7 @@ where
     // Reject `N < 6144` (native minimum) with the typed too-short error.
     let schedule = ComputedSchedule352::new(input_sample_frames)?;
     let total_output_frames = schedule.total_output_frames();
-    let frame_bytes = profile.frame_bytes;
+    let frame_bytes = profile.frame_bytes();
     let payload_bytes = total_output_frames as usize * frame_bytes as usize;
     let file_bytes = ATRACX_HEADER_LEN as usize + payload_bytes;
 
@@ -1021,7 +967,7 @@ where
         input_sample_frames,
         total_output_frames,
         frame_bytes as u16,
-        profile.codec_info,
+        profile.codec_info(),
     )?;
     bytes.extend_from_slice(&payload);
 

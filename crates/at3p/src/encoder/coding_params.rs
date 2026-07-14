@@ -51,8 +51,7 @@
 //!   8955/11899/14907/16379 for 48..352 (block_count = 1 for plain stereo, from
 //!   the init-words `block_count_u32 = 1`).
 
-use crate::encoder::encode_setting::{mono_setting_by_row_match, stereo_setting_by_row_match};
-use crate::encoder::profile::EncodeProfile;
+use crate::encoder::profile::Atrac3plusProfile;
 use crate::tables::at5::{isps_at5, x_at5};
 
 /// Block group count (`atx_state + 0xc`; init-words `block_count_u32 = 1` at
@@ -176,7 +175,7 @@ pub fn frame_bit_budget(frame_bytes: u32, block_count: u32) -> i32 {
 }
 
 /// The three per-rate words the computed pipeline threads in place of the pinned
-/// 352 constants. Derived purely from an [`EncodeProfile`]; carries no runtime
+/// 352 constants. Derived purely from an [`Atrac3plusProfile`]; carries no runtime
 /// trace input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodingParams {
@@ -203,7 +202,8 @@ pub struct CodingParams {
     pub channels: u32,
     /// The `g_a_encode_setting_atx` row+0x14 `mode_a` config word — the zeroth
     /// `param_5` (`*(handle+0x190)`) joint/intensity-stereo producer gate
-    /// (docs/13 §2.3 (r), `encode_setting.rs`). `3` for 48-256 kbps (the
+    /// (docs/13 §2.3 (r), now stored by the validated profile). `3` for
+    /// 48-256 kbps (the
     /// zeroth `param_5 == 3` producer arm is LIVE), `2` for 320/352 kbps (DEAD;
     /// which is why those rates are byte-identical whether or not the producer
     /// is wired). Threaded into the frontend sigproc mode and the coding-bridge
@@ -244,31 +244,18 @@ pub struct CodingParams {
 }
 
 impl CodingParams {
-    /// Derive the per-rate coding params from an [`EncodeProfile`], channel-mode
+    /// Derive the per-rate coding params from an [`Atrac3plusProfile`], channel-mode
     /// aware (block_count = 1 for both stereo and mono, MEASURED). `channels == 1`
     /// resolves the five mono rows; anything else the nine stereo rows.
-    pub fn for_profile(profile: &EncodeProfile) -> Self {
-        let frame_bits = profile.frame_bytes * 8;
-        let is_mono = profile.channels == 1;
-        // `mode_a` and `bandwidth_hz` from the exact `g_a_encode_setting_atx`
-        // row, keyed on `(frame_bytes, sample_rate, channel_mode)` mirroring the
-        // native init row match. Four mono frame sizes (280/376/560/744) coincide
-        // with stereo rows, so the channel mode is load-bearing. Every accepted
-        // profile has a row; the fallbacks (`mode_a` neutral, `band_index = 32`
-        // full-band) only guard a non-matching profile.
-        let setting = if is_mono {
-            mono_setting_by_row_match(profile.frame_bytes, profile.sample_rate, 1)
-        } else {
-            stereo_setting_by_row_match(profile.frame_bytes, profile.sample_rate, 2)
-        };
-        // Mono rows carry `mode_a = 1` (MEASURED `mode_a_0x190_u32 == 1` at all
-        // five rates; joint/intensity machinery structurally dead at mono); the
-        // non-matching fallback stays the stereo-neutral 2.
-        let mode_a = setting.map(|s| s.mode_a).unwrap_or(2);
-        let band_index = setting
-            .map(|s| atx_band_index_for_bandwidth(s.sample_rate, s.bandwidth_hz))
-            .unwrap_or(FULL_BAND_INDEX);
-        let selector = atx_encode_selector(profile.sample_rate, frame_bits) as i32;
+    pub fn for_profile(profile: &Atrac3plusProfile) -> Self {
+        let frame_bits = profile.frame_bytes() * 8;
+        let is_mono = profile.channels() == 1;
+        // The validated profile owns the matching `g_a_encode_setting_atx`
+        // facts, so this conversion is infallible and has no neutral fallback.
+        let mode_a = profile.mode_a();
+        let band_index =
+            atx_band_index_for_bandwidth(profile.sample_rate(), profile.bandwidth_hz());
+        let selector = atx_encode_selector(profile.sample_rate(), frame_bits) as i32;
         // `atx_init_encode_block` +0xd0 / +0xcc store thresholds are
         // channel-mode-dependent (gate word `handle+0x44` == 0 measured at every
         // stereo AND mono rate, so the plain-threshold branch governs):
@@ -280,13 +267,13 @@ impl CodingParams {
         let (gha_gt, cc_ge) = if is_mono { (0x0e, 0x0f) } else { (0x12, 0x13) };
         CodingParams {
             selector,
-            budget: frame_bit_budget(profile.frame_bytes, STEREO_BLOCK_COUNT),
-            frame_bytes: profile.frame_bytes,
+            budget: frame_bit_budget(profile.frame_bytes(), STEREO_BLOCK_COUNT),
+            frame_bytes: profile.frame_bytes(),
             // `handle+0x94` channel count: 2 stereo / 1 mono (MEASURED, docs/14
             // §0.2/§0.4). All five mono values — 128 kbps (docs/14 §1.3), 96 kbps
             // (docs/14 §2.1), 64 kbps (docs/14 §3.1), 48 kbps (docs/14 §4.1), and
             // 32 kbps (docs/14 §5.1) — drive a live 1-channel pipeline.
-            channels: u32::from(profile.channels),
+            channels: u32::from(profile.channels()),
             mode_a,
             band_index,
             gha_enabled: selector > gha_gt,

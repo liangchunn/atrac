@@ -54,13 +54,13 @@ pub struct AtxHandleState {
 impl AtxHandleState {
     pub fn target_352_initial() -> Self {
         Self {
-            channels: u32::from(ATRAC3PLUS_352.channels),
+            channels: u32::from(ATRAC3PLUS_352.channels()),
             block_count: 1,
-            frame_bytes: ATRAC3PLUS_352.frame_bytes,
+            frame_bytes: ATRAC3PLUS_352.frame_bytes(),
             error_code: ERROR_OK,
             encode_delay_remaining: 7,
             flush_remaining: 9,
-            input_channels: u32::from(ATRAC3PLUS_352.channels),
+            input_channels: u32::from(ATRAC3PLUS_352.channels()),
             block_errors: vec![ERROR_OK],
         }
     }

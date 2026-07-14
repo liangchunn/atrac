@@ -7,7 +7,7 @@ use super::payload::{
     ComputedFileError, ComputedPayloadError, ComputedWriteError, ComputedWriteStage, EncodePhase,
     EncodeProgress, write_computed_output_frame,
 };
-use super::profile::EncodeProfile;
+use super::profile::Atrac3plusProfile;
 use crate::riff::write::{
     ATRACX_HEADER_LEN, write_atracx_header, write_atracx_header_for_rate,
     write_atracx_header_for_rate_channels,
@@ -44,43 +44,28 @@ pub struct Atrac3plusStreamEncoder<W: Write> {
 impl<W: Write> Atrac3plusStreamEncoder<W> {
     pub fn new(
         mut writer: W,
-        profile: &EncodeProfile,
+        profile: &Atrac3plusProfile,
         input_sample_frames: u32,
     ) -> Result<Self, ComputedWriteError> {
-        let supported = match profile.channels {
-            1 => matches!(profile.bitrate_kbps, 32 | 48 | 64 | 96 | 128),
-            2 => matches!(
-                profile.bitrate_kbps,
-                48 | 64 | 96 | 128 | 160 | 192 | 256 | 320 | 352
-            ),
-            _ => false,
-        };
-        if !supported {
-            return Err(ComputedFileError::UnsupportedProfile {
-                bitrate_kbps: profile.bitrate_kbps,
-            }
-            .into());
-        }
-
         let schedule = ComputedSchedule352::new(input_sample_frames)
             .map_err(ComputedFileError::from)
             .map_err(ComputedWriteError::from)?;
-        let header = match profile.channels {
-            2 if profile.bitrate_kbps == 352 => {
+        let header = match profile.channels() {
+            2 if profile.bitrate_kbps() == 352 => {
                 write_atracx_header(input_sample_frames, schedule.total_output_frames())
             }
             2 => write_atracx_header_for_rate(
                 input_sample_frames,
                 schedule.total_output_frames(),
-                profile.frame_bytes as u16,
-                profile.codec_info,
+                profile.frame_bytes() as u16,
+                profile.codec_info(),
             ),
             1 => write_atracx_header_for_rate_channels(
                 1,
                 input_sample_frames,
                 schedule.total_output_frames(),
-                profile.frame_bytes as u16,
-                profile.codec_info,
+                profile.frame_bytes() as u16,
+                profile.codec_info(),
             ),
             _ => unreachable!("validated ATRAC3plus channel count"),
         }
@@ -101,15 +86,15 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
             writer,
             schedule,
             scheduler,
-            channel_count: profile.channels as usize,
-            frame_bytes: profile.frame_bytes as usize,
+            channel_count: profile.channels() as usize,
+            frame_bytes: profile.frame_bytes() as usize,
             total_steps,
             input_sample_frames,
             consumed_sample_frames: 0,
             next_output_frame_index: 0,
             written_payload_bytes: 0,
             header_len: header.len(),
-            pcm_frame: vec![vec![0.0; FRONTEND_FRAME_SAMPLES]; profile.channels as usize],
+            pcm_frame: vec![vec![0.0; FRONTEND_FRAME_SAMPLES]; profile.channels() as usize],
         })
     }
 
@@ -324,12 +309,12 @@ mod tests {
             .collect()
     }
 
-    fn stream(profile: &EncodeProfile, pcm: &[Vec<i16>]) -> Vec<u8> {
+    fn stream(profile: &Atrac3plusProfile, pcm: &[Vec<i16>]) -> Vec<u8> {
         let mut encoder =
             Atrac3plusStreamEncoder::new(Vec::new(), profile, pcm[0].len() as u32).unwrap();
         let mut offset = 0;
         while let Some(frames) = encoder.expected_next_chunk_frames() {
-            match profile.channels {
+            match profile.channels() {
                 1 => encoder
                     .push_pcm(&[&pcm[0][offset..offset + frames]])
                     .unwrap(),

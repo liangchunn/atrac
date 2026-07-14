@@ -95,7 +95,7 @@ impl AtracxWaveFormat {
     /// NOT `frame_bytes` — they only coincide at 352), `channel_mask` 3, the
     /// ATRACX GUID, `revision` 1, and an 8-byte zero tail. `avg_bytes_per_sec`
     /// follows [`atracx_avg_bytes_per_sec`]. This constructor takes primitive
-    /// params (not an `EncodeProfile`) so `riff` stays independent of the codec
+    /// params (not an `Atrac3plusProfile`) so `riff` stays independent of the codec
     /// modules (docs/02).
     pub const fn for_rate(frame_bytes: u16, codec_info: u32) -> Self {
         Self::for_rate_channels(2, frame_bytes, codec_info)

@@ -85,9 +85,9 @@
 //!   trace-feed the captured values via the aux.
 //!
 //! * **Config / side scalars (computed 352 constants).** `channel_count = 2`
-//!   (`ATRAC3PLUS_352.channels`), `selector = 30`, `band_count = 32`,
+//!   (`ATRAC3PLUS_352.channels()`), `selector = 30`, `band_count = 32`,
 //!   `gain_band_count = 16`, `flags_1dc = 0`, `sr_ac = 44100`
-//!   (`ATRAC3PLUS_352.sample_rate`) are frame-invariant 352 config computed here
+//!   (`ATRAC3PLUS_352.sample_rate()`) are frame-invariant 352 config computed here
 //!   and asserted byte-exact vs the captured `side_fields`. `join_flags_50`
 //!   (init's per-group joint-stereo flags, cfg row `+0x50..+0x90`) is NOT
 //!   frame-invariant: `assemble_init_frame_state_at5` seeds it `[0;16]` (correct
@@ -364,7 +364,7 @@ pub fn assemble_init_frame_state_with_selector_at5(
         // `CODING_BRIDGE_FLAGS_1DC = 0`; the sine-mode hysteresis (docs/12
         // §4.3 b-residual) makes it nonzero on mask-1 frames.
         flags_1dc,
-        sr_ac: ATRAC3PLUS_352.sample_rate,
+        sr_ac: ATRAC3PLUS_352.sample_rate(),
         join_flags_50: vec![0i32; CODING_BRIDGE_GAIN_BAND_COUNT],
     })
 }
@@ -1691,7 +1691,7 @@ pub fn assemble_calc_frame_entry_with_init_for_params_at5(
         // do full-band rates.
         tone_group_count: gain_band_count,
         selector: selector as u32,
-        sample_rate: ATRAC3PLUS_352.sample_rate as i32,
+        sample_rate: ATRAC3PLUS_352.sample_rate() as i32,
         header_flags_1dc: flags_1dc,
         // The zeroing gate word `*(obj+0x30)+0x1c` (objside_1c, 0 at 352).
         object_mode_1c: init_state.channels[0].objside_1c as u32,
@@ -1811,7 +1811,7 @@ pub fn assemble_calc_frame_entry_with_init_for_params_at5(
                 .collect(),
             config_90: CALC_BRIDGE_CONFIG_90,
             config_a8: CALC_BRIDGE_CONFIG_A8,
-            config_ac: ATRAC3PLUS_352.sample_rate,
+            config_ac: ATRAC3PLUS_352.sample_rate(),
             config_b0: active_b0,
             // Per-FRAME `+0xb8` shape-count law (9 at band_index 27 / 128, else 10).
             config_b8: cfg_shape_count_b8(band_index),
