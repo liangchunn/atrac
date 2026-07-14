@@ -8,7 +8,6 @@ publish.workspace = true
 
 [features]
 default = []
-bit-perfect = ["at3/bit-perfect"]
 mdct-disasm = ["at3/mdct-disasm"]
 
 [[bin]]

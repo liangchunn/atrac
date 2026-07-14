@@ -1,79 +1,7 @@
 use crate::dsp::quant::ispof_iqt_at3;
-#[cfg(feature = "bit-perfect")]
-use crate::dsp::x87::{RoundingMode, X87Control, X87Real as Ext80};
 use crate::tables::dba;
 use crate::tables::dba::{DBA_HUF_MASK, DBA_NBITS_WL2_QUAD, DBA_NORM_FACT, DBA_SCALE_LOOKUP};
 use crate::tables::{NSPS1024_TABLE, QTSTART_TABLE};
-
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-const DBA_X87_CONTROL: X87Control = X87Control {
-    rounding: RoundingMode::NearestEven,
-};
-
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-const DBA_X87_ONE: Ext80 = Ext80::from_f32_exact(1.0);
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-const DBA_X87_HALF: Ext80 = Ext80::from_f32_exact(0.5);
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-const DBA_X87_EIGHTH: Ext80 = Ext80::from_f32_exact(0.125);
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-const DBA_X87_MAGIC_ROUND: Ext80 = Ext80::from_f32_exact(12_582_912.0);
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-const DBA_X87_INV_SQRT_2: Ext80 = Ext80::from_f32_exact(0.70710677_f32);
-
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-fn dba_x87_from_f32(value: f32) -> Ext80 {
-    Ext80::from_f32_exact(value)
-}
-
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-fn dba_x87_store_f32(value: Ext80) -> f32 {
-    value.to_f32(RoundingMode::NearestEven)
-}
-
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-fn dba_x87_add(lhs: Ext80, rhs: Ext80) -> Ext80 {
-    lhs.fadd(rhs, DBA_X87_CONTROL)
-}
-
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-fn dba_x87_sub(lhs: Ext80, rhs: Ext80) -> Ext80 {
-    lhs.fsub(rhs, DBA_X87_CONTROL)
-}
-
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-fn dba_x87_mul(lhs: Ext80, rhs: Ext80) -> Ext80 {
-    lhs.fmul(rhs, DBA_X87_CONTROL)
-}
-
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-fn dba_x87_div(lhs: Ext80, rhs: Ext80) -> Ext80 {
-    lhs.fdiv(rhs, DBA_X87_CONTROL)
-}
-
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-fn dba_x87_mul_add(lhs: Ext80, rhs: Ext80, addend: Ext80) -> Ext80 {
-    dba_x87_add(dba_x87_mul(lhs, rhs), addend)
-}
-
-#[cfg(feature = "bit-perfect")]
-#[cfg_attr(not(test), allow(dead_code))]
-fn dba_x87_to_i32_trunc(value: Ext80) -> i32 {
-    value.to_i32_trunc().unwrap()
-}
 
 #[cfg_attr(not(test), allow(dead_code))]
 const DBA_QMF_HISTORY: usize = 138;
@@ -108,7 +36,6 @@ impl DbaAnalysisFilterBank {
         }
     }
 
-    #[cfg(not(feature = "bit-perfect"))]
     pub(crate) fn analysis(&mut self, pcm: &[f32; 1024], bands: &mut [[f32; 256]; 4]) {
         let mut work = [0.0f32; DBA_QMF_WORK];
         work[..DBA_QMF_HISTORY].copy_from_slice(&self.history);
@@ -164,94 +91,6 @@ impl DbaAnalysisFilterBank {
             bands[1][sample] = (f7 - f22) as f32;
             bands[2][sample] = (f6 - f10) as f32;
             bands[3][sample] = (f6 + f10) as f32;
-        }
-
-        self.history.copy_from_slice(&work[1024..]);
-    }
-
-    #[cfg(feature = "bit-perfect")]
-    pub(crate) fn analysis(&mut self, pcm: &[f32; 1024], bands: &mut [[f32; 256]; 4]) {
-        let mut work = [0.0f32; DBA_QMF_WORK];
-        work[..DBA_QMF_HISTORY].copy_from_slice(&self.history);
-        work[DBA_QMF_HISTORY..].copy_from_slice(pcm);
-        let qmf_coefficients = dba::DBA_QMF_COEFFICIENTS.map(dba_x87_from_f32);
-        let c0 = qmf_coefficients[0];
-
-        for sample in 0..256 {
-            let base = sample * 4;
-            let mut f22 = dba_x87_add(
-                dba_x87_mul(dba_x87_from_f32(work[base + 0x5d]), c0),
-                dba_x87_from_f32(pcm[base + 1]),
-            );
-            let mut f3 = dba_x87_add(
-                dba_x87_mul(dba_x87_from_f32(pcm[base]), c0),
-                dba_x87_from_f32(work[base + 0x5c]),
-            );
-            let mut f4 = dba_x87_add(
-                dba_x87_mul(dba_x87_from_f32(work[base + 0x5f]), c0),
-                dba_x87_from_f32(pcm[base + 3]),
-            );
-            let mut f5 = dba_x87_add(
-                dba_x87_mul(dba_x87_from_f32(pcm[base + 2]), c0),
-                dba_x87_from_f32(work[base + 0x5e]),
-            );
-
-            for coeff_idx in (1..=0x16).rev() {
-                let reverse_idx = 0x17 - coeff_idx;
-                let coeff = qmf_coefficients[coeff_idx];
-                let reverse_coeff = qmf_coefficients[reverse_idx];
-                let tap = coeff_idx * 2;
-                f4 = dba_x87_add(
-                    f4,
-                    dba_x87_mul(coeff, dba_x87_from_f32(work[base + tap + 0x5f])),
-                );
-                f22 = dba_x87_add(
-                    f22,
-                    dba_x87_mul(coeff, dba_x87_from_f32(work[base + tap + 0x5d])),
-                );
-                f3 = dba_x87_add(
-                    f3,
-                    dba_x87_mul(reverse_coeff, dba_x87_from_f32(work[base + tap + 0x5c])),
-                );
-                f5 = dba_x87_add(
-                    f5,
-                    dba_x87_mul(reverse_coeff, dba_x87_from_f32(work[base + tap + 0x5e])),
-                );
-            }
-
-            let a0 = dba_x87_add(f22, f3);
-            let a1 = dba_x87_sub(f22, f3);
-            let a2 = dba_x87_add(f4, f5);
-            let a3 = dba_x87_sub(f4, f5);
-            work[base + 0x5c] = dba_x87_store_f32(a0);
-            work[base + 0x5d] = dba_x87_store_f32(a1);
-            work[base + 0x5e] = dba_x87_store_f32(a2);
-            work[base + 0x5f] = dba_x87_store_f32(a3);
-
-            let mut f6 = dba_x87_add(dba_x87_mul(dba_x87_from_f32(work[base + 3]), c0), a3);
-            let mut f7 = dba_x87_add(a2, dba_x87_mul(dba_x87_from_f32(work[base + 2]), c0));
-            let mut f10 = dba_x87_add(dba_x87_mul(a1, c0), dba_x87_from_f32(work[base + 1]));
-            let mut f22 = dba_x87_add(dba_x87_mul(a0, c0), dba_x87_from_f32(work[base]));
-            let mut ptr = base + 0x58;
-
-            for coeff_idx in (1..=0x16).rev() {
-                let reverse_idx = 0x17 - coeff_idx;
-                let coeff = qmf_coefficients[coeff_idx];
-                let reverse_coeff = qmf_coefficients[reverse_idx];
-                f6 = dba_x87_add(f6, dba_x87_mul(coeff, dba_x87_from_f32(work[ptr + 3])));
-                f7 = dba_x87_add(f7, dba_x87_mul(coeff, dba_x87_from_f32(work[ptr + 2])));
-                f22 = dba_x87_add(f22, dba_x87_mul(reverse_coeff, dba_x87_from_f32(work[ptr])));
-                f10 = dba_x87_add(
-                    f10,
-                    dba_x87_mul(reverse_coeff, dba_x87_from_f32(work[ptr + 1])),
-                );
-                ptr -= 4;
-            }
-
-            bands[0][sample] = dba_x87_store_f32(dba_x87_add(f7, f22));
-            bands[1][sample] = dba_x87_store_f32(dba_x87_sub(f7, f22));
-            bands[2][sample] = dba_x87_store_f32(dba_x87_sub(f6, f10));
-            bands[3][sample] = dba_x87_store_f32(dba_x87_add(f6, f10));
         }
 
         self.history.copy_from_slice(&work[1024..]);
@@ -379,16 +218,9 @@ pub fn dba_mainsub(params: DbaMainsubParams<'_>) -> i32 {
     params.base_position.wrapping_add(offset & !7)
 }
 
-#[cfg(not(feature = "bit-perfect"))]
 pub(crate) fn dba_magic_round_bits(sample: f32, scale: f32) -> u32 {
     let rounded = sample * scale + 12_582_912.0;
     rounded.to_bits()
-}
-
-#[cfg(feature = "bit-perfect")]
-pub(crate) fn dba_magic_round_bits(sample: f32, scale: f32) -> u32 {
-    let scaled = dba_x87_mul(dba_x87_from_f32(sample), dba_x87_from_f32(scale));
-    dba_x87_store_f32(dba_x87_add(scaled, DBA_X87_MAGIC_ROUND)).to_bits()
 }
 
 fn dba_tone_quantized_sample(sample: f32, scale: f32) -> i32 {
@@ -396,13 +228,6 @@ fn dba_tone_quantized_sample(sample: f32, scale: f32) -> i32 {
     (rounded as u16 as i16) as i32
 }
 
-#[cfg(feature = "bit-perfect")]
-fn dba_tone_quantized_scaled(scaled: Ext80) -> i32 {
-    let rounded = dba_x87_store_f32(dba_x87_add(scaled, DBA_X87_MAGIC_ROUND));
-    (rounded.to_bits() as u16 as i16) as i32
-}
-
-#[cfg(not(feature = "bit-perfect"))]
 pub fn set_best_idsf4_tone(
     samples: &[f32],
     table_offset: i32,
@@ -454,80 +279,6 @@ pub fn set_best_idsf4_tone(
         if max_error < best_error * scale {
             result = candidate;
             best_error = max_error * (1.0 / scale);
-            if quantized_or & 1 == 0 && candidate < 61 {
-                let max_shifts = ((61 - candidate + 2) / 3) as u32;
-                let shifts = quantized_or.trailing_zeros().min(max_shifts);
-                result = candidate + shifts as i32 * 3;
-            }
-        }
-
-        candidate -= 1;
-        phase = phase.wrapping_sub(0x002b_0000);
-        if candidate < min_idsf {
-            return result;
-        }
-    }
-}
-
-#[cfg(feature = "bit-perfect")]
-pub fn set_best_idsf4_tone(
-    samples: &[f32],
-    table_offset: i32,
-    sample_count: usize,
-    current_idsf: i32,
-) -> i32 {
-    let max_bits = samples[..4]
-        .iter()
-        .map(|sample| sample.to_bits().wrapping_mul(2))
-        .max()
-        .unwrap();
-    let fraction = max_bits & 0x00ff_ffff;
-    let mut min_idsf = (max_bits >> 24).wrapping_mul(3).wrapping_sub(0x16c);
-    if fraction > 0x0096_5fe9 {
-        min_idsf = min_idsf.wrapping_add(1);
-    }
-    if fraction < 0x0042_8a30 {
-        min_idsf = min_idsf.wrapping_sub(1);
-    }
-    if min_idsf >= 64 {
-        min_idsf = 0;
-    }
-
-    let min_idsf = min_idsf as i32;
-    let mut candidate = (min_idsf + 3).min(64) - 1;
-    if candidate < min_idsf {
-        return current_idsf;
-    }
-
-    let mut best_error = dba_x87_from_f32(1.0e10);
-    let mut result = current_idsf;
-    let mut phase = (candidate as u32).wrapping_mul(0x002b_0000);
-    loop {
-        let table_index = (((phase >> 23) as i32 + table_offset) * 3 - candidate - 1) as usize;
-        let scale_f32 = f32::from_bits(
-            DBA_NORM_FACT[table_index]
-                .to_bits()
-                .wrapping_sub(phase & 0x7f80_0000),
-        );
-        let scale = dba_x87_from_f32(scale_f32);
-        let mut quantized_or = 0u32;
-        let mut max_error = Ext80::zero(false);
-        for &sample in &samples[..sample_count] {
-            let scaled = dba_x87_mul(dba_x87_from_f32(sample), scale);
-            let quantized = dba_tone_quantized_scaled(scaled);
-            quantized_or |= quantized as u32;
-            let error = dba_x87_sub(scaled, Ext80::from_i32_exact(quantized)).fabs();
-            if matches!(error.compare(max_error), Some(std::cmp::Ordering::Greater)) {
-                max_error = error;
-            }
-        }
-
-        if matches!(
-            max_error.compare(dba_x87_mul(best_error, scale)),
-            Some(std::cmp::Ordering::Less)
-        ) {
-            result = candidate;
-            best_error = dba_x87_mul(max_error, dba_x87_div(DBA_X87_ONE, scale));
             if quantized_or & 1 == 0 && candidate < 61 {
                 let max_shifts = ((61 - candidate + 2) / 3) as u32;
                 let shifts = quantized_or.trailing_zeros().min(max_shifts);
@@ -598,9 +349,7 @@ const CHCONV_F_256: f32 = 256.0;
 const CHCONV_F_1_6802721: f32 = 1.6802721;
 const CHCONV_F_1_6666666: f32 = 1.6666666;
 const CHCONV_F_0_05: f32 = 0.05;
-#[cfg_attr(feature = "bit-perfect", allow(dead_code))]
 const CHCONV_F_0_5: f32 = 0.5;
-#[cfg_attr(feature = "bit-perfect", allow(dead_code))]
 const CHCONV_F_0_125: f32 = 0.125;
 
 fn select_chconv_into_state(
@@ -833,7 +582,6 @@ pub(crate) fn dba_channel_convert(
             state.target_coefficients[band] = target;
             state.smooth_coefficients[band] = target;
 
-            #[cfg(not(feature = "bit-perfect"))]
             {
                 let current_hi_scaled = chsw_current_hi * target;
                 #[allow(clippy::needless_range_loop)]
@@ -861,52 +609,6 @@ pub(crate) fn dba_channel_convert(
                     bands[0][band][sample] = mid;
                 }
             }
-            #[cfg(feature = "bit-perfect")]
-            {
-                let current_hi_scaled =
-                    dba_x87_mul(dba_x87_from_f32(chsw_current_hi), dba_x87_from_f32(target));
-                let chsw_current_lo_x87 = dba_x87_from_f32(chsw_current_lo);
-                let chsw_previous_lo_x87 = dba_x87_from_f32(chsw_previous_lo);
-                let chsw_previous_hi_scaled = dba_x87_mul(
-                    dba_x87_from_f32(chsw_previous_hi),
-                    dba_x87_from_f32(previous_smooth),
-                );
-                let eighth = DBA_X87_EIGHTH;
-                let half = DBA_X87_HALF;
-                for sample in 0..8 {
-                    let ramp = dba_x87_from_f32((sample as i32 - 8) as f32);
-                    let left = dba_x87_from_f32(bands[0][band][sample]);
-                    let right = dba_x87_from_f32(bands[1][band][sample]);
-                    let mid = dba_x87_mul(dba_x87_add(left, right), half);
-                    let left_delta = dba_x87_sub(chsw_previous_lo_x87, chsw_current_lo_x87);
-                    let left_coef = dba_x87_sub(
-                        chsw_current_lo_x87,
-                        dba_x87_mul(dba_x87_mul(ramp, left_delta), eighth),
-                    );
-                    let right_delta = dba_x87_sub(chsw_previous_hi_scaled, current_hi_scaled);
-                    let right_coef = dba_x87_sub(
-                        current_hi_scaled,
-                        dba_x87_mul(dba_x87_mul(ramp, right_delta), eighth),
-                    );
-                    let numerator = dba_x87_sub(left, dba_x87_mul(left_coef, mid));
-                    bands[1][band][sample] = dba_x87_store_f32(dba_x87_mul(
-                        numerator,
-                        dba_x87_div(DBA_X87_ONE, right_coef),
-                    ));
-                    bands[0][band][sample] = dba_x87_store_f32(mid);
-                }
-                let reciprocal = dba_x87_div(DBA_X87_ONE, current_hi_scaled);
-                for sample in 8..256 {
-                    let left = dba_x87_from_f32(bands[0][band][sample]);
-                    let right = dba_x87_from_f32(bands[1][band][sample]);
-                    let mid = dba_x87_mul(dba_x87_add(left, right), half);
-                    bands[1][band][sample] = dba_x87_store_f32(dba_x87_mul(
-                        dba_x87_sub(left, dba_x87_mul(mid, chsw_current_lo_x87)),
-                        reciprocal,
-                    ));
-                    bands[0][band][sample] = dba_x87_store_f32(mid);
-                }
-            }
         } else {
             let (previous_idx, current_idx) = dba_chconv_weight_indices(
                 mode_abs,
@@ -915,7 +617,6 @@ pub(crate) fn dba_channel_convert(
             );
             let previous_weight = dba::DBA_WT_COMP[previous_idx];
             let current_weight = dba::DBA_WT_COMP[current_idx];
-            #[cfg(not(feature = "bit-perfect"))]
             {
                 #[allow(clippy::needless_range_loop)]
                 for sample in 0..8 {
@@ -929,36 +630,6 @@ pub(crate) fn dba_channel_convert(
                 for sample in 8..256 {
                     bands[0][band][sample] =
                         (bands[1][band][sample] + bands[0][band][sample]) * (1.0 / current_weight);
-                }
-            }
-            #[cfg(feature = "bit-perfect")]
-            {
-                let previous_weight = dba_x87_from_f32(previous_weight);
-                let current_weight = dba_x87_from_f32(current_weight);
-                let eighth = DBA_X87_EIGHTH;
-                for sample in 0..8 {
-                    let ramp = dba_x87_from_f32((sample as i32 - 8) as f32);
-                    let denom = dba_x87_sub(
-                        current_weight,
-                        dba_x87_mul(
-                            dba_x87_mul(ramp, dba_x87_sub(previous_weight, current_weight)),
-                            eighth,
-                        ),
-                    );
-                    let sum = dba_x87_add(
-                        dba_x87_from_f32(bands[1][band][sample]),
-                        dba_x87_from_f32(bands[0][band][sample]),
-                    );
-                    bands[0][band][sample] =
-                        dba_x87_store_f32(dba_x87_mul(sum, dba_x87_div(DBA_X87_ONE, denom)));
-                }
-                let reciprocal = dba_x87_div(DBA_X87_ONE, current_weight);
-                for sample in 8..256 {
-                    let sum = dba_x87_add(
-                        dba_x87_from_f32(bands[1][band][sample]),
-                        dba_x87_from_f32(bands[0][band][sample]),
-                    );
-                    bands[0][band][sample] = dba_x87_store_f32(dba_x87_mul(sum, reciprocal));
                 }
             }
         }
@@ -1701,17 +1372,8 @@ fn dba_gain_interp_scale(index: i32) -> f32 {
     f32::from_bits(bits)
 }
 
-#[cfg(not(feature = "bit-perfect"))]
 fn dba_scale_gain_sample(value: f32, scale: f32) -> f32 {
     value * scale
-}
-
-#[cfg(feature = "bit-perfect")]
-fn dba_scale_gain_sample(value: f32, scale: f32) -> f32 {
-    dba_x87_store_f32(dba_x87_mul(
-        dba_x87_from_f32(value),
-        dba_x87_from_f32(scale),
-    ))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1791,7 +1453,6 @@ fn dba_fcb_end_negative(index: i32) -> f32 {
     dba::DBA_FCB[(127 + index) as usize]
 }
 
-#[cfg(not(feature = "bit-perfect"))]
 fn dba_mdct_after_scheduled_gain(
     pre_mdct_bands: &[f32; 1024],
     gain_side_info: &[i32],
@@ -1909,148 +1570,6 @@ fn dba_mdct_after_scheduled_gain(
         for lane in 0..4 {
             scratch[group * 4 + lane] =
                 (scratch[group * 4 + lane] as f64 + scratch[1020 - group * 4 + lane] as f64) as f32;
-        }
-
-        output[group] = scratch[group * 4];
-        output[255 - group] = scratch[1020 - group * 4];
-        output[256 + group] = scratch[1021 - group * 4];
-        output[511 - group] = scratch[group * 4 + 1];
-        output[512 + group] = scratch[group * 4 + 2];
-        output[767 - group] = scratch[1022 - group * 4];
-        output[768 + group] = scratch[1023 - group * 4];
-        output[1023 - group] = scratch[group * 4 + 3];
-    }
-
-    output
-}
-
-#[cfg(feature = "bit-perfect")]
-fn dba_mdct_after_scheduled_gain(
-    pre_mdct_bands: &[f32; 1024],
-    gain_side_info: &[i32],
-    state: &mut DbaGainMdctState,
-) -> [f32; 1024] {
-    let mut scratch = [0.0f32; DBA_MDCT_SCRATCH];
-    let gains = [
-        dba::DBA_GAIN_TABLE[dba_gain_level(gain_side_info, 0)],
-        dba::DBA_GAIN_TABLE[dba_gain_level(gain_side_info, 1)],
-        dba::DBA_GAIN_TABLE[dba_gain_level(gain_side_info, 2)],
-        dba::DBA_GAIN_TABLE[dba_gain_level(gain_side_info, 3)],
-    ];
-
-    for group in 0..128 {
-        let perm = dba::DBA_MDCT_PERM[group] as usize;
-        let fr = perm * 4;
-        let fr0 = dba_x87_from_f32(dba::DBA_FRTBL[fr]);
-        let fr1 = dba_x87_from_f32(dba::DBA_FRTBL[fr + 1]);
-        let fr2 = dba_x87_from_f32(dba::DBA_FRTBL[fr + 2]);
-        let fr3 = dba_x87_from_f32(dba::DBA_FRTBL[fr + 3]);
-
-        for lane in 0..4 {
-            let gain = dba_x87_from_f32(gains[lane]);
-            let prev = dba_x87_from_f32(state.history[0x400 + group * 4 + lane]);
-            let mirrored = dba_x87_from_f32(state.history[(127 - perm) * 4 + lane]);
-            let forward = dba_x87_from_f32(state.history[0x200 + perm * 4 + lane]);
-            let folded = dba_x87_mul(dba_x87_add(dba_x87_mul(mirrored, fr0), forward), fr2);
-            let next_history = dba_x87_mul(dba_x87_sub(dba_x87_mul(forward, fr0), mirrored), fr1);
-            state.history[0x400 + group * 4 + lane] = dba_x87_store_f32(next_history);
-
-            let gain_prev = dba_x87_mul(gain, prev);
-            let high = dba_x87_mul(dba_x87_sub(folded, gain_prev), fr3);
-            scratch[group * 8 + 4 + lane] = dba_x87_store_f32(high);
-            scratch[group * 8 + lane] =
-                dba_x87_store_f32(dba_x87_add(dba_x87_add(folded, gain_prev), high));
-        }
-    }
-
-    state.history[..1024].copy_from_slice(pre_mdct_bands);
-
-    for group in 0..64 {
-        let coeff = dba_x87_from_f32(dba_fcb_from_frtbl_negative(-128 + group as i32 * 2));
-        let base = group * 16;
-        for lane in 0..4 {
-            let a = dba_x87_from_f32(scratch[base + lane]);
-            let b = dba_x87_from_f32(scratch[base + 4 + lane]);
-            let c = dba_x87_from_f32(scratch[base + 8 + lane]);
-            let d = dba_x87_from_f32(scratch[base + 12 + lane]);
-            let high = dba_x87_mul(dba_x87_sub(b, d), coeff);
-            let low = dba_x87_mul(dba_x87_sub(a, c), coeff);
-            scratch[base + 12 + lane] = dba_x87_store_f32(high);
-            scratch[base + lane] = dba_x87_store_f32(dba_x87_add(dba_x87_add(a, c), high));
-            scratch[base + 8 + lane] = dba_x87_store_f32(low);
-            scratch[base + 4 + lane] = dba_x87_store_f32(dba_x87_add(dba_x87_add(b, d), low));
-        }
-    }
-
-    let mut step = 4usize;
-    while step != 0x80 {
-        let mut coeff_index = step as i32 / 2 - 0x80;
-        let mut base = 0usize;
-        while coeff_index < 1 {
-            let stop = base + step * 4;
-            let coeff = dba_x87_from_f32(dba_fcb_end_negative(coeff_index));
-            while base != stop {
-                for lane in 0..4 {
-                    let lo = dba_x87_from_f32(scratch[base + lane]);
-                    let lo_pair = dba_x87_from_f32(scratch[base + 4 + lane]);
-                    let hi = dba_x87_from_f32(scratch[base + step * 4 + lane]);
-                    let hi_pair = dba_x87_from_f32(scratch[base + step * 4 + 4 + lane]);
-                    scratch[base + step * 4 + lane] =
-                        dba_x87_store_f32(dba_x87_mul(dba_x87_sub(lo, hi), coeff));
-                    scratch[base + step * 4 + 4 + lane] =
-                        dba_x87_store_f32(dba_x87_mul(dba_x87_sub(lo_pair, hi_pair), coeff));
-                    scratch[base + lane] = dba_x87_store_f32(dba_x87_add(lo, hi));
-                    scratch[base + 4 + lane] = dba_x87_store_f32(dba_x87_add(lo_pair, hi_pair));
-                }
-                base += 8;
-            }
-
-            let mut tail = step as i32 * 2 - 1;
-            base -= step * 4;
-            while tail > 0 {
-                let tail_base = tail as usize * 4;
-                for lane in 0..4 {
-                    scratch[base + lane] = dba_x87_store_f32(dba_x87_add(
-                        dba_x87_from_f32(scratch[base + tail_base + lane]),
-                        dba_x87_from_f32(scratch[base + lane]),
-                    ));
-                    scratch[base + 4 + lane] = dba_x87_store_f32(dba_x87_add(
-                        dba_x87_from_f32(scratch[base + tail_base + lane - 4]),
-                        dba_x87_from_f32(scratch[base + 4 + lane]),
-                    ));
-                    scratch[base + 8 + lane] = dba_x87_store_f32(dba_x87_add(
-                        dba_x87_from_f32(scratch[base + tail_base + lane - 8]),
-                        dba_x87_from_f32(scratch[base + 8 + lane]),
-                    ));
-                    scratch[base + 12 + lane] = dba_x87_store_f32(dba_x87_add(
-                        dba_x87_from_f32(scratch[base + tail_base + lane - 12]),
-                        dba_x87_from_f32(scratch[base + 12 + lane]),
-                    ));
-                }
-                base += 16;
-                tail -= 8;
-            }
-
-            base += step * 4;
-            coeff_index += step as i32;
-        }
-        step *= 2;
-    }
-
-    for idx in 0..512 {
-        let a = dba_x87_from_f32(scratch[idx]);
-        let b = dba_x87_from_f32(scratch[512 + idx]);
-        scratch[idx] = dba_x87_store_f32(dba_x87_add(a, b));
-        scratch[512 + idx] = dba_x87_store_f32(dba_x87_mul(dba_x87_sub(a, b), DBA_X87_INV_SQRT_2));
-    }
-
-    let mut output = [0.0f32; 1024];
-    for group in 0..128 {
-        for lane in 0..4 {
-            scratch[group * 4 + lane] = dba_x87_store_f32(dba_x87_add(
-                dba_x87_from_f32(scratch[group * 4 + lane]),
-                dba_x87_from_f32(scratch[1020 - group * 4 + lane]),
-            ));
         }
 
         output[group] = scratch[group * 4];
@@ -2316,36 +1835,16 @@ fn dba_tone_scale(idsf: i32, idwl: i32) -> f32 {
     )
 }
 
-#[cfg(not(feature = "bit-perfect"))]
 fn dba_tone_inverse(scale: f32) -> f32 {
     1.0f32 / scale
 }
 
-#[cfg(feature = "bit-perfect")]
-fn dba_tone_inverse(scale: f32) -> Ext80 {
-    dba_x87_div(DBA_X87_ONE, dba_x87_from_f32(scale))
-}
-
-#[cfg(not(feature = "bit-perfect"))]
 fn dba_tone_sub_quantized(sample: f32, quantized: i32, inverse: f32) -> f32 {
     sample - quantized as f32 * inverse
 }
 
-#[cfg(feature = "bit-perfect")]
-fn dba_tone_sub_quantized(sample: f32, quantized: i32, inverse: Ext80) -> f32 {
-    let restored = dba_x87_mul(Ext80::from_i32_exact(quantized), inverse);
-    dba_x87_store_f32(dba_x87_sub(dba_x87_from_f32(sample), restored))
-}
-
-#[cfg(not(feature = "bit-perfect"))]
 fn dba_tone_add_quantized(sample: f32, quantized: i32, inverse: f32) -> f32 {
     sample + quantized as f32 * inverse
-}
-
-#[cfg(feature = "bit-perfect")]
-fn dba_tone_add_quantized(sample: f32, quantized: i32, inverse: Ext80) -> f32 {
-    let restored = dba_x87_mul(Ext80::from_i32_exact(quantized), inverse);
-    dba_x87_store_f32(dba_x87_add(dba_x87_from_f32(sample), restored))
 }
 
 fn dba_restore_tone(residual: &mut [f32], component: DbaToneComponent, idwl: i32, width: i32) {

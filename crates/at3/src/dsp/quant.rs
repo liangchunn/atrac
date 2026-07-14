@@ -41,7 +41,7 @@ pub const NUM_SPECS: usize = 1024;
 /// `scfof_id_at3` (`0x6560c`): IDSF → scale factor (f32).
 ///
 /// Returns `SCALE_FACTOR_TABLE[id]` for `id < 64`, else −65536.0.
-/// The x87 `longdouble` return is mirrored as `f64`.
+/// The original extended-precision return is represented as `f64`.
 #[inline]
 pub fn scfof_id_at3(id: u32) -> f64 {
     if id < 64 {
@@ -127,8 +127,8 @@ pub fn twidof_id_at3(idwl: u32) -> i32 {
 
 /// `abs_max` (`0x69290`): max |f32| over a slice.
 ///
-/// Returns 0.0 for empty slices. The x87 `longdouble` return is mirrored
-/// as `f64`.
+/// Returns 0.0 for empty slices. The original extended-precision return is
+/// represented as `f64`.
 #[inline]
 pub fn abs_max(specs: &[f32]) -> f64 {
     let mut max = 0.0f32;
@@ -156,8 +156,8 @@ pub fn npower(base: i32, exp: i32) -> i32 {
 /// `QUANT(val, sf, nsteps) = trunc((nsteps + 0.5) * (val / sf) + 31.5) - 31`,
 /// clamped to `[-nsteps, nsteps]`.
 ///
-/// Uses x87 truncation mode (toward zero), matching the `fldcw` + `fistp`
-/// sequence at `0x691ce..0x691e1`.
+/// Uses truncation toward zero, matching the instruction sequence at
+/// `0x691ce..0x691e1`.
 #[inline]
 fn clamp_mantissa(mut q: i32, nsteps: i32) -> i32 {
     if nsteps < q {

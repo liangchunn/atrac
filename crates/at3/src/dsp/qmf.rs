@@ -16,14 +16,10 @@
 //! lower[k] = (lo + hi) as f32
 //! upper[k] = (lo - hi) as f32
 //! ```
-//! where `buf = [history (46 f32)][input (N f32)]`. Default builds use `f64`
-//! accumulation as the empirically closest fast path. `bit-perfect` builds use
-//! the software x87 scalar path and the binary's reverse grouped tap order.
+//! where `buf = [history (46 f32)][input (N f32)]`. The implementation uses
+//! `f64` accumulation as the empirically closest fast path.
 
 use crate::tables::QMF_WINDOW;
-
-#[cfg(feature = "bit-perfect")]
-use crate::dsp::x87::{RoundingMode, X87Control, X87Real as Ext80};
 
 const HISTORY: usize = 46;
 const TAPS: usize = 48;
@@ -64,39 +60,6 @@ impl QmfSplit {
     }
 }
 
-#[cfg(feature = "bit-perfect")]
-fn qmf_outputs(buf: &[f32], base: usize) -> (f32, f32) {
-    const CONTROL: X87Control = X87Control {
-        rounding: RoundingMode::NearestEven,
-    };
-
-    let mut lo = Ext80::zero(false);
-    let mut hi = Ext80::zero(false);
-    let mut j = TAPS - 1;
-    loop {
-        lo = x87_mul_add(lo, buf[base + j], QMF_WINDOW[j], CONTROL);
-        lo = x87_mul_add(lo, buf[base + j - 2], QMF_WINDOW[j - 2], CONTROL);
-        hi = x87_mul_add(hi, buf[base + j - 1], QMF_WINDOW[j - 1], CONTROL);
-        hi = x87_mul_add(hi, buf[base + j - 3], QMF_WINDOW[j - 3], CONTROL);
-        if j == 3 {
-            break;
-        }
-        j -= 4;
-    }
-
-    (
-        lo.fadd(hi, CONTROL).to_f32(RoundingMode::NearestEven),
-        lo.fsub(hi, CONTROL).to_f32(RoundingMode::NearestEven),
-    )
-}
-
-#[cfg(feature = "bit-perfect")]
-fn x87_mul_add(acc: Ext80, sample: f32, coeff: f32, control: X87Control) -> Ext80 {
-    let product = Ext80::from_f32_exact(sample).fmul(Ext80::from_f32_exact(coeff), control);
-    acc.fadd(product, control)
-}
-
-#[cfg(not(feature = "bit-perfect"))]
 fn qmf_outputs(buf: &[f32], base: usize) -> (f32, f32) {
     let mut lo = 0.0_f64;
     let mut hi = 0.0_f64;

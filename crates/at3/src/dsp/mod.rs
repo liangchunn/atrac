@@ -13,4 +13,3 @@ pub mod qmf;
 pub mod quant;
 pub mod tone;
 pub mod transient;
-pub mod x87;

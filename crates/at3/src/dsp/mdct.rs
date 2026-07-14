@@ -20,8 +20,8 @@
 //!
 //! verified against `winormal_mdct_256` to within `f32`
 //! precision (max abs error < 1e-9). The FFT-based decomposition uses
-//! `rustfft` with `f64` accumulation to mirror the x87 extended-precision
-//! evaluation in the original library.
+//! `rustfft` with `f64` accumulation to approximate the extended-precision
+//! evaluation of the original library.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -29,10 +29,8 @@ use std::sync::Arc;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
-#[cfg(feature = "bit-perfect")]
-use crate::dsp::x87::{RoundingMode, X87Control, X87Real as Ext80};
 use crate::tables::FORWARD_WINDOW;
-#[cfg(any(feature = "bit-perfect", feature = "mdct-disasm"))]
+#[cfg(feature = "mdct-disasm")]
 use crate::tables::mdct::{
     FFT_BITREV128, FFT_WX_128, FFT_WY_128, MDCT_A0_256, MDCT_A1_256, MDCT_A2_256, MDCT_A3_256,
     MDCT_C0_256, MDCT_S0_256,
@@ -41,23 +39,13 @@ use crate::tables::mdct::{
 const MDCT_SIZE: usize = 512;
 const OUTPUT_SIZE: usize = 256;
 const FFT_SIZE: usize = 128;
-#[cfg_attr(
-    any(feature = "bit-perfect", feature = "mdct-disasm"),
-    allow(dead_code)
-)]
+#[cfg_attr(feature = "mdct-disasm", allow(dead_code))]
 const SCALE: f64 = 1.0 / 128.0;
 
-#[cfg(feature = "bit-perfect")]
-const X87_CONTROL: X87Control = X87Control {
-    rounding: RoundingMode::NearestEven,
-};
-#[cfg(any(feature = "bit-perfect", feature = "mdct-disasm"))]
+#[cfg(feature = "mdct-disasm")]
 const MDCT_SCALE_F32: f32 = f32::from_bits(0x3c00_0000);
 
-#[cfg_attr(
-    any(feature = "bit-perfect", feature = "mdct-disasm"),
-    allow(dead_code)
-)]
+#[cfg_attr(feature = "mdct-disasm", allow(dead_code))]
 struct MdctTwiddles {
     cos: Vec<f64>,
     sin: Vec<f64>,
@@ -77,10 +65,7 @@ impl MdctTwiddles {
     }
 }
 
-#[cfg_attr(
-    any(feature = "bit-perfect", feature = "mdct-disasm"),
-    allow(dead_code)
-)]
+#[cfg_attr(feature = "mdct-disasm", allow(dead_code))]
 pub struct Mdct512 {
     fft: Arc<dyn Fft<f64>>,
     fft_scratch: Vec<Complex<f64>>,
@@ -117,17 +102,12 @@ impl Mdct512 {
         output: &mut [f32; OUTPUT_SIZE],
         parity: u32,
     ) {
-        #[cfg(feature = "bit-perfect")]
-        {
-            self.transform_bitperfect(input, output, parity);
-        }
-
-        #[cfg(all(not(feature = "bit-perfect"), feature = "mdct-disasm"))]
+        #[cfg(feature = "mdct-disasm")]
         {
             self.transform_disasm(input, output, parity);
         }
 
-        #[cfg(all(not(feature = "bit-perfect"), not(feature = "mdct-disasm")))]
+        #[cfg(not(feature = "mdct-disasm"))]
         {
             for n in 0..MDCT_SIZE {
                 self.windowed[n] = input[n] as f64 * FORWARD_WINDOW[n] as f64;
@@ -179,7 +159,7 @@ impl Mdct512 {
         }
     }
 
-    #[cfg(all(not(feature = "bit-perfect"), feature = "mdct-disasm"))]
+    #[cfg(feature = "mdct-disasm")]
     fn transform_disasm(
         &mut self,
         input: &[f32; MDCT_SIZE],
@@ -285,135 +265,6 @@ impl Mdct512 {
             output[i] = MDCT_SCALE_F32 * src;
         }
     }
-
-    #[cfg(feature = "bit-perfect")]
-    fn transform_bitperfect(
-        &mut self,
-        input: &[f32; MDCT_SIZE],
-        output: &mut [f32; OUTPUT_SIZE],
-        parity: u32,
-    ) {
-        let mut tmp = [0.0f32; OUTPUT_SIZE];
-        let mut real = [0.0f32; FFT_SIZE];
-        let mut imag = [0.0f32; FFT_SIZE];
-
-        for i in 0..64 {
-            let left = x87_mul_f32(input[384 + 2 * i], FORWARD_WINDOW[384 + 2 * i]).fneg();
-            let right = x87_mul_f32(FORWARD_WINDOW[383 - 2 * i], input[383 - 2 * i]);
-            tmp[i] = x87_store_f32(left.fsub(right, X87_CONTROL));
-        }
-
-        for i in 0..128 {
-            let left = x87_mul_f32(FORWARD_WINDOW[2 * i], input[2 * i]);
-            let right = x87_mul_f32(FORWARD_WINDOW[255 - 2 * i], input[255 - 2 * i]);
-            tmp[64 + i] = x87_store_f32(left.fsub(right, X87_CONTROL));
-        }
-
-        for i in 0..64 {
-            let left = x87_mul_f32(FORWARD_WINDOW[256 + 2 * i], input[256 + 2 * i]);
-            let right = x87_mul_f32(FORWARD_WINDOW[511 - 2 * i], input[511 - 2 * i]);
-            tmp[192 + i] = x87_store_f32(left.fadd(right, X87_CONTROL));
-        }
-
-        for i in 0..FFT_SIZE {
-            let even = tmp[2 * i];
-            let odd = tmp[2 * i + 1];
-            let r0 = x87_mul_f32(even, MDCT_C0_256[i]);
-            let r1 = x87_mul_f32(odd, MDCT_S0_256[i]);
-            real[i] = x87_store_f32(r0.fsub(r1, X87_CONTROL));
-
-            let i0 = x87_mul_f32(odd, MDCT_C0_256[i]);
-            let i1 = x87_mul_f32(even, MDCT_S0_256[i]);
-            imag[i] = x87_store_f32(i0.fadd(i1, X87_CONTROL));
-        }
-
-        let mut seen = [false; FFT_SIZE];
-        for i in 0..FFT_SIZE {
-            if !seen[i] {
-                let j = FFT_BITREV128[i] as usize;
-                real.swap(i, j);
-                imag.swap(i, j);
-                seen[j] = true;
-            }
-        }
-
-        let mut twiddle_step = 64usize;
-        let mut group_size = 2usize;
-        for _ in 0..7 {
-            let half = group_size >> 1;
-            let mut left = 0usize;
-            let mut right = half;
-            for _ in 0..twiddle_step {
-                let mut twiddle = 0usize;
-                for _ in 0..half {
-                    let right_re = real[right];
-                    let right_im = imag[right];
-                    let t_re = x87_mul_f32(right_re, FFT_WX_128[twiddle])
-                        .fsub(x87_mul_f32(right_im, FFT_WY_128[twiddle]), X87_CONTROL);
-                    real[right] = x87_store_f32(x87_load_f32(real[left]).fsub(t_re, X87_CONTROL));
-
-                    let t_im = x87_mul_f32(right_re, FFT_WY_128[twiddle])
-                        .fadd(x87_mul_f32(right_im, FFT_WX_128[twiddle]), X87_CONTROL);
-                    imag[right] = x87_store_f32(x87_load_f32(imag[left]).fsub(t_im, X87_CONTROL));
-
-                    real[left] = x87_store_f32(t_re.fadd(x87_load_f32(real[left]), X87_CONTROL));
-                    imag[left] = x87_store_f32(t_im.fadd(x87_load_f32(imag[left]), X87_CONTROL));
-
-                    twiddle += twiddle_step;
-                    left += 1;
-                    right += 1;
-                }
-                left += half;
-                right += half;
-            }
-            twiddle_step >>= 1;
-            group_size <<= 1;
-        }
-
-        for i in 0..FFT_SIZE {
-            let rev = FFT_SIZE - 1 - i;
-            let real_i = real[i];
-            let real_rev = real[rev];
-            let imag_i = imag[i];
-            let imag_rev = imag[rev];
-
-            let out0 = x87_mul_f32(real_rev, MDCT_A1_256[i])
-                .fadd(x87_mul_f32(real_i, MDCT_A0_256[i]), X87_CONTROL)
-                .fadd(x87_mul_f32(imag_i, MDCT_A2_256[i]), X87_CONTROL)
-                .fadd(x87_mul_f32(imag_rev, MDCT_A3_256[i]), X87_CONTROL);
-            tmp[i] = x87_store_f32(out0);
-
-            let out1 = x87_mul_f32(real_i, MDCT_A2_256[i])
-                .fsub(x87_mul_f32(real_rev, MDCT_A3_256[i]), X87_CONTROL)
-                .fsub(x87_mul_f32(imag_i, MDCT_A0_256[i]), X87_CONTROL)
-                .fadd(x87_mul_f32(imag_rev, MDCT_A1_256[i]), X87_CONTROL);
-            tmp[OUTPUT_SIZE - 1 - i] = x87_store_f32(out1);
-        }
-
-        for i in 0..OUTPUT_SIZE {
-            let src = if parity == 1 {
-                tmp[OUTPUT_SIZE - 1 - i]
-            } else {
-                tmp[i]
-            };
-            output[i] = x87_store_f32(x87_mul_f32(MDCT_SCALE_F32, src));
-        }
-    }
-}
-
-#[cfg(feature = "bit-perfect")]
-fn x87_load_f32(value: f32) -> Ext80 {
-    Ext80::from_f32_exact(value)
-}
-
-#[cfg(feature = "bit-perfect")]
-fn x87_store_f32(value: Ext80) -> f32 {
-    value.to_f32(RoundingMode::NearestEven)
-}
-
-#[cfg(feature = "bit-perfect")]
-fn x87_mul_f32(lhs: f32, rhs: f32) -> Ext80 {
-    x87_load_f32(lhs).fmul(x87_load_f32(rhs), X87_CONTROL)
 }
 
 impl Default for Mdct512 {
