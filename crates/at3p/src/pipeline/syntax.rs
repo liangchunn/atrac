@@ -16,7 +16,7 @@ const MAX_QUANT_UNITS: usize = 32;
 pub(crate) struct FrameSyntax {
     frame_bytes: usize,
     groups: Vec<BlockGroupSyntax>,
-    reference_backing: FramePrepackerState,
+    reference_backing: Option<FramePrepackerState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -524,6 +524,7 @@ pub enum FrameSyntaxError {
         actual: usize,
     },
     EmptyFrame,
+    MissingReferenceBacking,
 }
 
 impl From<FrameAssemblyError> for FrameSyntaxError {
@@ -839,7 +840,26 @@ impl FrameSyntax {
         let syntax = Self {
             frame_bytes: reference.frame_bytes,
             groups,
-            reference_backing: reference.clone(),
+            reference_backing: Some(reference.clone()),
+        };
+        if syntax.groups.len() != reference.block_count {
+            return Err(FrameSyntaxError::GroupCount {
+                declared: reference.block_count,
+                actual: syntax.groups.len(),
+            });
+        }
+        syntax.validate()?;
+        Ok(syntax)
+    }
+
+    pub(crate) fn from_parts(
+        frame_bytes: usize,
+        groups: Vec<BlockGroupSyntax>,
+    ) -> Result<Self, FrameSyntaxError> {
+        let syntax = Self {
+            frame_bytes,
+            groups,
+            reference_backing: None,
         };
         syntax.validate()?;
         Ok(syntax)
@@ -849,25 +869,7 @@ impl FrameSyntax {
         if self.frame_bytes == 0 {
             return Err(FrameSyntaxError::EmptyFrame);
         }
-        if self.groups.len() != self.reference_backing.block_count {
-            return Err(FrameSyntaxError::GroupCount {
-                declared: self.reference_backing.block_count,
-                actual: self.groups.len(),
-            });
-        }
-        for (group_index, (syntax, reference)) in self
-            .groups
-            .iter()
-            .zip(&self.reference_backing.groups)
-            .enumerate()
-        {
-            if syntax.channels.len() != reference.nblk {
-                return Err(FrameSyntaxError::ChannelCount {
-                    group: group_index,
-                    declared: reference.nblk,
-                    actual: syntax.channels.len(),
-                });
-            }
+        for (group_index, syntax) in self.groups.iter().enumerate() {
             if !(1..=2).contains(&syntax.channels.len()) {
                 return Err(FrameSyntaxError::UnsupportedChannelCount {
                     group: group_index,
@@ -1090,7 +1092,9 @@ impl FrameSyntax {
 
     pub(crate) fn to_reference(&self) -> Result<FramePrepackerState, FrameSyntaxError> {
         self.validate()?;
-        Ok(self.reference_backing.clone())
+        self.reference_backing
+            .clone()
+            .ok_or(FrameSyntaxError::MissingReferenceBacking)
     }
 
     pub(crate) fn frame_bytes(&self) -> usize {
@@ -1103,6 +1107,22 @@ impl FrameSyntax {
 }
 
 impl BlockGroupSyntax {
+    pub(crate) fn new(
+        header: BlockHeaderSyntax,
+        channels: Vec<ChannelSyntax>,
+        stereo: Option<StereoSyntax>,
+        post_payload: Option<[u8; 2]>,
+        gha: GhaSyntax,
+    ) -> Self {
+        Self {
+            header,
+            channels,
+            stereo,
+            post_payload,
+            gha,
+        }
+    }
+
     pub(crate) fn header(&self) -> BlockHeaderSyntax {
         self.header
     }
@@ -2248,6 +2268,19 @@ mod tests {
             IdctCountSyntax::Explicit(12)
         );
         assert_eq!(syntax.to_reference().unwrap(), reference);
+    }
+
+    #[test]
+    fn owned_syntax_does_not_require_native_layout_backing() {
+        let reference = reference_state();
+        let adapted = FrameSyntax::from_reference(&reference).unwrap();
+        let owned = FrameSyntax::from_parts(adapted.frame_bytes, adapted.groups.clone()).unwrap();
+
+        assert_eq!(owned.groups(), adapted.groups());
+        assert_eq!(
+            owned.to_reference(),
+            Err(FrameSyntaxError::MissingReferenceBacking)
+        );
     }
 
     #[test]
