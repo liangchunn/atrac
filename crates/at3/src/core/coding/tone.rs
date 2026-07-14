@@ -47,7 +47,7 @@
 //! 0x4c..0x21c tone_components int32[~112] (pointers/refs to tone entries)
 //! ```
 
-use crate::dsp::quant::{
+use crate::core::coding::quant::{
     HuffTableSet, abs_max, huffbits, idscfof_absval_at3, idscfof_val_at3, nstepsof_idwl_at3,
     quant_at3, scfof_id_at3, twidof_id_at3,
 };
@@ -722,7 +722,7 @@ pub fn set_cuidsf_from_spec(specs: &[f32], descriptors: &mut [BinDescriptor], co
 /// `set_quidsf_from_cuidsf` (`0x67f5c`): propagates per-bin IDSF to
 /// per-BFU quantized IDSF.
 pub fn set_quidsf_from_cuidsf(descriptors: &[BinDescriptor], idsf_out: &mut [i32], count: i32) {
-    use crate::dsp::quant::ispof_iqt_at3;
+    use crate::core::coding::quant::ispof_iqt_at3;
 
     let mut i = 0i32;
     while i < count {

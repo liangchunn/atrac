@@ -1,4 +1,4 @@
-//! Quantization helper functions reproduced from `libatrac.so.1.2.0`.
+//! Quantization and bit-allocation helpers reproduced from `libatrac.so.1.2.0`.
 //!
 //! These are the small leaf functions used by both the tone-extraction path
 //! (milestone #5) and the full quantization/bit-allocation path (milestones

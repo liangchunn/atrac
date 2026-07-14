@@ -1,8 +1,8 @@
 //! Transient detection and gain curve construction for ATRAC3.
 //!
-//! Ports the codex `dsp::transient` module, adapted to the libatrac
+//! Ports the transient-analysis module, adapted to the libatrac
 //! constants. This is separate from the libatrac-compatible gain-control
-//! schedule-generation path in `dsp::gain`.
+//! schedule-generation path in `analysis::gain`.
 //!
 //! Key components:
 //! - `TransientDetector`: HP-filter + RMS-based transient flagging.
@@ -11,7 +11,7 @@
 //! - `calc_curve`: builds `GainCurvePoint`s from the analyzed gain envelope
 //!   using plateau detection, median filtering, and boundary scoring.
 
-use crate::dsp::gain::{EXPONENT_OFFSET, GainPoint, MAX_GAIN_POINTS};
+use crate::analysis::gain::{EXPONENT_OFFSET, GainPoint, MAX_GAIN_POINTS};
 
 const PREV_BUF_SZ: usize = 20;
 const FIR_LEN: usize = 21;

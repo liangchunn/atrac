@@ -21,6 +21,17 @@ pub(crate) struct DbaPackFrame<'a> {
     pub(crate) chconv_abs_modes: [i32; 4],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DbaPackError {
+    MissingToneBank,
+    MissingToneCodebook,
+    MissingToneComponent,
+    MissingToneSymbol,
+    InvalidSpectralPresence,
+    MissingSpectralCodebook,
+    MissingSpectralSymbol,
+}
+
 fn hcspec_code_len(entry: u32) -> (u32, u32) {
     let len = entry >> 16;
     let code = entry & 0xffff;
@@ -84,10 +95,10 @@ fn dba_pack_tones(
     coding_layout: i32,
     buffer: &mut [u8],
     bit_pos: &mut u32,
-) -> Result<(), i32> {
+) -> Result<(), DbaPackError> {
     for bank_idx in 0..tone_mode {
         let Some(bank) = table.banks.get(bank_idx) else {
-            return Err(-1);
+            return Err(DbaPackError::MissingToneBank);
         };
         let mut active = bank.active_quarters[0];
         for idx in 1..ntones {
@@ -98,7 +109,7 @@ fn dba_pack_tones(
 
         let huff = dba::dba_hcspec_packed_table(bank.idwl, coding_layout);
         if huff.is_empty() {
-            return Err(-1);
+            return Err(DbaPackError::MissingToneCodebook);
         }
         for group_idx in 0..ntones * 4 {
             if bank.active_quarters[group_idx >> 2] == 0 {
@@ -108,14 +119,14 @@ fn dba_pack_tones(
             pack_store_from_msb(group.len() as u32, 3, buffer, bit_pos);
             for &slot in group {
                 let Some(component) = table.components.get(slot) else {
-                    return Err(-1);
+                    return Err(DbaPackError::MissingToneComponent);
                 };
                 pack_store_from_msb(component.idsf as u32, 6, buffer, bit_pos);
                 pack_store_from_msb((component.position as u32) & 0x3f, 6, buffer, bit_pos);
                 for idx in 0..=bank.width as usize {
                     let value = component.quantized[idx] as usize;
                     let Some(&entry) = huff.get(value) else {
-                        return Err(-1);
+                        return Err(DbaPackError::MissingToneSymbol);
                     };
                     write_hcspec(entry, buffer, bit_pos);
                 }
@@ -129,7 +140,7 @@ fn dba_pack_spectrum(
     data: &DbaAt3DataResult,
     buffer: &mut [u8],
     bit_pos: &mut u32,
-) -> Result<(), i32> {
+) -> Result<(), DbaPackError> {
     pack_store_from_msb((data.nunits * 2 - 2) as u32, 6, buffer, bit_pos);
     for band in 0..data.nunits as usize {
         pack_store_from_msb(data.presence[band] as u32, 3, buffer, bit_pos);
@@ -168,15 +179,15 @@ fn dba_pack_spectrum(
         } else {
             let huff = dba::dba_hcspec_table(presence);
             let Some(&mask) = dba::DBA_HUF_MASK.get((presence - 2) as usize) else {
-                return Err(-1);
+                return Err(DbaPackError::InvalidSpectralPresence);
             };
             if huff.is_empty() {
-                return Err(-1);
+                return Err(DbaPackError::MissingSpectralCodebook);
             }
             for &sample in &data.residual_spectrum[start..end] {
                 let value = (dba_quantized(sample, scale) & mask) as usize;
                 let Some(&entry) = huff.get(value) else {
-                    return Err(-1);
+                    return Err(DbaPackError::MissingSpectralSymbol);
                 };
                 write_hcspec(entry, buffer, bit_pos);
             }
@@ -190,7 +201,7 @@ pub(crate) fn dba_pack_channel(
     chconv_abs_modes: [i32; 4],
     buffer: &mut [u8],
     byte_offset: usize,
-) -> Result<usize, i32> {
+) -> Result<usize, DbaPackError> {
     let ntones = channel.data.ntones.max(0) as usize;
     let tone_mode = channel.data.tone_mode.max(0) as usize;
     let mut header_offset = byte_offset;
@@ -227,7 +238,10 @@ pub(crate) fn dba_pack_channel(
     Ok(((bit_pos + 7) >> 3) as usize)
 }
 
-pub(crate) fn dba_pack_frame(frame: DbaPackFrame<'_>, buffer: &mut [u8]) -> Result<(), i32> {
+pub(crate) fn dba_pack_frame(
+    frame: DbaPackFrame<'_>,
+    buffer: &mut [u8],
+) -> Result<(), DbaPackError> {
     buffer.fill(0);
     let mut byte_offset = 0usize;
     for (channel_idx, channel) in frame.channels.iter().enumerate() {

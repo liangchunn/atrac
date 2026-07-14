@@ -1,4 +1,5 @@
-use crate::dsp::quant::ispof_iqt_at3;
+use crate::config::{Atrac3Profile, EncoderStrategy};
+use crate::core::coding::quant::ispof_iqt_at3;
 use crate::tables::dba;
 use crate::tables::dba::{DBA_HUF_MASK, DBA_NBITS_WL2_QUAD, DBA_NORM_FACT, DBA_SCALE_LOOKUP};
 use crate::tables::{NSPS1024_TABLE, QTSTART_TABLE};
@@ -796,8 +797,33 @@ pub(crate) struct DbaFrameEncoder {
     gain_mdct: [DbaGainMdctChannelState; 2],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DbaFrameError {
+    OutputTooSmall { needed: usize, actual: usize },
+    MissingGainResult { channel: usize },
+    Packing(crate::core::dba_bitstream::DbaPackError),
+}
+
+impl From<crate::core::dba_bitstream::DbaPackError> for DbaFrameError {
+    fn from(error: crate::core::dba_bitstream::DbaPackError) -> Self {
+        Self::Packing(error)
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 impl DbaFrameEncoder {
+    pub(crate) fn for_profile(profile: Atrac3Profile) -> Option<Self> {
+        if profile.strategy() != EncoderStrategy::Dba {
+            return None;
+        }
+        let config = match (profile.bitrate_kbps(), profile.channels()) {
+            (52, 1) | (105, 2) => DbaFrameConfig::sony_105_stereo(),
+            (66, 2) => DbaFrameConfig::sony_66_stereo(),
+            _ => return None,
+        };
+        Some(Self::new(config))
+    }
+
     pub(crate) fn new(config: DbaFrameConfig) -> Self {
         let chconv_threshold = if config.js_enabled { 1 } else { -1 };
         Self {
@@ -812,9 +838,12 @@ impl DbaFrameEncoder {
         &mut self,
         pcm: &[&[f32; 1024]; 2],
         output: &mut [u8],
-    ) -> Result<(), i32> {
+    ) -> Result<(), DbaFrameError> {
         if output.len() < self.config.frame_bytes {
-            return Err(-1);
+            return Err(DbaFrameError::OutputTooSmall {
+                needed: self.config.frame_bytes,
+                actual: output.len(),
+            });
         }
         output[..self.config.frame_bytes].fill(0);
 
@@ -895,8 +924,8 @@ impl DbaFrameEncoder {
         channel: usize,
         output: &mut [u8],
         byte_offset: usize,
-    ) -> Result<usize, i32> {
-        crate::core::dba_bitstream::dba_pack_channel(
+    ) -> Result<usize, DbaFrameError> {
+        Ok(crate::core::dba_bitstream::dba_pack_channel(
             &crate::core::dba_bitstream::DbaPackChannel {
                 data,
                 gain_side_info_ext: &gain.gain_side_info_ext,
@@ -906,16 +935,16 @@ impl DbaFrameEncoder {
             self.chconv.abs_modes,
             output,
             byte_offset,
-        )
+        )?)
     }
 
     fn encode_js_frame(
         &self,
         gain_results: [Option<DbaGainMdctFrameResult>; 2],
         output: &mut [u8],
-    ) -> Result<(), i32> {
+    ) -> Result<(), DbaFrameError> {
         let [Some(gain0), Some(gain1)] = gain_results else {
-            return Err(-1);
+            return Err(DbaFrameError::MissingGainResult { channel: 0 });
         };
         let fixed_splice = dba_gain_event_counts(&gain1.gain_side_info_ext)[0];
         let ch0_available = dba_mainsub(DbaMainsubParams {
@@ -943,10 +972,10 @@ impl DbaFrameEncoder {
         &self,
         gain_results: [Option<DbaGainMdctFrameResult>; 2],
         output: &mut [u8],
-    ) -> Result<(), i32> {
+    ) -> Result<(), DbaFrameError> {
         for (channel, gain) in gain_results.into_iter().enumerate() {
             let Some(gain) = gain else {
-                return Err(-1);
+                return Err(DbaFrameError::MissingGainResult { channel });
             };
             let data =
                 self.at3data_or_fallback(&gain, channel, self.config.base_available_bits[channel]);

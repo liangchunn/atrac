@@ -1,4 +1,4 @@
-//! MDCT-512 forward transform matching `winormal_mdct_256` (`0x69a08`) in
+//! MDCT-512 analysis transform matching `winormal_mdct_256` (`0x69a08`) in
 //! `libatrac.so.1.2.0`.
 //!
 //! `forward_transform_at3` (`0x6b318`) loops over 4 QMF bands. For each band
@@ -319,7 +319,7 @@ impl Atrac3ForwardTransform {
         &mut self,
         bands: &[&[f32; BAND_SAMPLES]; BAND_COUNT],
         spectra: &mut [&mut [f32; SPECTRA_SIZE]; BAND_COUNT],
-        gain: Option<&crate::dsp::gain::SubbandInfo>,
+        gain: Option<&crate::analysis::gain::SubbandInfo>,
     ) {
         const PARITY: [u32; BAND_COUNT] = [0, 1, 0, 1];
         let mut block = [0.0f32; MDCT_SIZE];
@@ -327,13 +327,13 @@ impl Atrac3ForwardTransform {
             let modulated = match gain.filter(|g| !g.is_band_empty(b)) {
                 Some(g) => {
                     let mut scales = [0.0f32; MDCT_SIZE];
-                    let ok = crate::dsp::gain::GainProcessor::compute_scales(
+                    let ok = crate::analysis::gain::GainProcessor::compute_scales(
                         &g.current[b],
                         &g.next[b],
                         &mut scales,
                     );
                     if ok {
-                        crate::dsp::gain::GainProcessor::modulate(
+                        crate::analysis::gain::GainProcessor::modulate(
                             &self.overlap[b],
                             bands[b],
                             &scales,

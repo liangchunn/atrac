@@ -4,11 +4,11 @@
 //! WAV decoding and filesystem policy stay outside this crate; the streaming
 //! encoder writes its ATRAC3 container to a caller-provided `Write` sink.
 
+#[allow(dead_code)]
+mod analysis;
 mod config;
 #[allow(dead_code)]
 mod core;
-#[allow(dead_code)]
-mod dsp;
 mod encoder;
 #[allow(dead_code, unused_imports)]
 mod tables;

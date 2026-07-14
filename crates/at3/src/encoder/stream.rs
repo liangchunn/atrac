@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 use crate::config::{Atrac3Profile, EncoderStrategy, UnsupportedProfile};
-use crate::core::clean::Atrac3Encoder;
+use crate::core::{EncoderCore, FrameEncodeError, PcmFrame};
 
 pub const PCM_BLOCK_FRAMES: usize = 1024;
 const SAMPLE_RATE: u32 = 44_100;
@@ -47,6 +47,10 @@ pub enum Atrac3StreamError {
         payload_bytes: u64,
     },
     SilenceFrame,
+    FrameOutputTooSmall {
+        needed: usize,
+        actual: usize,
+    },
     WrongChannelCount {
         expected: usize,
         actual: usize,
@@ -90,6 +94,10 @@ impl fmt::Display for Atrac3StreamError {
                 "ATRAC3 output is too large for a RIFF/WAVE container ({payload_bytes} payload bytes)"
             ),
             Self::SilenceFrame => write!(f, "failed to build fallback silence frame"),
+            Self::FrameOutputTooSmall { needed, actual } => write!(
+                f,
+                "ATRAC3 frame output buffer has {actual} bytes; need {needed}"
+            ),
             Self::WrongChannelCount { expected, actual } => {
                 write!(f, "expected {expected} PCM channel(s), got {actual}")
             }
@@ -155,7 +163,7 @@ pub struct Atrac3StreamSummary {
 
 pub struct Atrac3StreamEncoder<W: Write> {
     writer: W,
-    encoder: Atrac3Encoder,
+    encoder: EncoderCore,
     profile: Atrac3Profile,
     sample_frames: u32,
     sound_units: usize,
@@ -169,6 +177,23 @@ pub struct Atrac3StreamEncoder<W: Write> {
     written_payload_bytes: u64,
     encoded_frames: u32,
     fallback_frames: u32,
+    frame_failure_policy: FrameFailurePolicy,
+}
+
+/// Stream-level decision applied after a typed core failure. The default
+/// preserves the historical ATRAC3 silence-frame substitution behavior while
+/// keeping capacity/programming failures fatal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameFailurePolicy {
+    SubstituteSilenceForCodecFailure,
+}
+
+impl FrameFailurePolicy {
+    fn substitutes(self, error: FrameEncodeError) -> bool {
+        match self {
+            Self::SubstituteSilenceForCodecFailure => error.is_silence_fallback_eligible(),
+        }
+    }
 }
 
 impl<W: Write> Atrac3StreamEncoder<W> {
@@ -180,7 +205,7 @@ impl<W: Write> Atrac3StreamEncoder<W> {
         if sample_frames == 0 {
             return Err(Atrac3StreamError::EmptyInput);
         }
-        let encoder = Atrac3Encoder::new(profile);
+        let encoder = EncoderCore::new(profile);
         let sound_units = sound_units_to_encode(sample_frames as usize, profile);
         let payload_frames = sound_units - profile.priming_sound_units();
         let expected_payload_bytes = (payload_frames as u64)
@@ -229,6 +254,7 @@ impl<W: Write> Atrac3StreamEncoder<W> {
             written_payload_bytes: 0,
             encoded_frames: 0,
             fallback_frames: 0,
+            frame_failure_policy: FrameFailurePolicy::SubstituteSilenceForCodecFailure,
         })
     }
 
@@ -378,24 +404,32 @@ impl<W: Write> Atrac3StreamEncoder<W> {
             pcm0[index] = f32::from(left);
             pcm1[index] = f32::from(right);
         }
-        let pcm_refs: [&[f32; PCM_BLOCK_FRAMES]; 2] = [&pcm0, &pcm1];
-
-        let bit_count = self.encoder.encode_frame(&pcm_refs, &mut self.out_buf);
-        let byte_count = if bit_count < 0 {
-            None
-        } else {
-            Some(((bit_count as u32 + 7) >> 3) as usize)
-        };
+        let encoded = self.encoder.encode_frame(
+            PcmFrame::new([&pcm0, &pcm1]),
+            &mut self.out_buf,
+            self.profile.internal_frame_bytes(),
+        );
         if !write_frame {
             return Ok(());
         }
 
-        let bytes = if byte_count.is_none_or(|count| count > self.silence_frame.len()) {
-            self.fallback_frames += 1;
-            &self.silence_frame[..self.profile.frame_bytes()]
-        } else {
-            self.encoded_frames += 1;
-            &self.out_buf[..self.profile.frame_bytes()]
+        let bytes = match encoded {
+            Ok(frame) if frame.byte_count() <= self.silence_frame.len() => {
+                self.encoded_frames += 1;
+                &self.out_buf[..self.profile.frame_bytes()]
+            }
+            Ok(_) => {
+                self.fallback_frames += 1;
+                &self.silence_frame[..self.profile.frame_bytes()]
+            }
+            Err(error) if self.frame_failure_policy.substitutes(error) => {
+                self.fallback_frames += 1;
+                &self.silence_frame[..self.profile.frame_bytes()]
+            }
+            Err(FrameEncodeError::OutputTooSmall { needed, actual }) => {
+                return Err(Atrac3StreamError::FrameOutputTooSmall { needed, actual });
+            }
+            Err(_) => unreachable!("all non-capacity core errors are fallback eligible"),
         };
         self.writer
             .write_all(bytes)
@@ -448,14 +482,18 @@ impl<W: Write> Atrac3StreamEncoder<W> {
 }
 
 fn build_silence_frame(profile: Atrac3Profile) -> Result<Vec<u8>, Atrac3StreamError> {
-    let mut encoder = Atrac3Encoder::new(profile);
+    let mut encoder = EncoderCore::new(profile);
     let silence0 = [0.0f32; PCM_BLOCK_FRAMES];
     let silence1 = [0.0f32; PCM_BLOCK_FRAMES];
-    let refs = [&silence0, &silence1];
     let mut frame = vec![0; profile.internal_frame_bytes()];
-    let bit_count = encoder.encode_frame(&refs, &mut frame);
-    let byte_count = ((bit_count.max(0) as u32 + 7) >> 3) as usize;
-    if bit_count < 0 || byte_count > profile.internal_frame_bytes() {
+    let encoded = encoder
+        .encode_frame(
+            PcmFrame::new([&silence0, &silence1]),
+            &mut frame,
+            profile.internal_frame_bytes(),
+        )
+        .map_err(|_| Atrac3StreamError::SilenceFrame)?;
+    if encoded.byte_count() > profile.internal_frame_bytes() {
         return Err(Atrac3StreamError::SilenceFrame);
     }
     Ok(frame)
@@ -571,7 +609,7 @@ mod tests {
     }
 
     fn legacy_buffered_encode(profile: Atrac3Profile, pcm: &[Vec<i16>]) -> Vec<u8> {
-        let mut encoder = Atrac3Encoder::new(profile);
+        let mut encoder = EncoderCore::new(profile);
         let dba_priming = profile.strategy() == EncoderStrategy::Dba;
         let sound_units = sound_units_to_encode(pcm[0].len(), profile);
         let internal_frame_size = profile.internal_frame_bytes();
@@ -593,10 +631,16 @@ mod tests {
                     };
                 }
             }
-            let bit_count = encoder.encode_frame(&[&left, &right], &mut out_buf);
+            let encoded = encoder.encode_frame(
+                PcmFrame::new([&left, &right]),
+                &mut out_buf,
+                internal_frame_size,
+            );
             if write_sound_unit(sound_unit, profile) {
-                let byte_count = ((bit_count.max(0) as u32 + 7) >> 3) as usize;
-                if bit_count < 0 || byte_count > internal_frame_size {
+                let fallback = encoded
+                    .as_ref()
+                    .map_or(true, |frame| frame.byte_count() > internal_frame_size);
+                if fallback {
                     payload.extend_from_slice(&silence[..profile.frame_bytes()]);
                 } else {
                     payload.extend_from_slice(&out_buf[..profile.frame_bytes()]);

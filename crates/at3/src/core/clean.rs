@@ -2,22 +2,23 @@
 //!
 //! Ports the control flow of `encode_mddata_at3` (`0x65c98`) from
 //! `libatrac.so.1.2.0` using the already-validated leaf functions
-//! from `dsp::tone` and `dsp::quant`.
+//! from `core::coding::tone` and `core::coding::quant`.
 //!
 //! Half 1 (deterministic pipeline): implemented and validated.
 //! Half 2 (iterative bit-allocation convergence loop): in progress (Phase 3–4).
 
+use crate::analysis::gain::GainInfo;
 use crate::config::{Atrac3Profile, EncoderStrategy};
 use crate::core::bitstream::ToneComponentNbits;
 use crate::core::bitstream::ToneGroupNbits;
 use crate::core::bitstream::nbits_for_packdata as nbits_for_packdata_full;
 use crate::core::bitstream::pack_mddata_at3;
-use crate::dsp::gain::GainInfo;
-use crate::dsp::quant::{
+use crate::core::coding::quant;
+use crate::core::coding::quant::{
     HuffTableSet, calc_bitnumber, iorder_from_max, nbits_for_adjust, nbits_for_sheader,
     set_idtf_and_limwl, translate_to_idwl,
 };
-use crate::dsp::tone::{
+use crate::core::coding::tone::{
     BinDescriptor, ToneComponent, extract_multitone_with_groups, extract_single_tones, is_attack,
     set_cuidsf_from_spec, set_quidsf_from_cuidsf, single_tone_check,
 };
@@ -210,7 +211,7 @@ pub fn encode_mddata_at3(
     }
 
     let desc_count = {
-        let pos = crate::dsp::quant::ispof_iqt_at3(state.spectral_bfu_count as u32);
+        let pos = quant::ispof_iqt_at3(state.spectral_bfu_count as u32);
         if pos < 0 { (pos + 3) >> 2 } else { pos >> 2 }
     }
     .clamp(0, descriptors_b.len() as i32);
@@ -271,14 +272,14 @@ pub fn encode_mddata_at3(
     let mut quant_specs = tone_specs;
     quant_specs.resize(quant_specs.len().max(1024), 0.0);
     for (i, &idsf) in quidsf.iter().enumerate().take(29) {
-        let sf = crate::dsp::quant::scfof_id_at3(idsf as u32) as f32;
+        let sf = quant::scfof_id_at3(idsf as u32) as f32;
         if sf <= 0.0 {
             return EncodeResult {
                 remaining_budget: -0x8000,
             };
         }
-        let pos = crate::dsp::quant::ispof_iqt_at3(i as u32);
-        let nsps = crate::dsp::quant::nsps_inqt_at3(i as u32);
+        let pos = quant::ispof_iqt_at3(i as u32);
+        let nsps = quant::nsps_inqt_at3(i as u32);
         if pos < 0 || nsps < 0 {
             return EncodeResult {
                 remaining_budget: -0x8000,
@@ -398,16 +399,16 @@ pub fn encode_mddata_at3(
         if idwl <= 0 {
             continue;
         }
-        let scale = crate::dsp::quant::tfof_id(0, idwl);
-        let pos = crate::dsp::quant::ispof_iqt_at3(i as u32);
-        let nsps = crate::dsp::quant::nsps_inqt_at3(i as u32);
+        let scale = quant::tfof_id(0, idwl);
+        let pos = quant::ispof_iqt_at3(i as u32);
+        let nsps = quant::nsps_inqt_at3(i as u32);
         if pos < 0 || nsps < 0 {
             continue;
         }
         let spec_start = pos as usize;
         let spec_end = (spec_start + nsps as usize).min(quant_specs.len());
         let mut mantissas = vec![0i32; nsps as usize];
-        let bits = crate::dsp::quant::quant_nontone_nspecs(
+        let bits = quant::quant_nontone_nspecs(
             state.table_idx,
             idwl,
             scale,
@@ -466,7 +467,7 @@ pub fn encode_mddata_at3(
             } else {
                 0
             };
-    let density_pos = crate::dsp::quant::ispof_iqt_at3(spec_count as u32).max(0) + 0x100;
+    let density_pos = quant::ispof_iqt_at3(spec_count as u32).max(0) + 0x100;
     let density = remaining_budget as f64 / density_pos as f64;
     let density_ceil = if density <= 0.90 {
         12
@@ -722,16 +723,16 @@ pub fn encode_mddata_at3(
             if idwl <= 0 {
                 continue;
             }
-            let scale = crate::dsp::quant::tfof_id(0, idwl);
-            let pos = crate::dsp::quant::ispof_iqt_at3(i as u32);
-            let nsps = crate::dsp::quant::nsps_inqt_at3(i as u32);
+            let scale = quant::tfof_id(0, idwl);
+            let pos = quant::ispof_iqt_at3(i as u32);
+            let nsps = quant::nsps_inqt_at3(i as u32);
             if pos < 0 || nsps < 0 {
                 continue;
             }
             let spec_start = pos as usize;
             let spec_end = (spec_start + nsps as usize).min(quant_specs.len());
             let mut mantissas = vec![0i32; nsps as usize];
-            let _bits = crate::dsp::quant::quant_nontone_nspecs(
+            let _bits = quant::quant_nontone_nspecs(
                 state.table_idx,
                 idwl,
                 scale,
@@ -801,7 +802,7 @@ pub fn encode_mddata_at3(
         };
         let quidsf = &state.final_spread;
         for comp in &state.tone_components {
-            let width = crate::dsp::quant::twidof_id_at3(comp.width_id as u32).max(0) as usize;
+            let width = quant::twidof_id_at3(comp.width_id as u32).max(0) as usize;
             let mantissas: Vec<i32> = comp.mantissas.iter().take(width).copied().collect();
             group.components.push(ToneComponentNbits {
                 position: comp.position,
@@ -809,14 +810,14 @@ pub fn encode_mddata_at3(
             });
             let pos = comp.position >> 2;
             for (b, &qsf) in quidsf.iter().enumerate().take(bfu_num) {
-                let start = crate::dsp::quant::ispof_iqt_at3(b as u32);
+                let start = quant::ispof_iqt_at3(b as u32);
                 let end = if b + 1 < bfu_num {
-                    crate::dsp::quant::ispof_iqt_at3((b + 1) as u32)
+                    quant::ispof_iqt_at3((b + 1) as u32)
                 } else {
                     1024
                 };
                 if start >= 0 && pos >= start && pos < end {
-                    let itb = crate::dsp::quant::itfbof_iqt(qsf);
+                    let itb = quant::itfbof_iqt(qsf);
                     let g = crate::core::bitstream::itbgrpof_itb_at3(itb as u32);
                     if g >= 0 && (g as usize) < 4 {
                         group.has_tone[g as usize] = 1;
@@ -888,9 +889,9 @@ fn fine_tune_idwl(
             per_bfu_bit_counts[i] = 0;
             continue;
         }
-        let scale = crate::dsp::quant::tfof_id(0, idwl);
-        let pos = crate::dsp::quant::ispof_iqt_at3(i as u32);
-        let nsps = crate::dsp::quant::nsps_inqt_at3(i as u32);
+        let scale = quant::tfof_id(0, idwl);
+        let pos = quant::ispof_iqt_at3(i as u32);
+        let nsps = quant::nsps_inqt_at3(i as u32);
         if pos < 0 || nsps < 0 {
             per_bfu_bit_counts[i] = 0;
             continue;
@@ -898,7 +899,7 @@ fn fine_tune_idwl(
         let spec_start = pos as usize;
         let spec_end = (spec_start + nsps as usize).min(quant_specs.len());
         let mut mantissas = vec![0i32; nsps as usize];
-        let bits = crate::dsp::quant::quant_nontone_nspecs(
+        let bits = quant::quant_nontone_nspecs(
             table_idx,
             idwl,
             scale,
@@ -975,16 +976,16 @@ fn fine_tune_idwl(
                           per_bfu_bit_counts_: &mut [i32; 32],
                           state_: &mut EncoderChannelState|
      -> bool {
-        let scale = crate::dsp::quant::tfof_id(0, idwl_try);
-        let pos = crate::dsp::quant::ispof_iqt_at3(bfu as u32);
-        let nsps = crate::dsp::quant::nsps_inqt_at3(bfu as u32);
+        let scale = quant::tfof_id(0, idwl_try);
+        let pos = quant::ispof_iqt_at3(bfu as u32);
+        let nsps = quant::nsps_inqt_at3(bfu as u32);
         if pos < 0 || nsps < 0 {
             return false;
         }
         let spec_start = pos as usize;
         let spec_end = (spec_start + nsps as usize).min(quant_specs.len());
         let mut mantissas = vec![0i32; nsps as usize];
-        let new_bits = crate::dsp::quant::quant_nontone_nspecs(
+        let new_bits = quant::quant_nontone_nspecs(
             table_idx,
             idwl_try,
             scale,
@@ -1086,7 +1087,7 @@ fn fine_tune_idwl(
         order_keys[i] = (quidsf[i] + 1) * 32 - i as i32;
     }
     let mut order = [0i32; 32];
-    crate::dsp::quant::iorder_from_max(&order_keys, &mut order, spec_count);
+    quant::iorder_from_max(&order_keys, &mut order, spec_count);
     for pass in 0..4 {
         if *remaining + 2 > total_bit_budget {
             break;
@@ -1135,12 +1136,12 @@ fn fine_tune_idwl(
     // (C lines 55486-55518, assembly 0x679aa-0x67abd).
     for bfu in 0..active_bfu_count {
         let idwl = idwl_out[bfu];
-        let nsteps = crate::dsp::quant::nstepsof_idwl_at3(idwl as u32);
+        let nsteps = quant::nstepsof_idwl_at3(idwl as u32);
         if nsteps < 0 {
             continue;
         }
-        let pos = crate::dsp::quant::ispof_iqt_at3(bfu as u32);
-        let nsps = crate::dsp::quant::nsps_inqt_at3(bfu as u32);
+        let pos = quant::ispof_iqt_at3(bfu as u32);
+        let nsps = quant::nsps_inqt_at3(bfu as u32);
         if pos < 0 || nsps < 0 {
             continue;
         }
@@ -1224,7 +1225,7 @@ fn encode_channel_inner(
     let mut pack_components: Vec<crate::core::bitstream::PackToneComponent> = Vec::new();
 
     for comp in &state.tone_components {
-        let width = crate::dsp::quant::twidof_id_at3(comp.width_id as u32).max(0) as usize;
+        let width = quant::twidof_id_at3(comp.width_id as u32).max(0) as usize;
         let mantissas: Vec<i32> = comp.mantissas.iter().take(width).copied().collect();
 
         pack_components.push(crate::core::bitstream::PackToneComponent {
@@ -1340,8 +1341,8 @@ fn requantize_bfu_for_idwl(
     state: &mut EncoderChannelState,
     spec_huff: &HuffTableSet,
 ) {
-    let pos = crate::dsp::quant::ispof_iqt_at3(bfu as u32);
-    let nsps = crate::dsp::quant::nsps_inqt_at3(bfu as u32);
+    let pos = quant::ispof_iqt_at3(bfu as u32);
+    let nsps = quant::nsps_inqt_at3(bfu as u32);
     if pos < 0 || nsps <= 0 {
         return;
     }
@@ -1355,7 +1356,7 @@ fn requantize_bfu_for_idwl(
     }
 
     state.adjust_flags[bfu] = 1;
-    let sf = crate::dsp::quant::scfof_id_at3(state.final_spread[bfu] as u32) as f32;
+    let sf = quant::scfof_id_at3(state.final_spread[bfu] as u32) as f32;
     if sf <= 0.0 {
         state.quantized_mantissas[start..end].fill(0);
         return;
@@ -1367,10 +1368,10 @@ fn requantize_bfu_for_idwl(
     }
 
     let mut mantissas = vec![0i32; end - start];
-    let bits = crate::dsp::quant::quant_nontone_nspecs(
+    let bits = quant::quant_nontone_nspecs(
         state.table_idx,
         state.final_idwl[bfu],
-        crate::dsp::quant::tfof_id(0, state.final_idwl[bfu]),
+        quant::tfof_id(0, state.final_idwl[bfu]),
         nsps,
         &normalized,
         &mut mantissas,
@@ -1389,10 +1390,10 @@ fn requantize_bfu_for_idwl(
 ///
 /// Maintains per-channel QMF histories, MDCT overlaps, gain schedules,
 /// and encoder state across consecutive frames.
-pub struct Atrac3Encoder {
-    filter_banks: [crate::dsp::qmf::Atrac3AnalysisFilterBank; 2],
-    forward_transforms: [crate::dsp::mdct::Atrac3ForwardTransform; 2],
-    companion_forward_transforms: [crate::dsp::mdct::Atrac3ForwardTransform; 2],
+pub(crate) struct CleanEncoder {
+    filter_banks: [crate::analysis::qmf::Atrac3AnalysisFilterBank; 2],
+    forward_transforms: [crate::analysis::mdct::Atrac3ForwardTransform; 2],
+    companion_forward_transforms: [crate::analysis::mdct::Atrac3ForwardTransform; 2],
     gain_current: [[GainInfo; 4]; 2],
     gain_next: [[GainInfo; 4]; 2],
     subband_prev: [[[f32; 256]; 4]; 2],
@@ -1403,23 +1404,12 @@ pub struct Atrac3Encoder {
     frame_bytes: usize,
     channel_bytes: [usize; 2],
     joint_stereo: bool,
-    enc_algo: EncAlgo,
-    dba_frame_encoder: Option<crate::core::dba::DbaFrameEncoder>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EncAlgo {
-    Dba,
-    Clean,
-}
-
-impl EncAlgo {
-    fn from_profile(profile: Atrac3Profile) -> Self {
-        match profile.strategy() {
-            EncoderStrategy::Dba => Self::Dba,
-            EncoderStrategy::Clean => Self::Clean,
-        }
-    }
+pub(crate) enum CleanFrameError {
+    OutputTooSmall { needed: usize, actual: usize },
+    ChannelRejected { channel: usize },
 }
 
 fn has_gain_side_info(current: &[GainInfo; 4], previous: &[GainInfo; 4]) -> bool {
@@ -1429,15 +1419,7 @@ fn has_gain_side_info(current: &[GainInfo; 4], previous: &[GainInfo; 4]) -> bool
         .any(|gain| gain.count != 0)
 }
 
-fn dba_frame_config(profile: Atrac3Profile) -> Option<crate::core::dba::DbaFrameConfig> {
-    match (profile.bitrate_kbps(), profile.channels()) {
-        (52, 1) | (105, 2) => Some(crate::core::dba::DbaFrameConfig::sony_105_stereo()),
-        (66, 2) => Some(crate::core::dba::DbaFrameConfig::sony_66_stereo()),
-        _ => None,
-    }
-}
-
-impl Atrac3Encoder {
+impl CleanEncoder {
     /// Creates a new frame encoder for a validated ATRAC3 profile.
     ///
     /// Initialises all per-channel DSP and encoder state with defaults.
@@ -1445,8 +1427,8 @@ impl Atrac3Encoder {
     /// given bitrate: budget = (bitrate * 1024 / sample_rate) * 8 bits / 2 channels.
     /// For 132 kbps at 44.1 kHz: 132000 * 1024 / 44100 = ~3066 bits/frame,
     /// divided by 2 channels ≈ 1533, rounded to 1536 by the binary's overheads.
-    pub fn new(profile: Atrac3Profile) -> Self {
-        let enc_algo = EncAlgo::from_profile(profile);
+    pub(crate) fn new(profile: Atrac3Profile) -> Self {
+        debug_assert_eq!(profile.strategy(), EncoderStrategy::Clean);
         let frame_bytes = profile.internal_frame_bytes();
         debug_assert_eq!(
             frame_bytes,
@@ -1463,23 +1445,21 @@ impl Atrac3Encoder {
         } else {
             [frame_bytes / 2, frame_bytes / 2]
         };
-        let dba_frame_encoder =
-            dba_frame_config(profile).map(crate::core::dba::DbaFrameEncoder::new);
         let channel_bfu_counts: [i32; 2] = [29, 29];
         let tone_huff = HuffTableSet::build_tone();
         let spec_huff = HuffTableSet::build_spec();
         Self {
             filter_banks: [
-                crate::dsp::qmf::Atrac3AnalysisFilterBank::new(),
-                crate::dsp::qmf::Atrac3AnalysisFilterBank::new(),
+                crate::analysis::qmf::Atrac3AnalysisFilterBank::new(),
+                crate::analysis::qmf::Atrac3AnalysisFilterBank::new(),
             ],
             forward_transforms: [
-                crate::dsp::mdct::Atrac3ForwardTransform::new(),
-                crate::dsp::mdct::Atrac3ForwardTransform::new(),
+                crate::analysis::mdct::Atrac3ForwardTransform::new(),
+                crate::analysis::mdct::Atrac3ForwardTransform::new(),
             ],
             companion_forward_transforms: [
-                crate::dsp::mdct::Atrac3ForwardTransform::new(),
-                crate::dsp::mdct::Atrac3ForwardTransform::new(),
+                crate::analysis::mdct::Atrac3ForwardTransform::new(),
+                crate::analysis::mdct::Atrac3ForwardTransform::new(),
             ],
             gain_current: Default::default(),
             gain_next: Default::default(),
@@ -1506,8 +1486,6 @@ impl Atrac3Encoder {
             frame_bytes,
             channel_bytes,
             joint_stereo,
-            enc_algo,
-            dba_frame_encoder,
         }
     }
 
@@ -1543,9 +1521,8 @@ impl Atrac3Encoder {
 
     /// Encodes one stereo PCM sound unit (1024 samples per channel) into AT3 bytes.
     ///
-    /// Returns the packed bitstream for this frame, or an empty vector on error.
-    /// The output buffer is sized to hold a full AT3 frame (~4096 bytes max for
-    /// 132 kbps stereo).
+    /// Returns the packed bit count or a typed clean-core error. The caller
+    /// supplies storage for the validated profile's full internal frame.
     ///
     /// Pipeline per channel:
     /// 1. QMF analysis: 1024 PCM → 4×256 subbands
@@ -1553,21 +1530,18 @@ impl Atrac3Encoder {
     /// 3. MDCT with gain modulation: 4×256 subbands → 4×256 MDCT spectra
     /// 4. Encode: `encode_mddata_at3` (scale/quant/bit allocation)
     /// 5. Pack: `pack_mddata_at3` (Huffman-coded bitstream)
-    pub fn encode_frame(&mut self, pcm: &[&[f32; 1024]; 2], out_buffer: &mut [u8]) -> i32 {
+    pub(crate) fn encode_frame(
+        &mut self,
+        pcm: &[&[f32; 1024]; 2],
+        out_buffer: &mut [u8],
+    ) -> Result<usize, CleanFrameError> {
         if out_buffer.len() < self.frame_bytes {
-            return -1;
+            return Err(CleanFrameError::OutputTooSmall {
+                needed: self.frame_bytes,
+                actual: out_buffer.len(),
+            });
         }
         out_buffer.fill(0);
-
-        if self.enc_algo == EncAlgo::Dba {
-            let Some(encoder) = self.dba_frame_encoder.as_mut() else {
-                return -1;
-            };
-            return match encoder.encode_frame(pcm, out_buffer) {
-                Ok(()) => (self.frame_bytes * 8) as i32,
-                Err(code) => code,
-            };
-        }
 
         // --- QMF analysis for both channels ---
         let bands_ch0_raw: [[f32; 256]; 4] = {
@@ -1643,13 +1617,13 @@ impl Atrac3Encoder {
             gain_bufs[3][512..768].copy_from_slice(&current_bands[3]);
             let gain_refs: [&[f32]; 4] =
                 [&gain_bufs[0], &gain_bufs[1], &gain_bufs[2], &gain_bufs[3]];
-            crate::dsp::gain::GainProcessor::gaincontrol_at3(
+            crate::analysis::gain::GainProcessor::gaincontrol_at3(
                 gain_refs,
                 &self.gain_current[0],
                 &mut self.gain_next[0],
             );
 
-            let subband_info = crate::dsp::gain::SubbandInfo {
+            let subband_info = crate::analysis::gain::SubbandInfo {
                 current: self.gain_current[0].clone(),
                 next: self.gain_next[0].clone(),
             };
@@ -1704,13 +1678,13 @@ impl Atrac3Encoder {
             gain_bufs[3][512..768].copy_from_slice(&current_bands[3]);
             let gain_refs: [&[f32]; 4] =
                 [&gain_bufs[0], &gain_bufs[1], &gain_bufs[2], &gain_bufs[3]];
-            crate::dsp::gain::GainProcessor::gaincontrol_at3(
+            crate::analysis::gain::GainProcessor::gaincontrol_at3(
                 gain_refs,
                 &self.gain_current[1],
                 &mut self.gain_next[1],
             );
 
-            let subband_info = crate::dsp::gain::SubbandInfo {
+            let subband_info = crate::analysis::gain::SubbandInfo {
                 current: self.gain_current[1].clone(),
                 next: self.gain_next[1].clone(),
             };
@@ -1785,7 +1759,7 @@ impl Atrac3Encoder {
         if n_bits_ch0 < 0 || ((n_bits_ch0 as usize + 7) >> 3) > self.channel_bytes[0] {
             self.enc_states = saved_states;
             self.advance_gain_state();
-            return -1;
+            return Err(CleanFrameError::ChannelRejected { channel: 0 });
         }
 
         buf_offset = (self.channel_bytes[0] * 8) as i32;
@@ -1802,7 +1776,7 @@ impl Atrac3Encoder {
         if n_bits_ch1 < 0 || ((n_bits_ch1 as usize + 7) >> 3) > self.channel_bytes[1] {
             self.enc_states = saved_states;
             self.advance_gain_state();
-            return -1;
+            return Err(CleanFrameError::ChannelRejected { channel: 1 });
         }
 
         // For joint-stereo, reverse ch1 bytes in the output buffer.
@@ -1817,7 +1791,7 @@ impl Atrac3Encoder {
 
         self.advance_gain_state();
 
-        (self.frame_bytes * 8) as i32
+        Ok(self.frame_bytes * 8)
     }
 
     fn advance_gain_state(&mut self) {

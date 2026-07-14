@@ -3,8 +3,8 @@
 //! Ports the 6 functions from `libatrac.so.1.2.0` that serialize the
 //! encoder state into the ATRAC3 bitstream format.
 
-use crate::dsp::gain::GainInfo;
-use crate::dsp::quant::{
+use crate::analysis::gain::GainInfo;
+use crate::core::coding::quant::{
     HuffEntry, HuffTableSet, huffbits, ispof_iqt_at3, nsps_inqt_at3, twidof_id_at3, wlof_idwl_at3,
 };
 use crate::tables::ITB_GROUP_TABLE;
@@ -318,8 +318,8 @@ pub fn nbits_for_packdata(
     if spec_bits == -0x8000 {
         return -0x8000;
     }
-    let shdr = crate::dsp::quant::nbits_for_sheader(joint_stereo);
-    let adjust = crate::dsp::quant::nbits_for_adjust(adjust_count, adjust_per_bfu);
+    let shdr = crate::core::coding::quant::nbits_for_sheader(joint_stereo);
+    let adjust = crate::core::coding::quant::nbits_for_adjust(adjust_count, adjust_per_bfu);
     shdr + adjust + comp_bits + spec_bits
 }
 

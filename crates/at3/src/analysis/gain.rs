@@ -1,4 +1,4 @@
-//! Gain control for the classic ATRAC3 encoder.
+//! Gain analysis and control for the classic ATRAC3 encoder.
 //!
 //! Reproduces the behaviour of `libatrac.so.1.2.0`:
 //! - `gaincontrol_at3` (`0x6b504`): 4-band loop calling `set_gainc` then
