@@ -1,3 +1,4 @@
+use crate::entropy::huffman::huffman_entry;
 use crate::tables::at5::{
     IDCT_FIXBITS_AT5_ENTRIES, idct_fixbits_at5, n2_under128_at5, sg_shape_index_at5,
 };
@@ -2712,12 +2713,10 @@ fn previous_huffman_idct_cost(
 }
 
 fn huffman_bit_len(descriptor: HuffmanDescriptor, symbol: usize) -> Result<i32, BitcountError> {
-    descriptor
-        .pack_table()
-        .entry(symbol)
+    huffman_entry(descriptor, symbol)
         .map(|entry| i32::from(entry.bit_len))
-        .ok_or(BitcountError::HuffmanSymbolOutOfRange {
-            descriptor: descriptor.symbol(),
-            symbol,
+        .map_err(|error| BitcountError::HuffmanSymbolOutOfRange {
+            descriptor: error.descriptor,
+            symbol: error.symbol,
         })
 }

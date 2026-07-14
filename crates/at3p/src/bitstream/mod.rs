@@ -1,6 +1,5 @@
 pub mod dispatch;
 pub mod frame;
-pub mod group;
 pub mod huffman;
 pub mod pack_gain;
 pub mod pack_gha;

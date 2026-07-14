@@ -1,5 +1,5 @@
-use super::group::{GroupError, GroupedSymbol, hc_mkgrp_at5};
 use super::writer::{BitWriter, BitWriterError};
+use crate::entropy::group::{GroupError, GroupedSymbol, hc_mkgrp_at5};
 use crate::tables::spectral::{
     SpectralDescriptorMetadata, SpectralDescriptorSlot, SpectralPackTable,
 };

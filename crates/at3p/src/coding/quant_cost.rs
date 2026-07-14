@@ -275,8 +275,8 @@ pub fn quant_cost_accumulate_at5(
     cost
 }
 
-use crate::bitstream::group::hc_mkgrp_ex_at5;
 use crate::coding::quant::{QuantError, quant_at5};
+use crate::entropy::group::hc_mkgrp_ex_at5;
 use crate::tables::generated::{SAA_MASK, SAA_WL};
 
 /// The composed `quant_nontone_nspecs_at5` cost surface for one band

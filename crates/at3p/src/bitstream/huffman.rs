@@ -1,5 +1,6 @@
 use crate::bitstream::writer::{BitWriter, BitWriterError};
-use crate::tables::huffman::{HuffmanCodeEntry, HuffmanDescriptor};
+use crate::entropy::huffman::huffman_entry;
+use crate::tables::huffman::HuffmanDescriptor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HuffmanEmitError {
@@ -33,22 +34,22 @@ pub fn emit_symbol(
     symbol: usize,
 ) -> Result<HuffmanEmission, HuffmanEmitError> {
     let table = descriptor.pack_table();
-    let HuffmanCodeEntry { code, bit_len, .. } =
-        table.entry(symbol).ok_or(HuffmanEmitError::MissingSymbol {
-            descriptor: descriptor.symbol(),
-            symbol,
+    let entry =
+        huffman_entry(descriptor, symbol).map_err(|error| HuffmanEmitError::MissingSymbol {
+            descriptor: error.descriptor,
+            symbol: error.symbol,
         })?;
 
     let start_bit = writer.bit_pos();
-    writer.write_bits(code as u32, bit_len)?;
+    writer.write_bits(entry.code as u32, entry.bit_len)?;
     let end_bit = writer.bit_pos();
 
     Ok(HuffmanEmission {
         descriptor: descriptor.symbol(),
         table: table.symbol(),
         symbol,
-        code,
-        bit_len,
+        code: entry.code,
+        bit_len: entry.bit_len,
         start_bit,
         end_bit,
     })

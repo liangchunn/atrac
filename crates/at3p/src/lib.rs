@@ -13,6 +13,8 @@ mod dsp;
 #[allow(dead_code)]
 mod encoder;
 #[allow(dead_code)]
+mod entropy;
+#[allow(dead_code)]
 mod gha;
 #[allow(dead_code)]
 mod pipeline;
