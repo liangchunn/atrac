@@ -23,6 +23,8 @@ pub(crate) struct FrameSyntax {
 pub(crate) struct BlockGroupSyntax {
     header: BlockHeaderSyntax,
     channels: Vec<ChannelSyntax>,
+    stereo: Option<StereoSyntax>,
+    post_payload: Option<[u8; 2]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +36,6 @@ pub(crate) struct BlockHeaderSyntax {
     pub bandwidth_gate: bool,
     pub stereo_unit_count: usize,
     pub gainb_count: usize,
-    pub post_payload_gate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,9 +46,23 @@ pub(crate) struct ChannelSyntax {
     pub idsf: IdsfSyntax,
     pub idct: IdctSyntax,
     pub spectral: SpectralSyntax,
+    pub gainb: GatedFlagsSyntax,
     pub gain_present: bool,
     pub gha_present: bool,
     pub gha_idam_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StereoSyntax {
+    pub secondary: GatedFlagsSyntax,
+    pub primary: GatedFlagsSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GatedFlagsSyntax {
+    Absent,
+    PresentWithoutFlags,
+    Present { flags: Vec<bool> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +286,19 @@ pub enum FrameSyntaxError {
     UnsupportedSpectralRemap {
         group: usize,
     },
+    InvalidStereoPayload {
+        group: usize,
+        detail: &'static str,
+    },
+    InvalidGainbPayload {
+        group: usize,
+        channel: usize,
+        detail: &'static str,
+    },
+    InvalidPostPayload {
+        group: usize,
+        value: u8,
+    },
     InvalidPreviousChannel {
         group: usize,
         channel: usize,
@@ -346,7 +374,6 @@ impl FrameSyntax {
                 bandwidth_gate: source.cfg_u32(0x90)? != 0,
                 stereo_unit_count: source.cfg_u32(0xc0)? as usize,
                 gainb_count: source.cfg_u32(0xc8)? as usize,
-                post_payload_gate: source.cfg_u32(0x94)? != 0,
             };
             let channels = group
                 .objects
@@ -585,13 +612,44 @@ impl FrameSyntax {
                             units: spectral_units,
                             tail_values,
                         },
+                        gainb: gated_flags_from_gainb(object, header.gainb_count)?,
                         gain_present: object.u32(0x1b484)? != 0,
                         gha_present: object.arena_u32(0)? != 0,
                         gha_idam_enabled: object.arena_u32(1)? == 0,
                     })
                 })
                 .collect::<Result<Vec<_>, FrameSyntaxError>>()?;
-            groups.push(BlockGroupSyntax { header, channels });
+            let stereo = if group.nblk == 2 {
+                Some(StereoSyntax {
+                    secondary: gated_flags_from_cfg(
+                        source,
+                        0x48,
+                        0x4c,
+                        0x50,
+                        header.stereo_unit_count,
+                    )?,
+                    primary: gated_flags_from_cfg(
+                        source,
+                        0x00,
+                        0x04,
+                        0x08,
+                        header.stereo_unit_count,
+                    )?,
+                })
+            } else {
+                None
+            };
+            let post_payload = if source.cfg_u32(0x94)? == 0 {
+                None
+            } else {
+                Some([source.cfg_u32(0x98)? as u8, source.cfg_u32(0x9c)? as u8])
+            };
+            groups.push(BlockGroupSyntax {
+                header,
+                channels,
+                stereo,
+                post_payload,
+            });
         }
         let syntax = Self {
             frame_bytes: reference.frame_bytes,
@@ -635,6 +693,33 @@ impl FrameSyntax {
                 return Err(FrameSyntaxError::InvalidQuantUnitCount {
                     group: group_index,
                     count: syntax.header.quant_unit_count,
+                });
+            }
+            match (&syntax.stereo, syntax.channels.len()) {
+                (Some(stereo), 2) => {
+                    stereo
+                        .secondary
+                        .validate(syntax.header.stereo_unit_count)
+                        .and_then(|_| stereo.primary.validate(syntax.header.stereo_unit_count))
+                        .map_err(|detail| FrameSyntaxError::InvalidStereoPayload {
+                            group: group_index,
+                            detail,
+                        })?;
+                }
+                (None, 1) => {}
+                _ => {
+                    return Err(FrameSyntaxError::InvalidStereoPayload {
+                        group: group_index,
+                        detail: "channel-mode agreement",
+                    });
+                }
+            }
+            if let Some(words) = syntax.post_payload
+                && let Some(value) = words.into_iter().find(|value| *value > 0x0f)
+            {
+                return Err(FrameSyntaxError::InvalidPostPayload {
+                    group: group_index,
+                    value,
                 });
             }
             for (channel_index, channel) in syntax.channels.iter().enumerate() {
@@ -769,6 +854,13 @@ impl FrameSyntax {
                         detail,
                     });
                 }
+                if let Err(detail) = channel.gainb.validate(syntax.header.gainb_count) {
+                    return Err(FrameSyntaxError::InvalidGainbPayload {
+                        group: group_index,
+                        channel: channel_index,
+                        detail,
+                    });
+                }
             }
         }
         Ok(())
@@ -796,6 +888,14 @@ impl BlockGroupSyntax {
     pub(crate) fn channels(&self) -> &[ChannelSyntax] {
         &self.channels
     }
+
+    pub(crate) fn stereo(&self) -> Option<&StereoSyntax> {
+        self.stereo.as_ref()
+    }
+
+    pub(crate) fn post_payload(&self) -> Option<[u8; 2]> {
+        self.post_payload
+    }
 }
 
 impl ChannelSyntax {
@@ -814,6 +914,59 @@ impl ChannelSyntax {
     pub(crate) fn spectral(&self) -> &SpectralSyntax {
         &self.spectral
     }
+
+    pub(crate) fn gainb(&self) -> &GatedFlagsSyntax {
+        &self.gainb
+    }
+}
+
+impl GatedFlagsSyntax {
+    fn validate(&self, expected_flags: usize) -> Result<(), &'static str> {
+        match self {
+            Self::Absent | Self::PresentWithoutFlags => Ok(()),
+            Self::Present { flags } if flags.len() == expected_flags => Ok(()),
+            Self::Present { .. } => Err("flag count"),
+        }
+    }
+}
+
+fn gated_flags_from_cfg(
+    object: &crate::bitstream::frame::ObjectState,
+    present_offset: usize,
+    flags_present_offset: usize,
+    flags_offset: usize,
+    count: usize,
+) -> Result<GatedFlagsSyntax, FrameAssemblyError> {
+    if object.cfg_u32(present_offset)? == 0 {
+        return Ok(GatedFlagsSyntax::Absent);
+    }
+    if object.cfg_u32(flags_present_offset)? == 0 {
+        return Ok(GatedFlagsSyntax::PresentWithoutFlags);
+    }
+    let flags = (0..count)
+        .map(|index| {
+            object
+                .cfg_u32(flags_offset + index * 4)
+                .map(|value| value != 0)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GatedFlagsSyntax::Present { flags })
+}
+
+fn gated_flags_from_gainb(
+    object: &crate::bitstream::frame::ObjectState,
+    count: usize,
+) -> Result<GatedFlagsSyntax, FrameAssemblyError> {
+    if object.gainb_u32(0x980)? == 0 {
+        return Ok(GatedFlagsSyntax::Absent);
+    }
+    if object.gainb_u32(0x984)? == 0 {
+        return Ok(GatedFlagsSyntax::PresentWithoutFlags);
+    }
+    let flags = (0..count)
+        .map(|index| object.gainb_u32(0x988 + index * 4).map(|value| value != 0))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GatedFlagsSyntax::Present { flags })
 }
 
 impl SpectralSyntax {

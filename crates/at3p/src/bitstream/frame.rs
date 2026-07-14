@@ -102,8 +102,9 @@ use super::pack_spectral::{
 };
 use super::writer::{BitWriter, BitWriterError};
 use crate::pipeline::syntax::{
-    FrameSyntax, IdctCountSyntax, IdctEncodingSyntax, IdctSyntax, IdsfEncodingSyntax, IdsfSyntax,
-    IdwlEncodingSyntax, IdwlSyntax, SpectralSyntax, idspcqu_tail_count_at,
+    FrameSyntax, GatedFlagsSyntax, IdctCountSyntax, IdctEncodingSyntax, IdctSyntax,
+    IdsfEncodingSyntax, IdsfSyntax, IdwlEncodingSyntax, IdwlSyntax, SpectralSyntax, StereoSyntax,
+    idspcqu_tail_count_at,
 };
 use crate::tables::at5::{isps_at5, nsps_at5};
 use crate::tables::spectral::SPECTRAL_DESCRIPTOR_SLOTS;
@@ -221,7 +222,7 @@ impl ObjectState {
     }
 
     /// Word from the `*(obj + 8)` gainB window at object-relative byte `offset`.
-    fn gainb_u32(&self, offset: usize) -> Result<u32, FrameAssemblyError> {
+    pub(crate) fn gainb_u32(&self, offset: usize) -> Result<u32, FrameAssemblyError> {
         self.gainb
             .get_u32(offset)
             .ok_or(FrameAssemblyError::MissingGainWord { offset })
@@ -513,15 +514,28 @@ fn pack_frame_at5_impl(
 
         // Stereo config side data (native 46633..46781, gated `iVar19 == 2`).
         if nblk == 2 {
-            pack_stereo_config_block(writer, cfg_source)?;
+            if let Some(typed) = syntax_group {
+                let stereo = typed.stereo().ok_or(FrameAssemblyError::UnpinnedOrdering {
+                    section: "typed_stereo_payload",
+                })?;
+                pack_stereo_syntax(writer, stereo)?;
+            } else {
+                pack_stereo_config_block(writer, cfg_source)?;
+            }
         }
 
         // Section 6: secondary-gain "gainB" flags (native 46786..46865). Per
         // block, `*(obj+8)+0x980` (1 bit), then `+0x984` (1 bit) and `+0x988+k*4`
         // (1 bit each, k in 0..`*(cfg+0xc8)`) when the previous flag is nonzero.
-        let gainb_count = cfg_source.cfg_u32(0xc8)? as usize;
-        for obj in group.objects.iter().take(nblk) {
-            pack_gain_side_gainb(writer, obj, gainb_count)?;
+        if let Some(typed) = syntax_group {
+            for channel in typed.channels() {
+                pack_gated_flags(writer, channel.gainb())?;
+            }
+        } else {
+            let gainb_count = cfg_source.cfg_u32(0xc8)? as usize;
+            for obj in group.objects.iter().take(nblk) {
+                pack_gain_side_gainb(writer, obj, gainb_count)?;
+            }
         }
 
         // Section 7: gain NGC/IDLEV/IDLOC side data (native 46866..47053).
@@ -554,7 +568,11 @@ fn pack_frame_at5_impl(
         // Section D: post-payload gate (native 47570..47647). OUTSIDE the GHA
         // `arena_root[0]` gate (decompile 47566+): the 1-bit `cfg+0x94` gate and
         // its two 4-bit words pack even on GHA-absent frames.
-        pack_post_payload(writer, cfg_source)?;
+        if let Some(typed) = syntax_group {
+            pack_post_payload_syntax(writer, typed.post_payload())?;
+        } else {
+            pack_post_payload(writer, cfg_source)?;
+        }
     }
 
     // Frame tail (native 47651..47713): 2-bit marker `3`, byte align, then `0x01`
@@ -1252,6 +1270,36 @@ fn pack_stereo_config_block(
     Ok(())
 }
 
+fn pack_stereo_syntax(
+    writer: &mut BitWriter<'_>,
+    syntax: &StereoSyntax,
+) -> Result<(), FrameAssemblyError> {
+    pack_gated_flags(writer, &syntax.secondary)?;
+    pack_gated_flags(writer, &syntax.primary)?;
+    Ok(())
+}
+
+fn pack_gated_flags(
+    writer: &mut BitWriter<'_>,
+    syntax: &GatedFlagsSyntax,
+) -> Result<(), FrameAssemblyError> {
+    match syntax {
+        GatedFlagsSyntax::Absent => writer.write_bits(0, 1)?,
+        GatedFlagsSyntax::PresentWithoutFlags => {
+            writer.write_bits(1, 1)?;
+            writer.write_bits(0, 1)?;
+        }
+        GatedFlagsSyntax::Present { flags } => {
+            writer.write_bits(1, 1)?;
+            writer.write_bits(1, 1)?;
+            for flag in flags {
+                writer.write_bits(u32::from(*flag), 1)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Native `sa_pmodebits_gh_{nwavs,idsf,idam}` (all identical, `.rodata` 0xc0bc0):
 /// the prefix bit count for the per-channel GHA mode field, indexed by channel.
 const GH_PMODEBITS: [u8; 2] = [1, 2];
@@ -1806,6 +1854,21 @@ fn pack_post_payload(
     if flag == 1 {
         writer.write_bits(obj.cfg_u32(0x98)?, 4)?;
         writer.write_bits(obj.cfg_u32(0x9c)?, 4)?;
+    }
+    Ok(())
+}
+
+fn pack_post_payload_syntax(
+    writer: &mut BitWriter<'_>,
+    words: Option<[u8; 2]>,
+) -> Result<(), FrameAssemblyError> {
+    match words {
+        None => writer.write_bits(0, 1)?,
+        Some(words) => {
+            writer.write_bits(1, 1)?;
+            writer.write_bits(u32::from(words[0]), 4)?;
+            writer.write_bits(u32::from(words[1]), 4)?;
+        }
     }
     Ok(())
 }
