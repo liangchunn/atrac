@@ -126,7 +126,7 @@ pub struct AdjustChannelOutput {
     /// (`+0x8c != 0` path). `None` on the `+0x8c == 0` zero arm, where the
     /// native writes only `obj[0x1c73c]=0`/`0x1c74c=0`/`0x1c750=0` and does
     /// not invoke the leaf. Consumed by
-    /// `crate::encoder::packer_bridge::serialize_idsf_object_range_b`.
+    /// `crate::reference::native_layout::serialize_idsf_object_range_b`.
     pub idsf_block: Option<IdsfBlockState>,
 }
 

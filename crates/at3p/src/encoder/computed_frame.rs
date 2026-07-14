@@ -32,16 +32,19 @@
 //! proven live set, which fail with explicit errors BY DESIGN — this module
 //! never wires new arms; it surfaces the error to the caller.
 
+use crate::bitstream::frame::pack_frame_at5;
+#[cfg(any(test, debug_assertions))]
 use crate::bitstream::frame::{
-    BlockGroup, FramePrepackerState, ObjectState, ObjectWindow, pack_frame_at5,
-    pack_frame_reference_at5,
+    BlockGroup, FramePrepackerState, ObjectState, ObjectWindow, pack_frame_reference_at5,
 };
 use crate::bitstream::writer::BitWriter;
-use crate::coding::allocation::{
-    ZerothActivitySummary, zeroth_activity_summary_at5, zeroth_band_shape_counts_at5,
-};
+#[cfg(any(test, debug_assertions))]
+use crate::coding::allocation::zeroth_band_shape_counts_at5;
+use crate::coding::allocation::{ZerothActivitySummary, zeroth_activity_summary_at5};
 use crate::coding::calc_block::{CalcFrameEntry, CalcFrameOutput, calc_channel_block_frame_at5};
-use crate::encoder::cfg_bridge::{CfgPerFrame352, build_cfg_window};
+use crate::encoder::cfg_bridge::CfgPerFrame352;
+#[cfg(any(test, debug_assertions))]
+use crate::encoder::cfg_bridge::build_cfg_window;
 use crate::encoder::coding_bridge::{
     CodingBridgeError, GainRollState, InitGainHeaderWords, ZerothBridgeChannelAux,
     ZerothBridgeFrameAux, assemble_calc_frame_entry_with_init_for_params_at5,
@@ -53,16 +56,23 @@ use crate::encoder::frontend::{
     FRONTEND_CHANNEL_COUNT, FrontendCoreCallReport, FrontendError, FrontendState,
     frontend_core_call_at5,
 };
-use crate::encoder::packer_bridge::{
-    GHA_HAS_PREVIOUS_352, GhaPackingPrep, PackerBridgeError, gha_channel_records_to_waves,
-    gha_packing_prep_from_frontend, gha_record_slot_offsets, serialize_calc_object_range_a,
-    serialize_calc_object_range_b, serialize_gainb_window, serialize_gha_cfg_map,
-    serialize_gha_header_block, serialize_gha_p1_window, serialize_gha_selectors_range_b,
-    serialize_idct_object_range_a, serialize_idsf_object_range_b, serialize_idwl_mode2_cfg_words,
-    serialize_idwl_object_range_b, serialize_init_gain_header_range_b,
+use crate::encoder::packing_prep::{
+    GHA_HAS_PREVIOUS, GhaPackingPrep, PackingPrepError, gha_packing_prep_from_frontend,
 };
 use crate::encoder::profile::ATRAC3PLUS_352;
-use crate::pipeline::syntax::{FrameSyntax, FrameSyntaxError};
+use crate::encoder::syntax_bridge::build_computed_frame_syntax;
+#[cfg(any(test, debug_assertions))]
+use crate::pipeline::syntax::FrameSyntax;
+use crate::pipeline::syntax::FrameSyntaxError;
+#[cfg(any(test, debug_assertions))]
+use crate::reference::native_layout::{
+    PackerBridgeError, gha_channel_records_to_waves, gha_record_slot_offsets,
+    serialize_calc_object_range_a, serialize_calc_object_range_b, serialize_gainb_window,
+    serialize_gha_cfg_map, serialize_gha_header_block, serialize_gha_p1_window,
+    serialize_gha_selectors_range_b, serialize_idct_object_range_a, serialize_idsf_object_range_b,
+    serialize_idwl_mode2_cfg_words, serialize_idwl_object_range_b,
+    serialize_init_gain_header_range_b,
+};
 
 /// Frame byte length of the 352 stereo single-block frame.
 pub const COMPUTED_FRAME_BYTES: usize = 2048;
@@ -100,7 +110,11 @@ pub enum ComputedFrameError {
     Coding(CodingBridgeError),
     /// A packer bridge serializer failed (typically an untraceable dispatch arm
     /// past the parity horizon — surfaced, never wired).
-    Packer(PackerBridgeError),
+    Packing(PackingPrepError),
+    /// Reference-only native-layout construction failed during debug/test
+    /// differential checking.
+    #[cfg(any(test, debug_assertions))]
+    ReferenceLayout(PackerBridgeError),
     /// `calc_channel_block_frame_at5` rejected the computed entry. Carries the
     /// underlying guard so the probe names the branch (docs/12 §2.3).
     Calc(crate::coding::calc_block::CalcBlockError),
@@ -126,9 +140,15 @@ impl From<CodingBridgeError> for ComputedFrameError {
         ComputedFrameError::Coding(error)
     }
 }
+impl From<PackingPrepError> for ComputedFrameError {
+    fn from(error: PackingPrepError) -> Self {
+        ComputedFrameError::Packing(error)
+    }
+}
+#[cfg(any(test, debug_assertions))]
 impl From<PackerBridgeError> for ComputedFrameError {
     fn from(error: PackerBridgeError) -> Self {
-        ComputedFrameError::Packer(error)
+        ComputedFrameError::ReferenceLayout(error)
     }
 }
 impl From<FrameSyntaxError> for ComputedFrameError {
@@ -162,6 +182,7 @@ pub struct ComputedObjectInputs {
 /// the rolling frontend's ring-slot-0 arena (via `frontend`), exactly as the
 /// capstone's `substitute_gha_from_frontend` does; `prep` is the SAME
 /// `gha_packing_prep_from_frontend` result whose `total_bits` fed `gha_bits`.
+#[cfg(any(test, debug_assertions))]
 pub fn build_computed_prepacker_state(
     out: &CalcFrameOutput,
     per_frame: &CfgPerFrame352,
@@ -184,6 +205,55 @@ pub fn build_computed_prepacker_state(
     )
 }
 
+#[cfg(any(test, debug_assertions))]
+fn reference_prep(prep: &GhaPackingPrep) -> crate::reference::native_layout::GhaPackingPrep {
+    use crate::reference::native_layout::{
+        GhaArenaRow, GhaChannelSelectors, GhaHeaderSummaries,
+        GhaPackingPrep as ReferenceGhaPackingPrep,
+    };
+
+    ReferenceGhaPackingPrep {
+        swap_flags: prep.swap_flags.clone(),
+        post_swap_channels: prep
+            .post_swap_channels
+            .iter()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| {
+                        let mut words = [0u32; 10];
+                        words[4..8].copy_from_slice(&row.window_words);
+                        words[8] = row.wave_count as u32;
+                        GhaArenaRow {
+                            words,
+                            records: row.records.clone(),
+                        }
+                    })
+                    .collect()
+            })
+            .collect(),
+        channels: prep
+            .channels
+            .iter()
+            .map(|channel| GhaChannelSelectors {
+                idloc: channel.idloc,
+                nwavs: channel.nwavs,
+                freq: channel.freq,
+                idsf: channel.idsf,
+                idam: channel.idam,
+                freq_modes: channel.freq_modes.clone(),
+                active_flags: channel.active_flags.clone(),
+                compact_map: channel.compact_map.clone(),
+            })
+            .collect(),
+        summaries: GhaHeaderSummaries {
+            shared: prep.summaries.shared,
+            stereo: prep.summaries.stereo,
+            swap: prep.summaries.swap,
+        },
+        total_bits: prep.total_bits,
+    }
+}
+
 /// Like [`build_computed_prepacker_state`] but with an explicit per-rate block
 /// `selector`, frame bit `budget`, and `frame_bytes` (docs/13 §1.1). The window
 /// geometry (`range_a`/`range_b`/`cfg`/`gainb`/`gha_*`) is rate-INDEPENDENT
@@ -191,6 +261,7 @@ pub fn build_computed_prepacker_state(
 /// final frame byte length vary. At (30, 16379, 2048) this is byte-identical to
 /// the shipped 352 path.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, debug_assertions))]
 pub fn build_computed_prepacker_state_for_params(
     out: &CalcFrameOutput,
     per_frame: &CfgPerFrame352,
@@ -203,6 +274,7 @@ pub fn build_computed_prepacker_state_for_params(
     band_index: u32,
     band_count: u32,
 ) -> Result<FramePrepackerState, ComputedFrameError> {
+    let prep = reference_prep(prep);
     // Object count is profile-driven (docs/14 §0.4): the `nblk` written into the
     // block group is `objects.len()` (2 for the nine stereo rows == COMPUTED_NBLK,
     // 1 for the five mono rows). The caller (`compute_output_frame`) builds exactly
@@ -312,7 +384,7 @@ pub fn build_computed_prepacker_state_for_params(
                 row_count,
             ))
         };
-        crate::encoder::packer_bridge::serialize_gain_modes_range_b(
+        crate::reference::native_layout::serialize_gain_modes_range_b(
             &mut range_b,
             channel_index,
             active,
@@ -390,21 +462,22 @@ pub fn build_computed_prepacker_state_for_params(
     })
 }
 
-/// Parse `count` [`GainModeRow`](crate::encoder::packer_bridge::GainModeRow)s
+/// Parse `count` reference-layout gain rows
 /// out of a 16×38-word gain-A record buffer (stride 38 words): word 0 = point
 /// count `n` (clamped to the native 7-point maximum), words `1 + k` = location,
 /// words `8 + k` = level for `k < n`. Mirrors `parse_gain_rows` in the packer.
+#[cfg(any(test, debug_assertions))]
 fn gain_mode_rows_from_records(
     records: &[u32],
     count: usize,
-) -> Vec<crate::encoder::packer_bridge::GainModeRow> {
+) -> Vec<crate::reference::native_layout::GainModeRow> {
     (0..count)
         .map(|r| {
             let base = r * 38;
             let n = (records[base] as usize).min(7);
             let locations = (0..n).map(|k| records[base + 1 + k] as i32).collect();
             let levels = (0..n).map(|k| records[base + 8 + k] as i32).collect();
-            crate::encoder::packer_bridge::GainModeRow {
+            crate::reference::native_layout::GainModeRow {
                 count: n,
                 locations,
                 levels,
@@ -434,8 +507,6 @@ struct ComputedCalcEntry {
 pub struct ComputedFrame {
     /// The packed 2048-byte ATRAC3plus frame.
     pub bytes: Vec<u8>,
-    /// The assembled from-scratch prepacker state.
-    pub state: FramePrepackerState,
     /// The computed calc output.
     pub calc_out: CalcFrameOutput,
 }
@@ -759,34 +830,39 @@ impl ComputedFrameDriver {
             });
         }
 
-        let state = build_computed_prepacker_state_for_params(
+        let syntax = build_computed_frame_syntax(
             &out,
             &per_frame,
             &self.frontend,
             &gha_prep,
             &objects,
-            self.params.selector,
-            self.params.budget,
             self.params.frame_bytes as usize,
-            // Per-FRAME effective band extent (cfg+0xb4/+0xbc observation words;
-            // docs/13 §3.1 slice 3). These are packer-unread, but native truth is
-            // the per-frame shell-written values, not the static per-rate ones.
             effective_band_limit,
             effective_band_count,
         )?;
 
-        let syntax = FrameSyntax::from_reference(&state)?;
-        debug_assert_eq!(syntax.frame_bytes(), state.frame_bytes);
-        debug_assert_eq!(syntax.groups().len(), state.groups.len());
-        debug_assert_eq!(syntax.to_reference()?, state);
-
-        let mut bytes = vec![0u8; state.frame_bytes];
+        let mut bytes = vec![0u8; syntax.frame_bytes()];
         let mut writer = BitWriter::new(&mut bytes);
         pack_frame_at5(&syntax, &mut writer).map_err(ComputedFrameError::Pack)?;
-        let typed_bit_pos = writer.bit_pos();
 
         #[cfg(debug_assertions)]
         {
+            let typed_bit_pos = writer.bit_pos();
+            let state = build_computed_prepacker_state_for_params(
+                &out,
+                &per_frame,
+                &self.frontend,
+                &gha_prep,
+                &objects,
+                self.params.selector,
+                self.params.budget,
+                self.params.frame_bytes as usize,
+                effective_band_limit,
+                effective_band_count,
+            )?;
+            let reference_syntax = FrameSyntax::from_reference(&state)?;
+            debug_assert_eq!(syntax.frame_bytes(), reference_syntax.frame_bytes());
+            debug_assert_eq!(syntax.groups(), reference_syntax.groups());
             let mut reference_bytes = vec![0u8; state.frame_bytes];
             let mut reference_writer = BitWriter::new(&mut reference_bytes);
             pack_frame_reference_at5(&state, &mut reference_writer)
@@ -797,7 +873,6 @@ impl ComputedFrameDriver {
 
         Ok(ComputedFrame {
             bytes,
-            state,
             calc_out: out,
         })
     }
@@ -823,7 +898,7 @@ pub fn stereo_group_at5(
     active_count: usize,
 ) -> Result<(u32, u32, [u32; 16]), ComputedFrameError> {
     let summary: ZerothActivitySummary =
-        zeroth_activity_summary_at5(words, active_count).map_err(PackerBridgeError::from)?;
+        zeroth_activity_summary_at5(words, active_count).map_err(PackingPrepError::from)?;
     let mut k = [0u32; 16];
     for (i, slot) in k.iter_mut().enumerate() {
         *slot = words.get(i).copied().unwrap_or(0) as u32;
@@ -836,5 +911,5 @@ pub fn stereo_group_at5(
 /// are 352-only; assert the profile still names the scoped stereo path).
 const _: () = {
     assert!(ATRAC3PLUS_352.channels() as usize == COMPUTED_NBLK);
-    assert!(!GHA_HAS_PREVIOUS_352[0] && GHA_HAS_PREVIOUS_352[1]);
+    assert!(!GHA_HAS_PREVIOUS[0] && GHA_HAS_PREVIOUS[1]);
 };

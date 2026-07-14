@@ -55,7 +55,7 @@
 //! * `nblk = *(cfg + 0xa8)` is modeled separately as `BlockGroup.nblk`.
 //!
 //! # DEFERRED regions (left zero; owner + evidence, in the style of
-//! `src/encoder/packer_bridge.rs`'s CUT list)
+//! `src/reference/native_layout.rs`'s CUT list)
 //!
 //! These three regions are the ONLY bytes the captured call-7 window carries that
 //! this builder does NOT emit. The composition harness (`tests/composed_frame.rs`)
@@ -77,6 +77,7 @@
 //!   Packer-unread; native writer unidentified. *Owner*: unassigned (Phase-2
 //!   evidence question).
 
+#[cfg(any(test, debug_assertions))]
 use crate::{bitstream::frame::ObjectWindow, coding::allocation::zeroth_band_shape_counts_at5};
 
 /// Byte length of the config window this builder emits: `[0, 0x400)`.
@@ -202,6 +203,7 @@ pub struct CfgPerFrame352 {
     pub bits_1e4: i32,
 }
 
+#[cfg(any(test, debug_assertions))]
 fn put_u32(window: &mut ObjectWindow, offset: usize, value: u32) {
     window.bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -216,6 +218,7 @@ fn put_u32(window: &mut ObjectWindow, offset: usize, value: u32) {
 /// calls [`build_cfg_window`] with the 352 selector (30), budget (16379),
 /// full-band extent (band_index 32 / band_count 16), and stereo channel
 /// count (2).
+#[cfg(any(test, debug_assertions))]
 pub fn build_cfg_window_352(per_frame: &CfgPerFrame352) -> ObjectWindow {
     build_cfg_window(per_frame, 30, 16379, 0x20, 16, 2)
 }
@@ -261,6 +264,7 @@ pub fn cfg_shape_count_b8(band_index: u32) -> u32 {
 /// 352 states, 0/1 on all 77 `frame_prepacker_128_mono` states. At
 /// `channel_count == 2` the emitted words are the former hardcoded 1/2, so every
 /// stereo path is byte-identical.
+#[cfg(any(test, debug_assertions))]
 pub fn build_cfg_window(
     per_frame: &CfgPerFrame352,
     selector: u32,

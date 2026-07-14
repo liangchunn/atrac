@@ -101,24 +101,29 @@ use super::pack_spectral::{
     PackSpectralError, pack_spectral_descriptor_unit, pack_spectral_idspcqu_tail,
 };
 use super::writer::{BitWriter, BitWriterError};
+#[cfg(any(test, debug_assertions))]
+use crate::pipeline::syntax::idspcqu_tail_count_at;
 use crate::pipeline::syntax::{
     FrameSyntax, GainIdlevEncodingSyntax, GainIdlocEncodingSyntax, GainNgcEncodingSyntax,
     GainSyntax, GatedFlagsSyntax, GhaFreqEncodingSyntax, GhaIdsfEncodingSyntax,
     GhaNwavsEncodingSyntax, GhaSyntax, IdctCountSyntax, IdctEncodingSyntax, IdctSyntax,
     IdsfEncodingSyntax, IdsfSyntax, IdwlEncodingSyntax, IdwlSyntax, SpectralSyntax, StereoSyntax,
-    idspcqu_tail_count_at,
 };
-use crate::tables::at5::{isps_at5, nsps_at5};
+#[cfg(any(test, debug_assertions))]
+use crate::tables::at5::isps_at5;
+use crate::tables::at5::nsps_at5;
 use crate::tables::spectral::SPECTRAL_DESCRIPTOR_SLOTS;
 
 /// A captured memory window of a native object, indexable by native byte
 /// offset. `mem_offset` is the object-relative offset the window begins at.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, debug_assertions))]
 pub struct ObjectWindow {
     pub mem_offset: usize,
     pub bytes: Vec<u8>,
 }
 
+#[cfg(any(test, debug_assertions))]
 impl ObjectWindow {
     pub fn new(mem_offset: usize, bytes: Vec<u8>) -> Self {
         Self { mem_offset, bytes }
@@ -141,6 +146,7 @@ impl ObjectWindow {
 /// the packer reads its idsf source (`+0x0`), idam source (`+0x4`), 5-bit phase
 /// payload (`+0x8`), and frequency source (`+0xc`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, debug_assertions))]
 pub struct GhaWave {
     pub idsf: u32,
     pub idam: u32,
@@ -150,6 +156,7 @@ pub struct GhaWave {
 
 /// One native block object (channel) with the memory windows the packer reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, debug_assertions))]
 pub struct ObjectState {
     /// `*(obj)` native channel index; low bit is the dispatch channel parity.
     pub channel_index: u32,
@@ -174,6 +181,7 @@ pub struct ObjectState {
     pub gha_records: Vec<Vec<GhaWave>>,
 }
 
+#[cfg(any(test, debug_assertions))]
 impl ObjectState {
     pub(crate) fn u32(&self, offset: usize) -> Result<u32, FrameAssemblyError> {
         self.range_a
@@ -247,6 +255,7 @@ impl ObjectState {
 
 /// One block group `*(atx_state + 0x28 + group*0x44)` with its blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, debug_assertions))]
 pub struct BlockGroup {
     /// `*(cfg + 0xa8)` block/channel count in this group.
     pub nblk: usize,
@@ -255,6 +264,7 @@ pub struct BlockGroup {
 
 /// tests parse `frame0_prepacker_state.ndjson` into this shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, debug_assertions))]
 pub struct FramePrepackerState {
     pub frame_bytes: usize,
     /// `*(atx_state + 0xc)` block-group count.
@@ -348,6 +358,7 @@ impl From<HuffmanEmitError> for FrameAssemblyError {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 fn dispatch_index(mode_low_bits: u32, channel_parity: u32) -> usize {
     ((mode_low_bits & 3) + ((channel_parity & 1) << 2)) as usize
 }
@@ -408,6 +419,7 @@ pub fn pack_frame_at5(
 
 /// Temporary offset-driven parity oracle retained while payload families move
 /// to owned frame syntax. Production packing must use [`pack_frame_at5`].
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn pack_frame_reference_at5(
     state: &FramePrepackerState,
     writer: &mut BitWriter<'_>,
@@ -415,6 +427,7 @@ pub(crate) fn pack_frame_reference_at5(
     pack_frame_at5_impl(state, None, writer)
 }
 
+#[cfg(any(test, debug_assertions))]
 fn pack_frame_at5_impl(
     state: &FramePrepackerState,
     syntax: Option<&FrameSyntax>,
@@ -661,6 +674,7 @@ fn pack_frame_at5_impl(
     Ok(())
 }
 
+#[cfg(any(test, debug_assertions))]
 fn pack_idwl(
     writer: &mut BitWriter<'_>,
     group: &BlockGroup,
@@ -920,6 +934,7 @@ fn pack_idwl_syntax(
     Ok(())
 }
 
+#[cfg(any(test, debug_assertions))]
 fn pack_idsf(
     writer: &mut BitWriter<'_>,
     group: &BlockGroup,
@@ -1128,6 +1143,7 @@ fn pack_idsf_syntax(
     Ok(())
 }
 
+#[cfg(any(test, debug_assertions))]
 fn pack_idct(
     writer: &mut BitWriter<'_>,
     group: &BlockGroup,
@@ -1225,6 +1241,7 @@ fn pack_idct_syntax(
 /// as byte offset `iVar25*0x540 + sel*0xa8 + wl*0x18`, i.e. slot index
 /// `iVar25*56 + sel*7 + (wl-1)`. The grouped-symbol emission itself is the
 /// trace-verified `pack_spectral_descriptor_unit` leaf.
+#[cfg(any(test, debug_assertions))]
 fn pack_spectral_block(
     writer: &mut BitWriter<'_>,
     obj: &ObjectState,
@@ -1286,6 +1303,7 @@ fn pack_spectral_syntax(
 /// Per-block IDSPCQU tail (native 46599..46628): when `quant_unit_count > 2` and
 /// the `g_a_idspcqus_at5[cfg+0xc0 + 0x1f]` lookup is not the `0xff` sentinel,
 /// emit `count+1` 4-bit level words from `*(obj+0x1c6f8+k*4)`.
+#[cfg(any(test, debug_assertions))]
 fn pack_spectral_idspcqu_block(
     writer: &mut BitWriter<'_>,
     obj: &ObjectState,
@@ -1313,6 +1331,7 @@ fn pack_spectral_idspcqu_block(
 /// flag groups over the shared block config: the first from `cfg[0x48]`/`cfg[0x4c]`
 /// plus `cfg[0x50 + k*4]`, the second from `cfg[0x00]`/`cfg[0x04]` plus
 /// `cfg[0x08 + k*4]`, each inner run of length `cfg[0xc0]`.
+#[cfg(any(test, debug_assertions))]
 fn pack_stereo_config_block(
     writer: &mut BitWriter<'_>,
     cfg_source: &ObjectState,
@@ -1412,6 +1431,7 @@ fn pmodebits(channel_index: u32) -> u8 {
 /// Section 6: secondary-gain "gainB" flags (native 46786..46865). Reads the
 /// `*(obj+8)` gainB buffer: `+0x980` (1 bit); if nonzero `+0x984` (1 bit); if
 /// that is nonzero, `+0x988+k*4` (1 bit each) for `k` in `0..count`.
+#[cfg(any(test, debug_assertions))]
 fn pack_gain_side_gainb(
     writer: &mut BitWriter<'_>,
     obj: &ObjectState,
@@ -1436,6 +1456,7 @@ fn pack_gain_side_gainb(
 /// The native gain rows the gain leaves parse out of `*(obj+8)` (stride `0x98`,
 /// count `*(obj+0x1b490)`): `+0x0` = gain-point count, `+0x4+k*4` = location[k],
 /// `+0x20+k*4` = level[k].
+#[cfg(any(test, debug_assertions))]
 struct GainRows {
     counts: Vec<u32>,
     locations: Vec<Vec<u32>>,
@@ -1448,6 +1469,7 @@ struct GainRows {
 /// `+0x4+k*4` location[k], `+0x20+k*4` level[k]. The previous-state gain leaves
 /// (`_4`/`_6`) read the *current* row count out of the previous object's raw
 /// buffer, so `count` is passed explicitly rather than read per object.
+#[cfg(any(test, debug_assertions))]
 fn parse_gain_rows(obj: &ObjectState, count: usize) -> Result<GainRows, FrameAssemblyError> {
     let mut rows = GainRows {
         counts: Vec::with_capacity(count),
@@ -1477,6 +1499,7 @@ fn parse_gain_rows(obj: &ObjectState, count: usize) -> Result<GainRows, FrameAss
 }
 
 /// Section 7: gain NGC/IDLEV/IDLOC side data for one block (native 46866..47053).
+#[cfg(any(test, debug_assertions))]
 fn pack_gain_block(
     writer: &mut BitWriter<'_>,
     group: &BlockGroup,
@@ -1754,6 +1777,7 @@ fn pack_gain_syntax(
     Ok(())
 }
 
+#[cfg(any(test, debug_assertions))]
 fn idloc_rows(rows: &GainRows) -> Vec<IdlocRow<'_>> {
     rows.locations
         .iter()
@@ -1920,6 +1944,7 @@ fn pack_gha_syntax(
 }
 
 /// Section 8: GHA header (native 47055..47348) from the shared arena_root.
+#[cfg(any(test, debug_assertions))]
 fn pack_gha_header(
     writer: &mut BitWriter<'_>,
     obj: &ObjectState,
@@ -1962,6 +1987,7 @@ fn pack_gha_header(
 
 /// Sections 9 + 10: per-channel GHA side data + per-wave payload for one block
 /// (native 47349..47568).
+#[cfg(any(test, debug_assertions))]
 fn pack_gha_channel(
     writer: &mut BitWriter<'_>,
     group: &BlockGroup,
@@ -2160,6 +2186,7 @@ fn pack_gha_channel(
 /// active record reads `map[base + w]`. Inactive records get an empty slice (the
 /// leaf skips them). A `-1` (`0xffffffff`) entry is the no-predictor sentinel the
 /// leaf resolves against the raw-symbol base.
+#[cfg(any(test, debug_assertions))]
 fn gha_idsf_predictor_indices(
     obj: &ObjectState,
     active: &[bool],
@@ -2181,6 +2208,7 @@ fn gha_idsf_predictor_indices(
     Ok(rows)
 }
 
+#[cfg(any(test, debug_assertions))]
 fn gha_idloc_rows(
     obj: &ObjectState,
     active: &[bool],
@@ -2200,6 +2228,7 @@ fn gha_idloc_rows(
 }
 
 /// Section D: post-payload gate (native 47570..47647).
+#[cfg(any(test, debug_assertions))]
 fn pack_post_payload(
     writer: &mut BitWriter<'_>,
     obj: &ObjectState,
@@ -2228,6 +2257,7 @@ fn pack_post_payload_syntax(
     Ok(())
 }
 
+#[cfg(any(test, debug_assertions))]
 fn previous_object<'a>(
     group: &'a BlockGroup,
     obj: &ObjectState,

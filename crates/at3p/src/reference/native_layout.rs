@@ -1,4 +1,4 @@
-//! Coding->packer bridge (docs/09 Phase 3 Slice E): serialize the
+//! Reference-only coding->native-layout bridge: serialize the
 //! `calc_channel_block_at5` decision outputs into the packer's object memory
 //! windows.
 //!

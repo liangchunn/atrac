@@ -18,6 +18,9 @@ mod entropy;
 mod gha;
 #[allow(dead_code)]
 mod pipeline;
+#[cfg(any(test, debug_assertions))]
+#[allow(dead_code)]
+mod reference;
 #[allow(dead_code)]
 mod riff;
 #[allow(dead_code)]

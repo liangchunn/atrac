@@ -5,8 +5,12 @@
 //! temporary parity adapter; payload-family fields move out of it section by
 //! section before production packing switches to this type.
 
-use crate::bitstream::frame::{BlockGroup, FrameAssemblyError, FramePrepackerState, ObjectState};
-use crate::tables::at5::{isps_at5, nsps_at5};
+use crate::bitstream::frame::FrameAssemblyError;
+#[cfg(any(test, debug_assertions))]
+use crate::bitstream::frame::{BlockGroup, FramePrepackerState, ObjectState};
+#[cfg(any(test, debug_assertions))]
+use crate::tables::at5::isps_at5;
+use crate::tables::at5::nsps_at5;
 use crate::tables::generated::{G_A_IDSPCBANDS_AT5, G_A_IDSPCQUS_AT5};
 use crate::tables::spectral::SPECTRAL_DESCRIPTOR_SLOTS;
 
@@ -16,6 +20,7 @@ const MAX_QUANT_UNITS: usize = 32;
 pub(crate) struct FrameSyntax {
     frame_bytes: usize,
     groups: Vec<BlockGroupSyntax>,
+    #[cfg(any(test, debug_assertions))]
     reference_backing: Option<FramePrepackerState>,
 }
 
@@ -534,6 +539,7 @@ impl From<FrameAssemblyError> for FrameSyntaxError {
 }
 
 impl FrameSyntax {
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn from_reference(
         reference: &FramePrepackerState,
     ) -> Result<Self, FrameSyntaxError> {
@@ -859,6 +865,7 @@ impl FrameSyntax {
         let syntax = Self {
             frame_bytes,
             groups,
+            #[cfg(any(test, debug_assertions))]
             reference_backing: None,
         };
         syntax.validate()?;
@@ -1090,6 +1097,7 @@ impl FrameSyntax {
         Ok(())
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn to_reference(&self) -> Result<FramePrepackerState, FrameSyntaxError> {
         self.validate()?;
         self.reference_backing
@@ -1506,6 +1514,7 @@ impl GhaIdsfEncodingSyntax {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 fn gated_flags_from_cfg(
     object: &crate::bitstream::frame::ObjectState,
     present_offset: usize,
@@ -1529,6 +1538,7 @@ fn gated_flags_from_cfg(
     Ok(GatedFlagsSyntax::Present { flags })
 }
 
+#[cfg(any(test, debug_assertions))]
 fn gated_flags_from_gainb(
     object: &crate::bitstream::frame::ObjectState,
     count: usize,
@@ -1545,6 +1555,7 @@ fn gated_flags_from_gainb(
     Ok(GatedFlagsSyntax::Present { flags })
 }
 
+#[cfg(any(test, debug_assertions))]
 fn gain_syntax_from_reference(
     group: &BlockGroup,
     object: &ObjectState,
@@ -1660,6 +1671,7 @@ fn gain_syntax_from_reference(
     }))
 }
 
+#[cfg(any(test, debug_assertions))]
 fn gain_rows_from_reference(
     object: &ObjectState,
     count: usize,
@@ -1684,6 +1696,7 @@ fn gain_rows_from_reference(
         .collect()
 }
 
+#[cfg(any(test, debug_assertions))]
 fn gha_syntax_from_reference(
     group: &BlockGroup,
     source: &ObjectState,
@@ -1825,6 +1838,7 @@ fn gha_syntax_from_reference(
     }))
 }
 
+#[cfg(any(test, debug_assertions))]
 fn gated_flags_from_arena(
     object: &ObjectState,
     present_index: usize,
@@ -1848,6 +1862,7 @@ fn gated_flags_from_arena(
     Ok(GatedFlagsSyntax::Present { flags })
 }
 
+#[cfg(any(test, debug_assertions))]
 fn gha_predictor_indices_from_reference(
     object: &ObjectState,
     active: &[bool],

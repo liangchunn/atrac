@@ -483,7 +483,7 @@ pub struct CalcChannelOutput {
     /// per-band flags/aux). The `calc_channel_block_at5` tail copies its first
     /// 35 words (3 header + `cfg[0xb0] & 0x3fffffff` band words) into the
     /// packer object at `[0x1078, 0x1104)` — see
-    /// `crate::encoder::packer_bridge::serialize_idct_object_range_a`.
+    /// `crate::reference::native_layout::serialize_idct_object_range_a`.
     pub idct_block: IdctBlockState,
     /// Final per-channel `block+0x460` WLC/IDWL block state (after the
     /// section-14 fifth/sixth re-run). The `calc_channel_block_at5` tail
@@ -491,7 +491,7 @@ pub struct CalcChannelOutput {
     /// `+0x88 == 1`) copies the selected mode's 5-word record and the
     /// `word_rows[sel]` plane into the packer object at `[0x1c70c, 0x1c72c]`
     /// + `[0x1c7f0, 0x1c870)` — see
-    /// `crate::encoder::packer_bridge::serialize_idwl_object_range_b`.
+    /// `crate::reference::native_layout::serialize_idwl_object_range_b`.
     pub idwl_block: IdwlBlockState,
     /// Whether the native IDWL tail copy ran for this frame. False on the
     /// priming call (`config_b0 == 0`), where the captured object holds
@@ -505,7 +505,7 @@ pub struct CalcChannelOutput {
     /// `None` only when the epilogue's `+0x8c == 0` zero arm fired (the leaf
     /// was not invoked); `Some` on the live `+0x8c != 0` path (all captured
     /// calls). See
-    /// `crate::encoder::packer_bridge::serialize_idsf_object_range_b`.
+    /// `crate::reference::native_layout::serialize_idsf_object_range_b`.
     pub idsf_block: Option<IdsfBlockState>,
     pub o_1b578: Vec<i32>,
     pub o_1b5f8: Vec<i32>,
