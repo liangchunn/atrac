@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 use crate::config::{Atrac3Profile, EncoderStrategy, UnsupportedProfile};
-use crate::dsp::encode::Atrac3Encoder;
+use crate::core::clean::Atrac3Encoder;
 
 pub const PCM_BLOCK_FRAMES: usize = 1024;
 const SAMPLE_RATE: u32 = 44_100;

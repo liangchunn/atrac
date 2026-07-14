@@ -896,8 +896,8 @@ impl DbaFrameEncoder {
         output: &mut [u8],
         byte_offset: usize,
     ) -> Result<usize, i32> {
-        crate::dsp::dba_pack::dba_pack_channel(
-            &crate::dsp::dba_pack::DbaPackChannel {
+        crate::core::dba_bitstream::dba_pack_channel(
+            &crate::core::dba_bitstream::DbaPackChannel {
                 data,
                 gain_side_info_ext: &gain.gain_side_info_ext,
                 channel_mode: self.channel_mode(channel),

@@ -612,12 +612,12 @@ pub fn set_idtf_and_limwl(dst: &mut [i32; 6], lim_out: &mut i32, wl_out: &mut i3
 
 /// `nbits_for_packdata` (`0x658b4`): total bits for bitstream packing.
 ///
-/// Calls the full implementation in `dsp::pack::nbits_for_packdata`.
+/// Calls the full implementation in `core::bitstream::nbits_for_packdata`.
 /// The parameter count here is narrower — the caller passes only the subset
 /// of fields it knows at the `encode_mddata_at3` level.
 ///
 /// For the full packing bit budget (including tone components and spectral
-/// data), use `dsp::pack::nbits_for_packdata` directly.
+/// data), use `core::bitstream::nbits_for_packdata` directly.
 pub fn nbits_for_packdata(shdr_bits: i32, adjust_bits: i32) -> i32 {
     shdr_bits + adjust_bits
 }

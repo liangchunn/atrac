@@ -6,6 +6,8 @@
 
 mod config;
 #[allow(dead_code)]
+mod core;
+#[allow(dead_code)]
 mod dsp;
 mod encoder;
 #[allow(dead_code, unused_imports)]

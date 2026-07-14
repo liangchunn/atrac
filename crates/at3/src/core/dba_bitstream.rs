@@ -1,10 +1,10 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
-use crate::dsp::dba::{
+use crate::core::bitstream::pack_store_from_msb;
+use crate::core::dba::{
     DBA_GAIN_INFO_EXT_PREFIX, DBA_GAIN_INFO_STRIDE, DbaAt3DataResult, DbaToneTable,
     dba_magic_round_bits,
 };
-use crate::dsp::pack::pack_store_from_msb;
 use crate::tables::dba;
 
 pub(crate) struct DbaPackChannel<'a> {

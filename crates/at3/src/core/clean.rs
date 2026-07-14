@@ -8,11 +8,11 @@
 //! Half 2 (iterative bit-allocation convergence loop): in progress (Phase 3–4).
 
 use crate::config::{Atrac3Profile, EncoderStrategy};
+use crate::core::bitstream::ToneComponentNbits;
+use crate::core::bitstream::ToneGroupNbits;
+use crate::core::bitstream::nbits_for_packdata as nbits_for_packdata_full;
+use crate::core::bitstream::pack_mddata_at3;
 use crate::dsp::gain::GainInfo;
-use crate::dsp::pack::ToneComponentNbits;
-use crate::dsp::pack::ToneGroupNbits;
-use crate::dsp::pack::nbits_for_packdata as nbits_for_packdata_full;
-use crate::dsp::pack::pack_mddata_at3;
 use crate::dsp::quant::{
     HuffTableSet, calc_bitnumber, iorder_from_max, nbits_for_adjust, nbits_for_sheader,
     set_idtf_and_limwl, translate_to_idwl,
@@ -817,7 +817,7 @@ pub fn encode_mddata_at3(
                 };
                 if start >= 0 && pos >= start && pos < end {
                     let itb = crate::dsp::quant::itfbof_iqt(qsf);
-                    let g = crate::dsp::pack::itbgrpof_itb_at3(itb as u32);
+                    let g = crate::core::bitstream::itbgrpof_itb_at3(itb as u32);
                     if g >= 0 && (g as usize) < 4 {
                         group.has_tone[g as usize] = 1;
                     }
@@ -1221,13 +1221,13 @@ fn encode_channel_inner(
 
     // Build tone packing data from stored extraction output.
     let bfu_count = state.spectral_bfu_count.max(0) as usize;
-    let mut pack_components: Vec<crate::dsp::pack::PackToneComponent> = Vec::new();
+    let mut pack_components: Vec<crate::core::bitstream::PackToneComponent> = Vec::new();
 
     for comp in &state.tone_components {
         let width = crate::dsp::quant::twidof_id_at3(comp.width_id as u32).max(0) as usize;
         let mantissas: Vec<i32> = comp.mantissas.iter().take(width).copied().collect();
 
-        pack_components.push(crate::dsp::pack::PackToneComponent {
+        pack_components.push(crate::core::bitstream::PackToneComponent {
             idwl: comp.idwl,
             idsf: comp.idsf,
             coded_len: comp.width_id,
@@ -1404,7 +1404,7 @@ pub struct Atrac3Encoder {
     channel_bytes: [usize; 2],
     joint_stereo: bool,
     enc_algo: EncAlgo,
-    dba_frame_encoder: Option<crate::dsp::dba::DbaFrameEncoder>,
+    dba_frame_encoder: Option<crate::core::dba::DbaFrameEncoder>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1429,10 +1429,10 @@ fn has_gain_side_info(current: &[GainInfo; 4], previous: &[GainInfo; 4]) -> bool
         .any(|gain| gain.count != 0)
 }
 
-fn dba_frame_config(profile: Atrac3Profile) -> Option<crate::dsp::dba::DbaFrameConfig> {
+fn dba_frame_config(profile: Atrac3Profile) -> Option<crate::core::dba::DbaFrameConfig> {
     match (profile.bitrate_kbps(), profile.channels()) {
-        (52, 1) | (105, 2) => Some(crate::dsp::dba::DbaFrameConfig::sony_105_stereo()),
-        (66, 2) => Some(crate::dsp::dba::DbaFrameConfig::sony_66_stereo()),
+        (52, 1) | (105, 2) => Some(crate::core::dba::DbaFrameConfig::sony_105_stereo()),
+        (66, 2) => Some(crate::core::dba::DbaFrameConfig::sony_66_stereo()),
         _ => None,
     }
 }
@@ -1464,7 +1464,7 @@ impl Atrac3Encoder {
             [frame_bytes / 2, frame_bytes / 2]
         };
         let dba_frame_encoder =
-            dba_frame_config(profile).map(crate::dsp::dba::DbaFrameEncoder::new);
+            dba_frame_config(profile).map(crate::core::dba::DbaFrameEncoder::new);
         let channel_bfu_counts: [i32; 2] = [29, 29];
         let tone_huff = HuffTableSet::build_tone();
         let spec_huff = HuffTableSet::build_spec();

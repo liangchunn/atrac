@@ -1,4 +1,4 @@
-//! Bitstream packing functions for the classic ATRAC3 encoder.
+//! Bitstream packing shared by the classic ATRAC3 encoder cores.
 //!
 //! Ports the 6 functions from `libatrac.so.1.2.0` that serialize the
 //! encoder state into the ATRAC3 bitstream format.
