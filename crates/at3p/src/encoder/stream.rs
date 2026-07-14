@@ -19,8 +19,8 @@ pub const PCM_BLOCK_FRAMES: usize = FRONTEND_FRAME_SAMPLES;
 pub struct Atrac3plusStreamSummary {
     pub input_sample_frames: u32,
     pub output_frames: u32,
-    pub payload_bytes: usize,
-    pub file_bytes: usize,
+    pub payload_bytes: u64,
+    pub file_bytes: u64,
 }
 
 /// Incremental PCM-to-ATRAC3plus file writer. The caller owns WAV decoding and
@@ -104,7 +104,19 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
             .then(|| self.schedule.expected_encode_sample_frames(call) as usize)
     }
 
-    pub fn push_pcm(&mut self, channels: &[&[i16]]) -> Result<EncodeProgress, EncodeError> {
+    pub fn push_pcm(&mut self, channels: &[&[i16]]) -> Result<(), EncodeError> {
+        self.push_pcm_with_progress(channels, |_| {})
+    }
+
+    /// Supply one PCM chunk and report its completed scheduling step.
+    pub fn push_pcm_with_progress<F>(
+        &mut self,
+        channels: &[&[i16]],
+        mut on_progress: F,
+    ) -> Result<(), EncodeError>
+    where
+        F: FnMut(EncodeProgress),
+    {
         let core_call_index = self.scheduler.encode_calls();
         let Some(expected) = self.expected_next_chunk_frames() else {
             return Err(ComputedFileError::StreamInputAlreadyComplete.into());
@@ -158,24 +170,13 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
             self.frame_bytes,
         )?;
         self.consumed_sample_frames += expected as u32;
-        Ok(EncodeProgress {
+        on_progress(EncodeProgress {
             phase: EncodePhase::Encoding,
             completed_steps: core_call_index + 1,
             total_steps: self.total_steps,
             completed_output_frames: self.next_output_frame_index,
             total_output_frames: self.schedule.total_output_frames(),
-        })
-    }
-
-    pub fn push_pcm_with_progress<F>(
-        &mut self,
-        channels: &[&[i16]],
-        mut on_progress: F,
-    ) -> Result<(), EncodeError>
-    where
-        F: FnMut(EncodeProgress),
-    {
-        on_progress(self.push_pcm(channels)?);
+        });
         Ok(())
     }
 
@@ -260,8 +261,8 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
         let summary = Atrac3plusStreamSummary {
             input_sample_frames: self.input_sample_frames,
             output_frames: self.next_output_frame_index,
-            payload_bytes: self.written_payload_bytes,
-            file_bytes: actual_file_bytes,
+            payload_bytes: self.written_payload_bytes as u64,
+            file_bytes: actual_file_bytes as u64,
         };
         Ok((self.writer, summary))
     }
@@ -347,6 +348,31 @@ mod tests {
         let expected =
             assemble_computed_atracx_file_for_mono_profile(&profile, 6144, &pcm).unwrap();
         assert_eq!(stream(&profile, &pcm), expected);
+    }
+
+    #[test]
+    fn summary_reports_common_stream_totals() {
+        let pcm = generated_pcm(2, 6144);
+        let mut encoder = Atrac3plusStreamEncoder::new(Vec::new(), &ATRAC3PLUS_352, 6144).unwrap();
+        let mut offset = 0;
+        while let Some(frames) = encoder.expected_next_chunk_frames() {
+            encoder
+                .push_pcm(&[
+                    &pcm[0][offset..offset + frames],
+                    &pcm[1][offset..offset + frames],
+                ])
+                .unwrap();
+            offset += frames;
+        }
+        let (bytes, summary) = encoder.finish().unwrap();
+
+        assert_eq!(summary.input_sample_frames, 6144);
+        assert_eq!(summary.output_frames, 5);
+        assert_eq!(summary.file_bytes, bytes.len() as u64);
+        assert_eq!(
+            summary.payload_bytes,
+            summary.file_bytes - ATRACX_HEADER_LEN as u64
+        );
     }
 
     #[test]

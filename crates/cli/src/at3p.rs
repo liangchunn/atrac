@@ -150,20 +150,21 @@ fn encode_computed(
             break;
         }
         let result = match profile.channels() {
-            1 => encoder.push_pcm(&[blocks[0].as_slice()]),
-            2 => encoder.push_pcm(&[blocks[0].as_slice(), blocks[1].as_slice()]),
+            1 => encoder
+                .push_pcm_with_progress(&[blocks[0].as_slice()], |update| progress.update(update)),
+            2 => encoder
+                .push_pcm_with_progress(&[blocks[0].as_slice(), blocks[1].as_slice()], |update| {
+                    progress.update(update)
+                }),
             channels => unreachable!("validated ATRAC3plus profile has {channels} channels"),
         };
-        match result {
-            Ok(update) => progress.update(update),
-            Err(error) => {
-                progress.finish();
-                return Err(describe_computed_write_error(output, &error));
-            }
+        if let Err(error) = result {
+            progress.finish();
+            return Err(describe_computed_write_error(output, &error));
         }
     }
     drop(pcm);
-    let (mut file, _) = encoder
+    let (mut file, summary) = encoder
         .finish_with_progress(|update| progress.update(update))
         .map_err(|error| describe_computed_write_error(output, &error))?;
     progress.finish();
@@ -181,7 +182,15 @@ fn encode_computed(
             "failed to replace output `{}` with completed temporary file: {error}",
             output.display()
         )
-    })
+    })?;
+
+    eprintln!(
+        "wrote {} bytes ({} frames) to {}",
+        summary.file_bytes,
+        summary.output_frames,
+        output.display(),
+    );
+    Ok(())
 }
 
 fn describe_computed_write_error(output: &Path, error: &EncodeError) -> String {

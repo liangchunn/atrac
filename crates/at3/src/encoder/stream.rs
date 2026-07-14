@@ -11,9 +11,9 @@ const ENCODER_DELAY: usize = 69;
 const HEADER_BYTES: u64 = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Atrac3WriteStage {
+pub enum WriteStage {
     Header,
-    Payload,
+    OutputFrame { output_frame_index: u32 },
 }
 
 /// The stream phase responsible for an ATRAC3 encode progress update.
@@ -79,7 +79,7 @@ pub enum Atrac3StreamError {
         actual: u64,
     },
     Io {
-        stage: Atrac3WriteStage,
+        stage: WriteStage,
         source: io::Error,
     },
 }
@@ -155,6 +155,8 @@ impl From<UnsupportedProfile> for Atrac3StreamError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Atrac3StreamSummary {
+    pub input_sample_frames: u32,
+    pub output_frames: u32,
     pub encoded_frames: u32,
     pub fallback_frames: u32,
     pub payload_bytes: u64,
@@ -232,7 +234,7 @@ impl<W: Write> Atrac3StreamEncoder<W> {
         writer
             .write_all(&header)
             .map_err(|source| Atrac3StreamError::Io {
-                stage: Atrac3WriteStage::Header,
+                stage: WriteStage::Header,
                 source,
             })?;
 
@@ -262,6 +264,16 @@ impl<W: Write> Atrac3StreamEncoder<W> {
         self.push_pcm_with_progress(channels, |_| {})
     }
 
+    /// Number of PCM sample frames expected in the next chunk.
+    pub fn expected_next_chunk_frames(&self) -> Option<usize> {
+        (self.received_frames < self.sample_frames).then(|| {
+            usize::min(
+                PCM_BLOCK_FRAMES,
+                (self.sample_frames - self.received_frames) as usize,
+            )
+        })
+    }
+
     /// Supply one PCM chunk and report progress after every sound unit encoded.
     pub fn push_pcm_with_progress<F>(
         &mut self,
@@ -280,10 +292,9 @@ impl<W: Write> Atrac3StreamEncoder<W> {
         if self.received_frames == self.sample_frames {
             return Err(Atrac3StreamError::InputAlreadyComplete);
         }
-        let expected = usize::min(
-            PCM_BLOCK_FRAMES,
-            (self.sample_frames - self.received_frames) as usize,
-        );
+        let expected = self
+            .expected_next_chunk_frames()
+            .expect("incomplete input has a next PCM chunk");
         let actual = channels.first().map_or(0, |channel| channel.len());
         if actual != expected {
             return Err(Atrac3StreamError::WrongChunkFrames {
@@ -340,6 +351,8 @@ impl<W: Write> Atrac3StreamEncoder<W> {
             });
         }
         let summary = Atrac3StreamSummary {
+            input_sample_frames: self.sample_frames,
+            output_frames: self.encoded_frames + self.fallback_frames,
             encoded_frames: self.encoded_frames,
             fallback_frames: self.fallback_frames,
             payload_bytes: self.written_payload_bytes,
@@ -431,10 +444,12 @@ impl<W: Write> Atrac3StreamEncoder<W> {
             }
             Err(_) => unreachable!("all non-capacity core errors are fallback eligible"),
         };
+        let output_frame_index =
+            (self.written_payload_bytes / self.profile.frame_bytes() as u64) as u32;
         self.writer
             .write_all(bytes)
             .map_err(|source| Atrac3StreamError::Io {
-                stage: Atrac3WriteStage::Payload,
+                stage: WriteStage::OutputFrame { output_frame_index },
                 source,
             })?;
         self.written_payload_bytes += bytes.len() as u64;
@@ -715,7 +730,7 @@ mod tests {
         encoder
             .push_pcm_with_progress(&[&pcm[0], &pcm[1]], |update| progress.push(update))
             .unwrap();
-        encoder
+        let (_, summary) = encoder
             .finish_with_progress(|update| progress.push(update))
             .unwrap();
 
@@ -738,6 +753,12 @@ mod tests {
                 completed_output_frames: 3,
                 total_output_frames: 3,
             })
+        );
+        assert_eq!(summary.input_sample_frames, 1024);
+        assert_eq!(summary.output_frames, 3);
+        assert_eq!(
+            summary.output_frames,
+            summary.encoded_frames + summary.fallback_frames
         );
     }
 
@@ -805,7 +826,7 @@ mod tests {
         assert!(matches!(
             encoder.finish(),
             Err(Atrac3StreamError::Io {
-                stage: Atrac3WriteStage::Payload,
+                stage: WriteStage::OutputFrame { .. },
                 ..
             })
         ));

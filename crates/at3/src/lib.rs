@@ -16,6 +16,6 @@ mod tables;
 pub use config::{Atrac3Profile, ChannelMode, UnsupportedProfile};
 pub use encoder::stream::{
     Atrac3StreamEncoder as Atrac3Encoder, Atrac3StreamError as EncodeError,
-    Atrac3StreamSummary as EncodeSummary, Atrac3WriteStage as WriteStage, EncodePhase,
-    EncodeProgress, PCM_BLOCK_FRAMES,
+    Atrac3StreamSummary as EncodeSummary, EncodePhase, EncodeProgress, PCM_BLOCK_FRAMES,
+    WriteStage,
 };
