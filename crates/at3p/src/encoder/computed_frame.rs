@@ -782,7 +782,7 @@ impl ComputedFrameDriver {
 
         let mut bytes = vec![0u8; state.frame_bytes];
         let mut writer = BitWriter::new(&mut bytes);
-        pack_frame_at5(&state, &syntax, &mut writer).map_err(ComputedFrameError::Pack)?;
+        pack_frame_at5(&syntax, &mut writer).map_err(ComputedFrameError::Pack)?;
         let typed_bit_pos = writer.bit_pos();
 
         #[cfg(debug_assertions)]

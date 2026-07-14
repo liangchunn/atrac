@@ -352,15 +352,58 @@ fn dispatch_index(mode_low_bits: u32, channel_parity: u32) -> usize {
     ((mode_low_bits & 3) + ((channel_parity & 1) << 2)) as usize
 }
 
-/// Assemble one whole ATRAC3plus frame from captured pre-packer state, walking
-/// the pinned native emission order and composing the existing packer leaves.
-///
+/// Assemble one whole ATRAC3plus frame exclusively from validated typed syntax.
 pub fn pack_frame_at5(
-    state: &FramePrepackerState,
     syntax: &FrameSyntax,
     writer: &mut BitWriter<'_>,
 ) -> Result<(), FrameAssemblyError> {
-    pack_frame_at5_impl(state, Some(syntax), writer)
+    writer.write_bits(0, 1)?;
+
+    for group in syntax.groups() {
+        let header = group.header();
+        writer.write_bits(header.channel_mode, 2)?;
+        writer.write_bits(header.quant_header.wrapping_sub(1), 5)?;
+        writer.write_bits(u32::from(header.header_flag), 1)?;
+
+        for channel in group.channels() {
+            writer.write_bits(channel.idwl().mode, 2)?;
+            pack_idwl_syntax(writer, channel.channel_index, channel.idwl())?;
+        }
+        if header.quant_unit_count > 0 {
+            for channel in group.channels() {
+                writer.write_bits(channel.idsf().mode, 2)?;
+                pack_idsf_syntax(writer, channel.idsf())?;
+            }
+            writer.write_bits(u32::from(header.bandwidth_gate), 1)?;
+            for channel in group.channels() {
+                writer.write_bits(u32::from(channel.idct().bandwidth), 1)?;
+                writer.write_bits(channel.idct().mode, 2)?;
+                pack_idct_syntax(writer, channel.idct())?;
+            }
+        }
+        for channel in group.channels() {
+            pack_spectral_syntax(writer, channel.spectral())?;
+        }
+        if group.channels().len() == 2 {
+            pack_stereo_syntax(
+                writer,
+                group.stereo().ok_or(FrameAssemblyError::UnpinnedOrdering {
+                    section: "typed_stereo_payload",
+                })?,
+            )?;
+        }
+        for channel in group.channels() {
+            pack_gated_flags(writer, channel.gainb())?;
+        }
+        for channel in group.channels() {
+            pack_gain_syntax(writer, channel.gain())?;
+        }
+        pack_gha_syntax(writer, group.gha())?;
+        pack_post_payload_syntax(writer, group.post_payload())?;
+    }
+
+    writer.write_frame_tail(syntax.frame_bytes() * 8)?;
+    Ok(())
 }
 
 /// Temporary offset-driven parity oracle retained while payload families move
