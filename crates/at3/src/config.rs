@@ -68,6 +68,9 @@ pub struct Atrac3Profile {
 }
 
 impl Atrac3Profile {
+    pub const SAMPLE_RATE: u32 = 44_100;
+    pub const FRAME_SAMPLES: u32 = 1024;
+
     pub const fn new(bitrate_kbps: u32, channels: u16) -> Result<Self, UnsupportedProfile> {
         let profile = match (channels, bitrate_kbps) {
             (1, 52) => Self::mono(52, 152, 105, 304, EncoderStrategy::Dba, 1),
@@ -134,6 +137,14 @@ impl Atrac3Profile {
 
     pub const fn channels(self) -> u16 {
         self.channel_mode.channels()
+    }
+
+    pub const fn sample_rate(self) -> u32 {
+        Self::SAMPLE_RATE
+    }
+
+    pub const fn frame_samples(self) -> u32 {
+        Self::FRAME_SAMPLES
     }
 
     pub const fn frame_bytes(self) -> usize {

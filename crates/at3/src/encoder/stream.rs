@@ -6,7 +6,6 @@ use crate::config::{Atrac3Profile, EncoderStrategy, UnsupportedProfile};
 use crate::core::{EncoderCore, FrameEncodeError, PcmFrame};
 
 pub const PCM_BLOCK_FRAMES: usize = 1024;
-const SAMPLE_RATE: u32 = 44_100;
 const ENCODER_DELAY: usize = 69;
 const HEADER_BYTES: u64 = 80;
 
@@ -536,9 +535,9 @@ fn build_header(
     push_u32(&mut header, 32);
     push_u16(&mut header, 0x0270);
     push_u16(&mut header, channels);
-    push_u32(&mut header, SAMPLE_RATE);
-    let byte_rate =
-        (u64::from(frame_size) * u64::from(SAMPLE_RATE)).div_ceil(PCM_BLOCK_FRAMES as u64) as u32;
+    push_u32(&mut header, Atrac3Profile::SAMPLE_RATE);
+    let byte_rate = (u64::from(frame_size) * u64::from(Atrac3Profile::SAMPLE_RATE))
+        .div_ceil(PCM_BLOCK_FRAMES as u64) as u32;
     push_u32(&mut header, byte_rate);
     push_u16(&mut header, frame_size as u16);
     push_u16(&mut header, 0);
@@ -553,8 +552,8 @@ fn build_header(
     header.extend_from_slice(b"fact");
     push_u32(&mut header, 12);
     push_u32(&mut header, sample_count);
-    push_u32(&mut header, PCM_BLOCK_FRAMES as u32);
-    push_u32(&mut header, PCM_BLOCK_FRAMES as u32);
+    push_u32(&mut header, Atrac3Profile::FRAME_SAMPLES);
+    push_u32(&mut header, Atrac3Profile::FRAME_SAMPLES);
     header.extend_from_slice(b"data");
     push_u32(&mut header, total_data_size);
     debug_assert_eq!(header.len(), HEADER_BYTES as usize);
