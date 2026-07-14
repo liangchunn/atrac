@@ -4,7 +4,7 @@
 //!   docs/12 §0.1) drives the pure [`ComputedFlushScheduler`] over raw PCM and
 //!   COMPUTES every 2048-byte output frame for ANY input of
 //!   `N >= MIN_INPUT_SAMPLE_FRAMES` sample frames. The whole encode/flush/output
-//!   schedule is derived from `N` by [`ComputedSchedule352`] (native contract:
+//!   schedule is derived from `N` by [`EncodeSchedule`] (native contract:
 //!   left/right length mismatch, fail explicitly with a typed error instead of
 //!   guessing.
 
@@ -12,8 +12,8 @@ use std::fmt;
 use std::io::{self, Write};
 
 use super::flush::{
-    ComputedFlushError, ComputedFlushScheduler, ComputedFrameResult, ComputedSchedule352,
-    FrameSource, IncrementalComputedFlushScheduler, InputTooShort,
+    ComputedFlushError, ComputedFlushScheduler, ComputedFrameResult, EncodeSchedule, FrameSource,
+    IncrementalComputedFlushScheduler, InputTooShort,
 };
 use crate::encoder::coding_params::CodingParams;
 use crate::encoder::computed_frame::COMPUTED_FRAME_BYTES;
@@ -39,7 +39,7 @@ pub enum EncodePhase {
 /// includes priming calls that emit no frame and the final flush done call, so
 /// it advances monotonically from the first encoder call through completion.
 /// `completed_output_frames / total_output_frames` separately describes the
-/// native output schedule. Totals come from [`ComputedSchedule352`], whose
+/// native output schedule. Totals come from [`EncodeSchedule`], whose
 /// length-dependent call and frame counts are pinned against native traces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeProgress {
@@ -190,9 +190,79 @@ impl From<InputTooShort> for ComputedFileError {
     }
 }
 
+impl fmt::Display for ComputedFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InputTooShort {
+                input_sample_frames,
+                minimum,
+            } => write!(
+                f,
+                "input has {input_sample_frames} sample frames; at least {minimum} are required"
+            ),
+            Self::UnsupportedInputShape {
+                expected_sample_frames,
+                left_len,
+                right_len,
+                ..
+            } => write!(
+                f,
+                "expected two PCM channels of {expected_sample_frames} frames, got lengths {left_len} and {right_len}"
+            ),
+            Self::UnsupportedMonoInputShape {
+                expected_sample_frames,
+                channel_count,
+                channel_len,
+            } => write!(
+                f,
+                "expected one PCM channel of {expected_sample_frames} frames, got {channel_count} channel(s) with first length {channel_len}"
+            ),
+            Self::UnexpectedInputChannelCount { expected, actual } => {
+                write!(f, "expected {expected} PCM channel(s), got {actual}")
+            }
+            Self::UnexpectedInputChunkFrames {
+                core_call_index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "PCM chunk {core_call_index} has {actual} frames; expected {expected}"
+            ),
+            Self::MismatchedInputChunkFrames {
+                core_call_index,
+                channel,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "PCM channel {channel} in chunk {core_call_index} has {actual} frames; expected {expected}"
+            ),
+            Self::StreamInputAlreadyComplete => write!(f, "PCM input is already complete"),
+            Self::IncompleteStreamInput {
+                expected_sample_frames,
+                actual_sample_frames,
+            } => write!(
+                f,
+                "PCM input ended after {actual_sample_frames} frames; expected {expected_sample_frames}"
+            ),
+            Self::Header(error) => write!(f, "ATRACX header error: {error:?}"),
+            Self::Payload(error) => write!(f, "ATRAC3plus payload error: {error:?}"),
+            Self::FinalFileLength { expected, actual } => {
+                write!(f, "ATRACX file has {actual} bytes; expected {expected}")
+            }
+            Self::UnsupportedProfile { bitrate_kbps } => write!(
+                f,
+                "profile is not valid for this {bitrate_kbps} kbps encoder entry point"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ComputedFileError {}
+
 /// The exact streaming-file region whose `write_all` call failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ComputedWriteStage {
+pub enum WriteStage {
     Header,
     OutputFrame {
         source: FrameSource,
@@ -207,24 +277,24 @@ pub enum ComputedWriteStage {
 /// Sink failures retain both their exact write stage and the original
 /// [`io::Error`], including through [`std::error::Error::source`].
 #[derive(Debug)]
-pub enum ComputedWriteError {
+pub enum EncodeError {
     File(ComputedFileError),
     Io {
-        stage: ComputedWriteStage,
+        stage: WriteStage,
         source: io::Error,
     },
 }
 
-impl From<ComputedFileError> for ComputedWriteError {
+impl From<ComputedFileError> for EncodeError {
     fn from(value: ComputedFileError) -> Self {
         Self::File(value)
     }
 }
 
-impl fmt::Display for ComputedWriteError {
+impl fmt::Display for EncodeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::File(error) => write!(formatter, "computed file error: {error:?}"),
+            Self::File(error) => error.fmt(formatter),
             Self::Io { stage, source } => {
                 write!(
                     formatter,
@@ -235,10 +305,10 @@ impl fmt::Display for ComputedWriteError {
     }
 }
 
-impl std::error::Error for ComputedWriteError {
+impl std::error::Error for EncodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::File(_) => None,
+            Self::File(source) => Some(source),
             Self::Io { source, .. } => Some(source),
         }
     }
@@ -248,7 +318,7 @@ impl std::error::Error for ComputedWriteError {
 /// for the derived schedule and assemble the computed `data` payload. Reads ZERO
 /// `input_sample_frames` that produced `frames`.
 pub fn assemble_computed_payload(
-    schedule: &ComputedSchedule352,
+    schedule: &EncodeSchedule,
     frames: Vec<[Vec<f32>; 2]>,
 ) -> Result<Vec<u8>, ComputedPayloadError> {
     assemble_computed_payload_with_progress(schedule, frames, |_| {})
@@ -257,7 +327,7 @@ pub fn assemble_computed_payload(
 /// [`assemble_computed_payload`] with a progress callback invoked after every
 /// successful encode and flush wrapper call.
 pub fn assemble_computed_payload_with_progress<F>(
-    schedule: &ComputedSchedule352,
+    schedule: &EncodeSchedule,
     frames: Vec<[Vec<f32>; 2]>,
     on_progress: F,
 ) -> Result<Vec<u8>, ComputedPayloadError>
@@ -297,7 +367,7 @@ where
 /// pattern [`ComputedFlushScheduler::new_for_params`] uses — so the stereo
 /// output stays bit-for-bit unchanged (pure reshape, no sample changes).
 pub fn assemble_computed_payload_for_params(
-    schedule: &ComputedSchedule352,
+    schedule: &EncodeSchedule,
     frames: Vec<[Vec<f32>; 2]>,
     params: CodingParams,
 ) -> Result<Vec<u8>, ComputedPayloadError> {
@@ -306,7 +376,7 @@ pub fn assemble_computed_payload_for_params(
 
 /// [`assemble_computed_payload_for_params`] with per-wrapper-call progress.
 pub fn assemble_computed_payload_for_params_with_progress<F>(
-    schedule: &ComputedSchedule352,
+    schedule: &EncodeSchedule,
     frames: Vec<[Vec<f32>; 2]>,
     params: CodingParams,
     on_progress: F,
@@ -334,7 +404,7 @@ where
 /// [`assemble_computed_payload_for_params`] delegates here after reshaping;
 /// the 128 kbps mono path (docs/14 §1.3) supplies a 1-channel frame vector.
 pub fn assemble_computed_payload_for_params_channels(
-    schedule: &ComputedSchedule352,
+    schedule: &EncodeSchedule,
     frames: Vec<Vec<Vec<f32>>>,
     params: CodingParams,
 ) -> Result<Vec<u8>, ComputedPayloadError> {
@@ -345,7 +415,7 @@ pub fn assemble_computed_payload_for_params_channels(
 /// successful scheduler call and output-frame append. Existing assembly entry
 /// points delegate here with a no-op callback, preserving their behavior.
 pub fn assemble_computed_payload_for_params_channels_with_progress<F>(
-    schedule: &ComputedSchedule352,
+    schedule: &EncodeSchedule,
     frames: Vec<Vec<Vec<f32>>>,
     params: CodingParams,
     mut on_progress: F,
@@ -429,7 +499,7 @@ where
 /// returned encoded frame before preparing the next call. The complete payload
 /// remains intentionally buffered for the existing `Vec<u8>` public APIs.
 fn assemble_computed_payload_from_pcm_channels_with_progress<F>(
-    schedule: &ComputedSchedule352,
+    schedule: &EncodeSchedule,
     channels: &[&[i16]],
     params: CodingParams,
     mut on_progress: F,
@@ -528,7 +598,7 @@ where
     F: FnMut(EncodeProgress),
 {
     // The channels must both hold exactly `N` sample frames. (The native minimum
-    // guard lives in `ComputedSchedule352::new`, invoked below.)
+    // guard lives in `EncodeSchedule::new`, invoked below.)
     if left.len() != input_sample_frames as usize || right.len() != input_sample_frames as usize {
         return Err(ComputedFileError::UnsupportedInputShape {
             expected_sample_frames: input_sample_frames,
@@ -539,7 +609,7 @@ where
     }
 
     // Reject `N < 6144` (native minimum) with the typed too-short error.
-    let schedule = ComputedSchedule352::new(input_sample_frames)?;
+    let schedule = EncodeSchedule::new(input_sample_frames)?;
     let total_output_frames = schedule.total_output_frames();
     let payload_bytes = total_output_frames as usize * COMPUTED_FRAME_BYTES;
     let file_bytes = ATRACX_HEADER_LEN as usize + payload_bytes;
@@ -626,7 +696,7 @@ pub fn write_computed_atracx_file_for_profile<W>(
     input_sample_frames: u32,
     left: &[i16],
     right: &[i16],
-) -> Result<(), ComputedWriteError>
+) -> Result<(), EncodeError>
 where
     W: Write,
 {
@@ -650,7 +720,7 @@ pub fn write_computed_atracx_file_for_profile_with_progress<W, F>(
     left: &[i16],
     right: &[i16],
     on_progress: F,
-) -> Result<(), ComputedWriteError>
+) -> Result<(), EncodeError>
 where
     W: Write,
     F: FnMut(EncodeProgress),
@@ -671,9 +741,9 @@ where
         .into());
     }
 
-    let schedule = ComputedSchedule352::new(input_sample_frames)
+    let schedule = EncodeSchedule::new(input_sample_frames)
         .map_err(ComputedFileError::from)
-        .map_err(ComputedWriteError::from)?;
+        .map_err(EncodeError::from)?;
     let mut stream =
         super::stream::Atrac3plusStreamEncoder::new(writer, profile, input_sample_frames)?;
     let mut on_progress = on_progress;
@@ -705,7 +775,7 @@ where
 /// 3. **too-short guard** — `N >= 6144`, else [`ComputedFileError::InputTooShort`].
 ///    Native `checkEncodeParam` rejects `N < 0x1800` BEFORE the rate/row match,
 ///    channel-independent (E2); the schedule law is channel-independent (E3), so
-///    [`ComputedSchedule352::new`] governs the minimum here too.
+///    [`EncodeSchedule::new`] governs the minimum here too.
 /// 4. **rate routing** — all five mono rows are LANDED: 128 kbps (docs/14 §1.3),
 ///    96 kbps (docs/14 §2.1), 64 kbps (docs/14 §3.1), 48 kbps (docs/14 §4.1),
 ///    and 32 kbps (docs/14 §5.1). Each runs the channel-vec computed pipeline
@@ -758,7 +828,7 @@ where
     }
 
     // (c) too-short guard (native precedence: BEFORE the rate/row match, E2).
-    let schedule = ComputedSchedule352::new(input_sample_frames)?;
+    let schedule = EncodeSchedule::new(input_sample_frames)?;
 
     // (d) rate routing. All five mono rows — 128 (docs/14 §1.3), 96 (docs/14
     // §2.1), 64 (docs/14 §3.1), 48 (docs/14 §4.1), 32 (docs/14 §5.1) — run the
@@ -780,7 +850,7 @@ pub fn write_computed_atracx_file_for_mono_profile<W>(
     profile: &Atrac3plusProfile,
     input_sample_frames: u32,
     channels: &[Vec<i16>],
-) -> Result<(), ComputedWriteError>
+) -> Result<(), EncodeError>
 where
     W: Write,
 {
@@ -802,7 +872,7 @@ pub fn write_computed_atracx_file_for_mono_profile_with_progress<W, F>(
     input_sample_frames: u32,
     channels: &[Vec<i16>],
     on_progress: F,
-) -> Result<(), ComputedWriteError>
+) -> Result<(), EncodeError>
 where
     W: Write,
     F: FnMut(EncodeProgress),
@@ -822,9 +892,9 @@ where
         .into());
     }
 
-    let schedule = ComputedSchedule352::new(input_sample_frames)
+    let schedule = EncodeSchedule::new(input_sample_frames)
         .map_err(ComputedFileError::from)
-        .map_err(ComputedWriteError::from)?;
+        .map_err(EncodeError::from)?;
     let mut stream =
         super::stream::Atrac3plusStreamEncoder::new(writer, profile, input_sample_frames)?;
     let mut on_progress = on_progress;
@@ -843,7 +913,7 @@ where
 /// [`assemble_computed_atracx_file_for_rate`], rate-generic via
 /// `profile.frame_bytes()` / [`CodingParams::for_profile`] / `profile.codec_info()`.
 /// The frame SCHEDULE is channel-independent (E3), so the caller's
-/// [`ComputedSchedule352`] governs the output-frame count; one current-call
+/// [`EncodeSchedule`] governs the output-frame count; one current-call
 /// scalar frame is prepared and immediately driven through the incremental
 /// computed pipeline with the mono [`CodingParams`] (`channels == 1`). The
 /// header is the mono row's (`write_atracx_header_for_rate_channels(1, …)`, pinned
@@ -855,7 +925,7 @@ where
 /// the native oracle).
 fn assemble_computed_mono_file_for_rate<F>(
     profile: &Atrac3plusProfile,
-    schedule: &ComputedSchedule352,
+    schedule: &EncodeSchedule,
     input_sample_frames: u32,
     channels: &[Vec<i16>],
     on_progress: F,
@@ -902,7 +972,7 @@ where
 /// coding params ([`CodingParams::for_profile`]) into the computed pipeline and
 /// sizes the payload / RIFF header at `profile.frame_bytes()` via
 /// [`write_atracx_header_for_rate`]. The frame SCHEDULE is rate-independent
-/// (docs/13 §2.3), so [`ComputedSchedule352`] governs the output-frame count.
+/// (docs/13 §2.3), so [`EncodeSchedule`] governs the output-frame count.
 /// There is NO packer-boundary byte oracle at a non-352 rate by design (x87
 /// divergence; the perceptual battery owns full-file acceptance) — this path is
 /// structurally exact (frame count / sizing / container) but not byte-pinned
@@ -949,7 +1019,7 @@ where
     }
 
     // Reject `N < 6144` (native minimum) with the typed too-short error.
-    let schedule = ComputedSchedule352::new(input_sample_frames)?;
+    let schedule = EncodeSchedule::new(input_sample_frames)?;
     let total_output_frames = schedule.total_output_frames();
     let frame_bytes = profile.frame_bytes();
     let payload_bytes = total_output_frames as usize * frame_bytes as usize;
@@ -987,7 +1057,7 @@ pub(crate) fn write_computed_output_frame<W>(
     written_payload_bytes: &mut usize,
     result: ComputedFrameResult,
     expected_frame_bytes: usize,
-) -> Result<(), ComputedWriteError>
+) -> Result<(), EncodeError>
 where
     W: Write,
 {
@@ -1034,16 +1104,14 @@ where
                 )
                 .into());
             }
-            writer
-                .write_all(&frame)
-                .map_err(|source| ComputedWriteError::Io {
-                    stage: ComputedWriteStage::OutputFrame {
-                        source: result.source,
-                        core_call_index: result.core_call_index,
-                        output_frame_index,
-                    },
-                    source,
-                })?;
+            writer.write_all(&frame).map_err(|source| EncodeError::Io {
+                stage: WriteStage::OutputFrame {
+                    source: result.source,
+                    core_call_index: result.core_call_index,
+                    output_frame_index,
+                },
+                source,
+            })?;
             *written_payload_bytes += frame.len();
             *next_output_frame_index += 1;
         }

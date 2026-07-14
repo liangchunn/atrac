@@ -1,11 +1,11 @@
 use std::io::Write;
 
 use super::coding_params::CodingParams;
-use super::flush::{ComputedSchedule352, IncrementalComputedFlushScheduler};
+use super::flush::{EncodeSchedule, IncrementalComputedFlushScheduler};
 use super::frontend::FRONTEND_FRAME_SAMPLES;
 use super::payload::{
-    ComputedFileError, ComputedPayloadError, ComputedWriteError, ComputedWriteStage, EncodePhase,
-    EncodeProgress, write_computed_output_frame,
+    ComputedFileError, ComputedPayloadError, EncodeError, EncodePhase, EncodeProgress, WriteStage,
+    write_computed_output_frame,
 };
 use super::profile::Atrac3plusProfile;
 use crate::riff::write::{
@@ -28,7 +28,7 @@ pub struct Atrac3plusStreamSummary {
 /// converted PCM frame, codec state, and at most one encoded frame.
 pub struct Atrac3plusStreamEncoder<W: Write> {
     writer: W,
-    schedule: ComputedSchedule352,
+    schedule: EncodeSchedule,
     scheduler: IncrementalComputedFlushScheduler,
     channel_count: usize,
     frame_bytes: usize,
@@ -46,10 +46,10 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
         mut writer: W,
         profile: &Atrac3plusProfile,
         input_sample_frames: u32,
-    ) -> Result<Self, ComputedWriteError> {
-        let schedule = ComputedSchedule352::new(input_sample_frames)
+    ) -> Result<Self, EncodeError> {
+        let schedule = EncodeSchedule::new(input_sample_frames)
             .map_err(ComputedFileError::from)
-            .map_err(ComputedWriteError::from)?;
+            .map_err(EncodeError::from)?;
         let header = match profile.channels() {
             2 if profile.bitrate_kbps() == 352 => {
                 write_atracx_header(input_sample_frames, schedule.total_output_frames())
@@ -72,8 +72,8 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
         .map_err(ComputedFileError::from)?;
         writer
             .write_all(&header)
-            .map_err(|source| ComputedWriteError::Io {
-                stage: ComputedWriteStage::Header,
+            .map_err(|source| EncodeError::Io {
+                stage: WriteStage::Header,
                 source,
             })?;
 
@@ -104,7 +104,7 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
             .then(|| self.schedule.expected_encode_sample_frames(call) as usize)
     }
 
-    pub fn push_pcm(&mut self, channels: &[&[i16]]) -> Result<EncodeProgress, ComputedWriteError> {
+    pub fn push_pcm(&mut self, channels: &[&[i16]]) -> Result<EncodeProgress, EncodeError> {
         let core_call_index = self.scheduler.encode_calls();
         let Some(expected) = self.expected_next_chunk_frames() else {
             return Err(ComputedFileError::StreamInputAlreadyComplete.into());
@@ -171,7 +171,7 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
         &mut self,
         channels: &[&[i16]],
         mut on_progress: F,
-    ) -> Result<(), ComputedWriteError>
+    ) -> Result<(), EncodeError>
     where
         F: FnMut(EncodeProgress),
     {
@@ -179,14 +179,14 @@ impl<W: Write> Atrac3plusStreamEncoder<W> {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<(W, Atrac3plusStreamSummary), ComputedWriteError> {
+    pub fn finish(self) -> Result<(W, Atrac3plusStreamSummary), EncodeError> {
         self.finish_with_progress(|_| {})
     }
 
     pub fn finish_with_progress<F>(
         mut self,
         mut on_progress: F,
-    ) -> Result<(W, Atrac3plusStreamSummary), ComputedWriteError>
+    ) -> Result<(W, Atrac3plusStreamSummary), EncodeError>
     where
         F: FnMut(EncodeProgress),
     {
@@ -356,7 +356,7 @@ mod tests {
         encoder.push_pcm(&[&pcm[0], &pcm[1]]).unwrap();
         assert!(matches!(
             encoder.finish(),
-            Err(ComputedWriteError::File(
+            Err(EncodeError::File(
                 ComputedFileError::IncompleteStreamInput {
                     expected_sample_frames: 6144,
                     actual_sample_frames: 2048,
@@ -383,8 +383,8 @@ mod tests {
         }
         assert!(matches!(
             encoder.finish(),
-            Err(ComputedWriteError::Io {
-                stage: ComputedWriteStage::OutputFrame { .. },
+            Err(EncodeError::Io {
+                stage: WriteStage::OutputFrame { .. },
                 ..
             })
         ));

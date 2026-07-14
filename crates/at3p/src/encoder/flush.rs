@@ -62,14 +62,14 @@ pub struct InputTooShort {
 ///   call produces exactly 2048 bytes; the first output is at global core call 7.
 ///   dance 7787435→3804.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ComputedSchedule352 {
+pub struct EncodeSchedule {
     input_sample_frames: u32,
     encode_calls: u32,
     final_call_sample_frames: u32,
     flush_processing_calls: u32,
 }
 
-impl ComputedSchedule352 {
+impl EncodeSchedule {
     /// Derive the schedule from the input sample-frame count. Returns
     /// [`InputTooShort`] for `N < MIN_INPUT_SAMPLE_FRAMES` (there is no native
     /// schedule below the 6144 minimum — fail explicit, never guess).
@@ -183,7 +183,7 @@ pub enum FlushScheduleError {
 // Computes each output frame from PCM via [`ComputedFrameDriver`]. It reproduces
 // the native schedule contract for ANY input of
 // `N >= MIN_INPUT_SAMPLE_FRAMES` sample frames per channel, driven by a
-// [`ComputedSchedule352`] (see its doc comment for the native sources): encode
+// [`EncodeSchedule`] (see its doc comment for the native sources): encode
 // calls + PCM-processing flush calls (8 or 9) → output frames, first output at
 // (N=154064) this is exactly the archived 76 encode + 9 flush → 77 output
 // contract.
@@ -260,10 +260,10 @@ pub struct ComputedFrameResult {
 }
 
 /// Computed-frame flush scheduler. Owns the [`ComputedFrameDriver`], the derived
-/// [`ComputedSchedule352`], and the per-call PCM supply; computes each output
+/// [`EncodeSchedule`], and the per-call PCM supply; computes each output
 /// frame at its scheduled call.
 pub struct ComputedFlushScheduler {
-    schedule: ComputedSchedule352,
+    schedule: EncodeSchedule,
     /// Per-core-call PCM frames indexed `[core_call][channel][sample]`
     /// (`encode_calls + flush_processing_calls` entries: encode + PCM-processing
     /// flush; the trailing flush wrapper call is the "done" call and processes no
@@ -284,7 +284,7 @@ impl ComputedFlushScheduler {
     /// Total core-call PCM frames the driver expects for a schedule:
     /// `encode_calls + flush_processing_calls` (the trailing flush wrapper call
     /// is the "done" call and processes no PCM).
-    pub fn expected_frame_supply(schedule: &ComputedSchedule352) -> usize {
+    pub fn expected_frame_supply(schedule: &EncodeSchedule) -> usize {
         schedule.total_core_calls() as usize
     }
 
@@ -323,7 +323,7 @@ impl ComputedFlushScheduler {
     /// (docs/13 §1.1): the owned [`ComputedFrameDriver`] is seeded with `params`
     /// so every computed frame is per-rate (selector/budget/frame_bytes). The
     /// encode/flush/output SCHEDULE is rate-independent (docs/13 §2.3), so the
-    /// same [`ComputedSchedule352`] governs. At the 352 params this equals
+    /// same [`EncodeSchedule`] governs. At the 352 params this equals
     /// [`new`](Self::new).
     pub fn new_for_params(
         input_sample_frames: u32,
@@ -353,7 +353,7 @@ impl ComputedFlushScheduler {
         frames: Vec<Vec<Vec<f32>>>,
         params: CodingParams,
     ) -> Result<Self, ComputedFlushError> {
-        let schedule = ComputedSchedule352::new(input_sample_frames)?;
+        let schedule = EncodeSchedule::new(input_sample_frames)?;
         let expected = Self::expected_frame_supply(&schedule);
         if frames.len() != expected {
             return Err(ComputedFlushError::FrameSupplyLen {
@@ -398,7 +398,7 @@ impl ComputedFlushScheduler {
     }
 
     /// The derived schedule for this scheduler's input length.
-    pub fn schedule(&self) -> &ComputedSchedule352 {
+    pub fn schedule(&self) -> &EncodeSchedule {
         &self.schedule
     }
 
@@ -561,7 +561,7 @@ impl ComputedFlushScheduler {
 /// channel-count-sized zero frame is retained for native processing-flush calls;
 /// the trailing done call performs no core processing.
 pub struct IncrementalComputedFlushScheduler {
-    schedule: ComputedSchedule352,
+    schedule: EncodeSchedule,
     driver: ComputedFrameDriver,
     channel_count: usize,
     zero_frame: Vec<Vec<f32>>,
@@ -578,7 +578,7 @@ impl IncrementalComputedFlushScheduler {
     /// Construct only the native-derived schedule, persistent codec driver, and
     /// fixed-width flush storage. No caller PCM is retained here.
     pub fn new(input_sample_frames: u32, params: CodingParams) -> Result<Self, ComputedFlushError> {
-        let schedule = ComputedSchedule352::new(input_sample_frames)?;
+        let schedule = EncodeSchedule::new(input_sample_frames)?;
         let channel_count = params.channels as usize;
         Ok(Self {
             schedule,
@@ -595,7 +595,7 @@ impl IncrementalComputedFlushScheduler {
         })
     }
 
-    pub fn schedule(&self) -> &ComputedSchedule352 {
+    pub fn schedule(&self) -> &EncodeSchedule {
         &self.schedule
     }
 

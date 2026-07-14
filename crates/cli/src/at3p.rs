@@ -5,8 +5,7 @@ use std::path::Path;
 use at3p::container::{RiffReadError, inspect_target_pcm_wave_for_channels, inspect_wave_format};
 use at3p::{
     ATRAC3PLUS_MONO_PROFILES, ATRAC3PLUS_STEREO_PROFILES, Atrac3plusEncoder, Atrac3plusProfile,
-    EncodeError as ComputedWriteError, EncodePhase, EncodeProgress,
-    FileEncodeError as ComputedFileError, PCM_BLOCK_FRAMES, profile_by_bitrate_and_channels,
+    EncodeError, EncodePhase, EncodeProgress, PCM_BLOCK_FRAMES, profile_by_bitrate_and_channels,
 };
 
 use crate::args::EncodeArgs;
@@ -231,50 +230,11 @@ fn encode_computed(
     })
 }
 
-fn describe_computed_write_error(output: &Path, error: &ComputedWriteError) -> String {
-    match error {
-        ComputedWriteError::File(error) => format!(
-            "failed to assemble computed ATRACX file: {}",
-            describe_computed_file_error(error)
-        ),
-        ComputedWriteError::Io { stage, source } => format!(
-            "failed to write temporary output for `{}` at {stage:?}: {source}",
-            output.display()
-        ),
-    }
-}
-
-fn describe_computed_file_error(error: &ComputedFileError) -> String {
-    match error {
-        ComputedFileError::InputTooShort {
-            input_sample_frames,
-            minimum,
-        } => format!(
-            "too short input file: {input_sample_frames} sample frames; the native encoder \
-             requires at least {minimum} (native at3tool checkEncodeParam rejection)"
-        ),
-        ComputedFileError::UnsupportedInputShape {
-            expected_sample_frames,
-            actual_sample_frames,
-            left_len,
-            right_len,
-        } => format!(
-            "unsupported input shape: expected {expected_sample_frames} sample frames with matching \
-             left/right channels, got {actual_sample_frames} sample frames (left {left_len}, right {right_len})"
-        ),
-        ComputedFileError::UnsupportedMonoInputShape {
-            expected_sample_frames,
-            channel_count,
-            channel_len,
-        } => format!(
-            "unsupported mono input shape: expected 1 channel of {expected_sample_frames} sample \
-             frames, got {channel_count} channel(s) (first channel {channel_len})"
-        ),
-        ComputedFileError::UnsupportedProfile { bitrate_kbps } => format!(
-            "unsupported bitrate {bitrate_kbps} kbps: no native ATRAC3plus stereo profile exists"
-        ),
-        other => format!("{other:?}"),
-    }
+fn describe_computed_write_error(output: &Path, error: &EncodeError) -> String {
+    format!(
+        "failed to encode temporary output for `{}`: {error}",
+        output.display()
+    )
 }
 
 fn describe_riff_error(error: &RiffReadError) -> String {
