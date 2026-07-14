@@ -606,6 +606,7 @@ For a phase to merge, its relevant rows must pass without unexplained fixture ch
 
 ## 8. Pull request and commit strategy
 
+- Create every refactor commit without GPG signing. Use `git commit --no-gpg-sign` (or the equivalent one-command override `git -c commit.gpgSign=false commit`) even when the local or global Git configuration enables signing by default.
 - Prefer one architectural boundary per pull request.
 - Keep moves separate from behavioral edits where possible so diffs remain reviewable.
 - Do not combine both crates in a single commit unless the change is deliberately shared, such as CLI progress rendering.
