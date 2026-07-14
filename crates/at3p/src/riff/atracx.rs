@@ -141,13 +141,6 @@ impl AtracxWaveFormat {
         }
     }
 
-    /// The 352 kbps stereo `fmt ` payload (shipped target). Byte-identical to a
-    /// direct `for_rate(2048, 0x0100_28ff)`; kept as a named const so every 352
-    /// call site compiles unchanged.
-    pub const fn target_352() -> Self {
-        Self::for_rate(2048, 0x0100_28ff)
-    }
-
     pub fn to_fmt_payload(self) -> [u8; ATRACX_FMT_PAYLOAD_LEN] {
         let mut bytes = [0u8; ATRACX_FMT_PAYLOAD_LEN];
         bytes[0..2].copy_from_slice(&self.format_tag.to_le_bytes());

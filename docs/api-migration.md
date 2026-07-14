@@ -23,6 +23,5 @@ summaries share `input_sample_frames`, `output_frames`, `payload_bytes`, and
 contract.
 
 `at3p::encoder::api::PublicEncoderHandle` and the other native-compatible
-surfaces are no longer public. They remain private reference infrastructure;
-their `encode` and `flush_encode` stubs are not part of the supported encoder
-API.
+surfaces have been removed. Their encoder methods were permanent stubs and are
+not part of the supported crate-root API.
