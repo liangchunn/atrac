@@ -744,3 +744,35 @@ impl IncrementalFlushScheduler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_pins_minimum_exact_and_flush_boundary_lengths() {
+        assert!(matches!(
+            EncodeSchedule::new(MIN_INPUT_SAMPLE_FRAMES - 1),
+            Err(InputTooShort {
+                input_sample_frames: 6143,
+                minimum: MIN_INPUT_SAMPLE_FRAMES,
+            })
+        ));
+
+        let exact = EncodeSchedule::new(6144).unwrap();
+        assert_eq!(exact.encode_calls(), 3);
+        assert_eq!(exact.final_call_sample_frames(), 2048);
+        assert_eq!(exact.flush_processing_calls(), 9);
+        assert_eq!(exact.total_output_frames(), 5);
+
+        let last_1680 = EncodeSchedule::new(7824).unwrap();
+        assert_eq!(last_1680.final_call_sample_frames(), 1680);
+        assert_eq!(last_1680.flush_processing_calls(), 8);
+        assert_eq!(last_1680.total_output_frames(), 5);
+
+        let first_1681 = EncodeSchedule::new(7825).unwrap();
+        assert_eq!(first_1681.final_call_sample_frames(), 1681);
+        assert_eq!(first_1681.flush_processing_calls(), 9);
+        assert_eq!(first_1681.total_output_frames(), 6);
+    }
+}

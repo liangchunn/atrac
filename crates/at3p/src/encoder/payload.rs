@@ -35,7 +35,7 @@ pub enum EncodePhase {
 /// includes priming calls that emit no frame and the final flush done call, so
 /// it advances monotonically from the first encoder call through completion.
 /// `completed_output_frames / total_output_frames` separately describes the
-/// output schedule. Totals come from [`EncodeSchedule`].
+/// output schedule. Totals come from the encoder's length-derived schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeProgress {
     pub phase: EncodePhase,
@@ -268,7 +268,7 @@ pub enum WriteStage {
 
 /// Typed failure from a frame-oriented file write.
 ///
-/// Codec/container validation remains represented by [`FileError`].
+/// Codec/container validation remains represented by the nested file error.
 /// Sink failures retain both their exact write stage and the original
 /// [`io::Error`], including through [`std::error::Error::source`].
 #[derive(Debug)]

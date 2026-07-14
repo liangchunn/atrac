@@ -1,6 +1,8 @@
+use std::io::{self, Write};
+
 use at3p::{
     ATRAC3PLUS_MONO_PROFILES, ATRAC3PLUS_STEREO_PROFILES, Atrac3plusEncoder, Atrac3plusProfile,
-    encode_to_vec,
+    EncodeError, WriteStage, encode_to_vec,
 };
 
 fn generated_pcm(channels: usize, frames: usize) -> Vec<Vec<i16>> {
@@ -97,4 +99,40 @@ fn low_middle_and_high_rates_preserve_partial_final_blocks() {
             profile.channels()
         );
     }
+}
+
+#[derive(Debug)]
+struct FailImmediately;
+
+impl Write for FailImmediately {
+    fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+        Err(io::Error::other("injected header failure"))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn minimum_shape_and_header_failure_errors_are_typed() {
+    let profile = ATRAC3PLUS_STEREO_PROFILES[8];
+    assert!(matches!(
+        Atrac3plusEncoder::new(Vec::new(), &profile, 6143),
+        Err(EncodeError::File(_))
+    ));
+    assert!(matches!(
+        Atrac3plusEncoder::new(FailImmediately, &profile, 6144),
+        Err(EncodeError::Io {
+            stage: WriteStage::Header,
+            ..
+        })
+    ));
+
+    let mut encoder = Atrac3plusEncoder::new(Vec::new(), &profile, 6144).unwrap();
+    let wrong_channel = vec![0_i16; encoder.expected_next_chunk_frames().unwrap()];
+    assert!(matches!(
+        encoder.push_pcm(&[&wrong_channel]),
+        Err(EncodeError::File(_))
+    ));
 }
