@@ -1,59 +1,13 @@
-use std::io::{self, IsTerminal, Write};
+use std::io::Write;
 use std::path::Path;
 
-use at3::{Atrac3Encoder, Atrac3Profile, EncodePhase, EncodeProgress, PCM_BLOCK_FRAMES};
+use at3::{Atrac3Encoder, Atrac3Profile, PCM_BLOCK_FRAMES};
 use hound::SampleFormat;
 
 use crate::args::EncodeArgs;
 use crate::output::create_pending_output;
 use crate::pcm::PcmWaveStream;
-
-/// Interactive CLI renderer for the library's exact sound-unit progress.
-/// Redirected stderr receives no progress redraws; library callers can consume
-/// every update through the callback-enabled stream methods.
-struct CliProgress {
-    enabled: bool,
-    active_line: bool,
-}
-
-impl CliProgress {
-    fn new() -> Self {
-        Self {
-            enabled: io::stderr().is_terminal(),
-            active_line: false,
-        }
-    }
-
-    fn update(&mut self, progress: EncodeProgress) {
-        if !self.enabled {
-            return;
-        }
-
-        let phase = match progress.phase {
-            EncodePhase::Encoding => "Encoding",
-            EncodePhase::Flushing => "Flushing",
-        };
-        let percent = f64::from(progress.completed_steps) * 100.0 / f64::from(progress.total_steps);
-        let mut stderr = io::stderr().lock();
-        let _ = write!(
-            stderr,
-            "\r{phase}: {percent:5.1}% ({}/{}) - {}/{} output frames",
-            progress.completed_steps,
-            progress.total_steps,
-            progress.completed_output_frames,
-            progress.total_output_frames,
-        );
-        let _ = stderr.flush();
-        self.active_line = true;
-    }
-
-    fn finish(&mut self) {
-        if self.active_line {
-            eprintln!();
-            self.active_line = false;
-        }
-    }
-}
+use crate::progress::CliProgress;
 
 pub fn run(args: EncodeArgs) -> anyhow::Result<()> {
     encode(args.bitrate, &args.input, &args.output)

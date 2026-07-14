@@ -1,63 +1,17 @@
 use std::fs::File;
-use std::io::{self, IsTerminal, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use at3p::container::{RiffReadError, inspect_target_pcm_wave_for_channels, inspect_wave_format};
 use at3p::{
     ATRAC3PLUS_MONO_PROFILES, ATRAC3PLUS_STEREO_PROFILES, Atrac3plusEncoder, Atrac3plusProfile,
-    EncodeError, EncodePhase, EncodeProgress, PCM_BLOCK_FRAMES, profile_by_bitrate_and_channels,
+    EncodeError, PCM_BLOCK_FRAMES, profile_by_bitrate_and_channels,
 };
 
 use crate::args::EncodeArgs;
 use crate::output::create_pending_output;
 use crate::pcm::PcmWaveStream;
-
-/// Interactive CLI renderer for the library's exact native-schedule progress.
-/// Redirected stderr stays clean; callers embedding the library receive every
-/// update directly through the callback-enabled assembly entry points.
-struct CliProgress {
-    enabled: bool,
-    active_line: bool,
-}
-
-impl CliProgress {
-    fn new() -> Self {
-        Self {
-            enabled: io::stderr().is_terminal(),
-            active_line: false,
-        }
-    }
-
-    fn update(&mut self, progress: EncodeProgress) {
-        if !self.enabled {
-            return;
-        }
-
-        let phase = match progress.phase {
-            EncodePhase::Encoding => "Encoding",
-            EncodePhase::Flushing => "Flushing",
-        };
-        let percent = f64::from(progress.completed_steps) * 100.0 / f64::from(progress.total_steps);
-        let mut stderr = io::stderr().lock();
-        let _ = write!(
-            stderr,
-            "\r{phase}: {percent:5.1}% ({}/{}) - {}/{} output frames",
-            progress.completed_steps,
-            progress.total_steps,
-            progress.completed_output_frames,
-            progress.total_output_frames,
-        );
-        let _ = stderr.flush();
-        self.active_line = true;
-    }
-
-    fn finish(&mut self) {
-        if self.active_line {
-            eprintln!();
-            self.active_line = false;
-        }
-    }
-}
+use crate::progress::CliProgress;
 
 pub fn run(command: EncodeArgs) -> Result<(), String> {
     // Preserve the native-style validation precedence: permissive format/channel

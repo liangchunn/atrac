@@ -3,6 +3,7 @@ mod at3;
 mod at3p;
 mod output;
 mod pcm;
+mod progress;
 
 use std::process::ExitCode;
 
