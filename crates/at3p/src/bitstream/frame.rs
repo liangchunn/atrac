@@ -101,7 +101,10 @@ use super::pack_spectral::{
     PackSpectralError, pack_spectral_descriptor_unit, pack_spectral_idspcqu_tail,
 };
 use super::writer::{BitWriter, BitWriterError};
-use crate::pipeline::syntax::{FrameSyntax, IdctCountSyntax, IdctEncodingSyntax, IdctSyntax};
+use crate::pipeline::syntax::{
+    FrameSyntax, IdctCountSyntax, IdctEncodingSyntax, IdctSyntax, IdsfEncodingSyntax, IdsfSyntax,
+    IdwlEncodingSyntax, IdwlSyntax,
+};
 use crate::tables::at5::{isps_at5, nsps_at5};
 use crate::tables::generated::{G_A_IDSPCBANDS_AT5, G_A_IDSPCQUS_AT5};
 use crate::tables::spectral::SPECTRAL_DESCRIPTOR_SLOTS;
@@ -183,11 +186,19 @@ impl ObjectState {
             .ok_or(FrameAssemblyError::MissingConfigWord { offset })
     }
 
-    fn u32_array(&self, offset: usize, count: usize) -> Result<Vec<u32>, FrameAssemblyError> {
+    pub(crate) fn u32_array(
+        &self,
+        offset: usize,
+        count: usize,
+    ) -> Result<Vec<u32>, FrameAssemblyError> {
         (0..count).map(|i| self.u32(offset + i * 4)).collect()
     }
 
-    fn i32_array(&self, offset: usize, count: usize) -> Result<Vec<i32>, FrameAssemblyError> {
+    pub(crate) fn i32_array(
+        &self,
+        offset: usize,
+        count: usize,
+    ) -> Result<Vec<i32>, FrameAssemblyError> {
         Ok(self
             .u32_array(offset, count)?
             .into_iter()
@@ -393,34 +404,60 @@ fn pack_frame_at5_impl(
 
         let nblk = group.nblk;
         let quant_unit_count = cfg_source.cfg_u32(0xb0)? as usize;
+        let syntax_quant_unit_count = syntax_group
+            .map(|group| group.header().quant_unit_count)
+            .unwrap_or(quant_unit_count);
 
         // IDWL section (native 46226..46260).
         for (i, obj) in group.objects.iter().enumerate().take(nblk) {
-            let mode = obj.u32(0x1c70c)?;
+            let typed = syntax_group.and_then(|group| group.channels().get(i));
+            if syntax_group.is_some() && typed.is_none() {
+                return Err(FrameAssemblyError::UnpinnedOrdering {
+                    section: "typed_channel_count",
+                });
+            }
+            let mode = match typed {
+                Some(channel) => channel.idwl().mode,
+                None => obj.u32(0x1c70c)?,
+            };
             {
                 writer.write_bits(mode, 2)?;
                 Ok::<(), FrameAssemblyError>(())
             }?;
-            pack_idwl(writer, group, i, obj)?;
+            if let Some(channel) = typed {
+                pack_idwl_syntax(writer, channel.channel_index, channel.idwl())?;
+            } else {
+                pack_idwl(writer, group, i, obj)?;
+            }
         }
 
         // IDSF section (native 46261..46294).
-        if quant_unit_count > 0 {
+        if syntax_quant_unit_count > 0 {
             for (i, obj) in group.objects.iter().enumerate().take(nblk) {
-                let mode = obj.u32(0x1c73c)?;
+                let typed = syntax_group.and_then(|group| group.channels().get(i));
+                if syntax_group.is_some() && typed.is_none() {
+                    return Err(FrameAssemblyError::UnpinnedOrdering {
+                        section: "typed_channel_count",
+                    });
+                }
+                let mode = match typed {
+                    Some(channel) => channel.idsf().mode,
+                    None => obj.u32(0x1c73c)?,
+                };
                 {
                     writer.write_bits(mode, 2)?;
                     Ok::<(), FrameAssemblyError>(())
                 }?;
-                pack_idsf(writer, group, i, obj)?;
+                if let Some(channel) = typed {
+                    pack_idsf_syntax(writer, channel.idsf())?;
+                } else {
+                    pack_idsf(writer, group, i, obj)?;
+                }
             }
         }
 
         // IDCT section (native 46295..46377).
-        let idct_quant_unit_count = syntax_group
-            .map(|group| group.header().quant_unit_count)
-            .unwrap_or(quant_unit_count);
-        if idct_quant_unit_count > 0 {
+        if syntax_quant_unit_count > 0 {
             let bandwidth_gate = match syntax_group {
                 Some(group) => u32::from(group.header().bandwidth_gate),
                 None => cfg_source.cfg_u32(0x90)?,
@@ -668,6 +705,114 @@ fn pack_idwl(
     Ok(())
 }
 
+fn pack_idwl_syntax(
+    writer: &mut BitWriter<'_>,
+    channel_index: u32,
+    syntax: &IdwlSyntax,
+) -> Result<(), FrameAssemblyError> {
+    match &syntax.encoding {
+        IdwlEncodingSyntax::Raw { word_lengths } => pack_idwl_0_at5(writer, word_lengths)?,
+        IdwlEncodingSyntax::Direct {
+            selector_a,
+            selector_b,
+            count,
+            mode3_value,
+            prefix_count,
+            residual_bits,
+            residual_base,
+            values,
+        } => pack_idwl_1_at5(
+            writer,
+            &Idwl1Fields {
+                channel_flag: channel_index,
+                selector_a: *selector_a,
+                selector_b: *selector_b,
+                count: *count,
+                mode3_value: *mode3_value,
+                prefix_count: *prefix_count,
+                residual_bits: *residual_bits,
+                residual_base: *residual_base,
+                values,
+            },
+        )?,
+        IdwlEncodingSyntax::Grouped {
+            selector_b,
+            count,
+            mode3_value,
+            subgroup_flag,
+            huffman_selector,
+            field_3bits,
+            field_4bits,
+            group_flags,
+            symbols,
+        } => pack_idwl_2_at5(
+            writer,
+            &Idwl2Fields {
+                channel_flag: channel_index,
+                selector_b: *selector_b,
+                count: *count,
+                mode3_value: *mode3_value,
+                subgroup_flag: *subgroup_flag,
+                huffman_selector: *huffman_selector,
+                field_3bits: *field_3bits,
+                field_4bits: *field_4bits,
+                group_flags,
+                symbols,
+            },
+        )?,
+        IdwlEncodingSyntax::Delta {
+            selector_a,
+            selector_b,
+            count,
+            config_count,
+            mode3_value,
+            huffman_selector,
+            values,
+        } => pack_idwl_3_at5(
+            writer,
+            &Idwl3Fields {
+                channel_flag: channel_index,
+                selector_a: *selector_a,
+                selector_b: *selector_b,
+                count: *count,
+                config_count: *config_count,
+                mode3_value: *mode3_value,
+                huffman_selector: *huffman_selector,
+                values,
+            },
+        )?,
+        IdwlEncodingSyntax::Previous {
+            progressive,
+            selector_b,
+            count,
+            config_count,
+            mode3_value,
+            huffman_selector,
+            current_values,
+            previous_values,
+            tail_flags,
+        } => {
+            let fields = Idwl4Fields {
+                channel_flag: channel_index,
+                selector_b: *selector_b,
+                count: *count,
+                config_count: *config_count,
+                mode3_value: *mode3_value,
+                huffman_selector: *huffman_selector,
+                current_values,
+                previous_values,
+                tail_flags,
+            };
+            if *progressive {
+                pack_idwl_5_at5(writer, &fields)?;
+            } else {
+                pack_idwl_4_at5(writer, &fields)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn pack_idsf(
     writer: &mut BitWriter<'_>,
     group: &BlockGroup,
@@ -787,6 +932,92 @@ fn pack_idsf(
         }
     }
     let _ = index;
+    Ok(())
+}
+
+fn pack_idsf_syntax(
+    writer: &mut BitWriter<'_>,
+    syntax: &IdsfSyntax,
+) -> Result<(), FrameAssemblyError> {
+    match &syntax.encoding {
+        IdsfEncodingSyntax::Raw { values } => pack_idsf_0_at5(writer, values)?,
+        IdsfEncodingSyntax::Direct {
+            mode_selector,
+            field_a,
+            field_b,
+            prefix_count,
+            residual_bits,
+            residual_base,
+            count,
+            values,
+        } => pack_idsf_1_at5(
+            writer,
+            &Idsf1Fields {
+                mode_selector: *mode_selector,
+                field_0x1c758: *field_a,
+                field_0x1c754: *field_b,
+                prefix_count: *prefix_count,
+                residual_bits: *residual_bits,
+                residual_base: *residual_base,
+                count: *count,
+                values,
+            },
+        )?,
+        IdsfEncodingSyntax::Grouped {
+            huffman_selector,
+            field_a,
+            field_b,
+            count,
+            symbols,
+        } => pack_idsf_2_at5(
+            writer,
+            &Idsf2Fields {
+                huffman_selector: *huffman_selector,
+                field_0x1c758: *field_a,
+                field_0x1c754: *field_b,
+                count: *count,
+                symbols,
+            },
+        )?,
+        IdsfEncodingSyntax::Delta {
+            mode_selector,
+            huffman_selector,
+            field_a,
+            field_b,
+            count,
+            values,
+        } => pack_idsf_3_at5(
+            writer,
+            &Idsf3Fields {
+                mode_selector: *mode_selector,
+                huffman_selector: *huffman_selector,
+                field_0x1c758: *field_a,
+                field_0x1c754: *field_b,
+                count: *count,
+                values,
+            },
+        )?,
+        IdsfEncodingSyntax::Previous {
+            progressive,
+            huffman_selector,
+            count,
+            current_values,
+            previous_values,
+        } => {
+            let fields = Idsf4Fields {
+                huffman_selector: *huffman_selector,
+                count: *count,
+                current_values,
+                previous_values,
+            };
+            if *progressive {
+                pack_idsf_5_at5(writer, &fields)?;
+            } else {
+                pack_idsf_4_at5(writer, &fields)?;
+            }
+        }
+        IdsfEncodingSyntax::Empty => pack_idsf_6_at5(writer)?,
+    }
     Ok(())
 }
 

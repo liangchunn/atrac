@@ -38,12 +38,112 @@ pub(crate) struct BlockHeaderSyntax {
 pub(crate) struct ChannelSyntax {
     pub channel_index: u32,
     pub previous_channel: Option<usize>,
-    pub idwl_mode: u32,
-    pub idsf_mode: u32,
+    pub idwl: IdwlSyntax,
+    pub idsf: IdsfSyntax,
     pub idct: IdctSyntax,
     pub gain_present: bool,
     pub gha_present: bool,
     pub gha_idam_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdsfSyntax {
+    pub mode: u32,
+    pub encoding: IdsfEncodingSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdsfEncodingSyntax {
+    Raw {
+        values: Vec<u32>,
+    },
+    Direct {
+        mode_selector: usize,
+        field_a: u32,
+        field_b: u32,
+        prefix_count: usize,
+        residual_bits: u8,
+        residual_base: i32,
+        count: usize,
+        values: Vec<i32>,
+    },
+    Grouped {
+        huffman_selector: usize,
+        field_a: u32,
+        field_b: u32,
+        count: usize,
+        symbols: Vec<u32>,
+    },
+    Delta {
+        mode_selector: usize,
+        huffman_selector: usize,
+        field_a: u32,
+        field_b: u32,
+        count: usize,
+        values: Vec<i32>,
+    },
+    Previous {
+        progressive: bool,
+        huffman_selector: usize,
+        count: usize,
+        current_values: Vec<u32>,
+        previous_values: Vec<u32>,
+    },
+    Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdwlSyntax {
+    pub mode: u32,
+    pub encoding: IdwlEncodingSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdwlEncodingSyntax {
+    Raw {
+        word_lengths: Vec<u32>,
+    },
+    Direct {
+        selector_a: u32,
+        selector_b: u32,
+        count: usize,
+        mode3_value: u32,
+        prefix_count: usize,
+        residual_bits: u8,
+        residual_base: u32,
+        values: Vec<u32>,
+    },
+    Grouped {
+        selector_b: u32,
+        count: usize,
+        mode3_value: u32,
+        subgroup_flag: u32,
+        huffman_selector: usize,
+        field_3bits: u32,
+        field_4bits: u32,
+        group_flags: Vec<u32>,
+        symbols: Vec<u32>,
+    },
+    Delta {
+        selector_a: u32,
+        selector_b: u32,
+        count: usize,
+        config_count: usize,
+        mode3_value: u32,
+        huffman_selector: usize,
+        values: Vec<u32>,
+    },
+    Previous {
+        progressive: bool,
+        selector_b: u32,
+        count: usize,
+        config_count: usize,
+        mode3_value: u32,
+        huffman_selector: usize,
+        current_values: Vec<u32>,
+        previous_values: Vec<u32>,
+        tail_flags: Vec<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +210,28 @@ pub enum FrameSyntaxError {
         channel: usize,
         section: &'static str,
         mode: u32,
+    },
+    InvalidIdwlEncoding {
+        group: usize,
+        channel: usize,
+        expected: &'static str,
+        actual: &'static str,
+    },
+    InvalidIdwlPayload {
+        group: usize,
+        channel: usize,
+        detail: &'static str,
+    },
+    InvalidIdsfEncoding {
+        group: usize,
+        channel: usize,
+        expected: &'static str,
+        actual: &'static str,
+    },
+    InvalidIdsfPayload {
+        group: usize,
+        channel: usize,
+        detail: &'static str,
     },
     InvalidPreviousChannel {
         group: usize,
@@ -194,6 +316,139 @@ impl FrameSyntax {
                 .take(group.nblk)
                 .enumerate()
                 .map(|(channel_index, object)| {
+                    let idwl_mode = object.u32(0x1c70c)?;
+                    let idwl_dispatch = (idwl_mode & 3) + ((object.channel_index & 1) << 2);
+                    let idwl_config_count = object.cfg_u32(0xc4)? as usize;
+                    let idwl_count = object.u32(0x1c728)? as usize;
+                    let idwl_encoding = match idwl_dispatch {
+                        0 | 4 => IdwlEncodingSyntax::Raw {
+                            word_lengths: object.u32_array(0x1b5f8, idwl_config_count)?,
+                        },
+                        1 => IdwlEncodingSyntax::Direct {
+                            selector_a: object.u32(0x1c71c)?,
+                            selector_b: object.u32(0x1c724)?,
+                            count: idwl_count,
+                            mode3_value: object.u32(0x1c72c)?,
+                            prefix_count: object.u32(0x1c710)? as usize,
+                            residual_bits: object.u32(0x1c714)? as u8,
+                            residual_base: object.u32(0x1c718)?,
+                            values: object.u32_array(0x1c7f0, idwl_count)?,
+                        },
+                        2 => {
+                            let group_count = object.cfg_u32(0xd4)? as usize;
+                            let group_flags = (0..group_count)
+                                .map(|index| object.cfg_u32(0xd8 + index * 4))
+                                .collect::<Result<Vec<_>, FrameAssemblyError>>()?;
+                            IdwlEncodingSyntax::Grouped {
+                                selector_b: object.u32(0x1c724)?,
+                                count: idwl_count,
+                                mode3_value: object.u32(0x1c72c)?,
+                                subgroup_flag: object.u32(0x1c738)?,
+                                huffman_selector: object.u32(0x1c720)? as usize,
+                                field_3bits: object.u32(0x1c734)?,
+                                field_4bits: object.u32(0x1c730)?,
+                                group_flags,
+                                symbols: object.u32_array(0x1c870, idwl_count)?,
+                            }
+                        }
+                        3 | 7 => IdwlEncodingSyntax::Delta {
+                            selector_a: object.u32(0x1c71c)?,
+                            selector_b: object.u32(0x1c724)?,
+                            count: idwl_count,
+                            config_count: idwl_config_count,
+                            mode3_value: object.u32(0x1c72c)?,
+                            huffman_selector: object.u32(0x1c720)? as usize,
+                            values: object.u32_array(0x1c7f0, idwl_config_count)?,
+                        },
+                        5 | 6 => {
+                            let previous = object
+                                .previous_index
+                                .and_then(|index| group.objects.get(index))
+                                .ok_or(FrameSyntaxError::MissingPreviousChannel {
+                                    group: group_index,
+                                    channel: channel_index,
+                                })?;
+                            IdwlEncodingSyntax::Previous {
+                                progressive: idwl_dispatch == 6,
+                                selector_b: object.u32(0x1c724)?,
+                                count: idwl_count,
+                                config_count: idwl_config_count,
+                                mode3_value: object.u32(0x1c72c)?,
+                                huffman_selector: object.u32(0x1c720)? as usize,
+                                current_values: object.u32_array(0x1b5f8, idwl_config_count)?,
+                                previous_values: previous.u32_array(0x1b5f8, idwl_config_count)?,
+                                tail_flags: object.u32_array(0x1c7f0, idwl_config_count)?,
+                            }
+                        }
+                        _ => unreachable!("masked IDWL dispatch index"),
+                    };
+                    let idsf_mode = object.u32(0x1c73c)?;
+                    let idsf_dispatch = (idsf_mode & 3) + ((object.channel_index & 1) << 2);
+                    let idsf_count = header.quant_unit_count;
+                    let idsf_encoding = match idsf_dispatch {
+                        0 | 4 => IdsfEncodingSyntax::Raw {
+                            values: object.u32_array(0x1b678, idsf_count)?,
+                        },
+                        1 => {
+                            let mode_selector = (object.u32(0x1c750)? & 3) as usize;
+                            IdsfEncodingSyntax::Direct {
+                                mode_selector,
+                                field_a: object.u32(0x1c758)?,
+                                field_b: object.u32(0x1c754)?,
+                                prefix_count: object.u32(0x1c740)? as usize,
+                                residual_bits: object.u32(0x1c744)? as u8,
+                                residual_base: object.u32(0x1c748)? as i32,
+                                count: idsf_count,
+                                values: object
+                                    .i32_array(0x1c8f0 + mode_selector * 0x80, idsf_count)?,
+                            }
+                        }
+                        2 => IdsfEncodingSyntax::Grouped {
+                            huffman_selector: (object.u32(0x1c74c)? & 3) as usize,
+                            field_a: object.u32(0x1c758)?,
+                            field_b: object.u32(0x1c754)?,
+                            count: idsf_count,
+                            symbols: object.u32_array(0x1ca70, idsf_count)?,
+                        },
+                        3 => {
+                            let mode_selector = (object.u32(0x1c750)? & 3) as usize;
+                            IdsfEncodingSyntax::Delta {
+                                mode_selector,
+                                huffman_selector: (object.u32(0x1c74c)? & 3) as usize,
+                                field_a: object.u32(0x1c758)?,
+                                field_b: object.u32(0x1c754)?,
+                                count: idsf_count,
+                                values: object
+                                    .i32_array(0x1c8f0 + mode_selector * 0x80, idsf_count)?,
+                            }
+                        }
+                        5 | 6 => {
+                            let previous = object
+                                .previous_index
+                                .and_then(|index| group.objects.get(index))
+                                .ok_or(FrameSyntaxError::MissingPreviousChannel {
+                                    group: group_index,
+                                    channel: channel_index,
+                                })?;
+                            IdsfEncodingSyntax::Previous {
+                                progressive: idsf_dispatch == 6,
+                                huffman_selector: (object.u32(0x1c74c)? & 3) as usize,
+                                count: idsf_count,
+                                current_values: object.u32_array(0x1b678, idsf_count)?,
+                                previous_values: previous.u32_array(0x1b678, idsf_count)?,
+                            }
+                        }
+                        7 => {
+                            if object.previous_index.is_none() {
+                                return Err(FrameSyntaxError::MissingPreviousChannel {
+                                    group: group_index,
+                                    channel: channel_index,
+                                });
+                            }
+                            IdsfEncodingSyntax::Empty
+                        }
+                        _ => unreachable!("masked IDSF dispatch index"),
+                    };
                     let mode = object.u32(0x1078)?;
                     let count = if object.u32(0x1080)? == 0 {
                         IdctCountSyntax::FullBand(header.quant_unit_count)
@@ -233,8 +488,14 @@ impl FrameSyntax {
                     Ok(ChannelSyntax {
                         channel_index: object.channel_index,
                         previous_channel: object.previous_index,
-                        idwl_mode: object.u32(0x1c70c)?,
-                        idsf_mode: object.u32(0x1c73c)?,
+                        idwl: IdwlSyntax {
+                            mode: idwl_mode,
+                            encoding: idwl_encoding,
+                        },
+                        idsf: IdsfSyntax {
+                            mode: idsf_mode,
+                            encoding: idsf_encoding,
+                        },
                         idct: IdctSyntax {
                             bandwidth: object.u32(0x1074)? != 0,
                             mode,
@@ -297,8 +558,8 @@ impl FrameSyntax {
             }
             for (channel_index, channel) in syntax.channels.iter().enumerate() {
                 for (section, mode) in [
-                    ("idwl", channel.idwl_mode),
-                    ("idsf", channel.idsf_mode),
+                    ("idwl", channel.idwl.mode),
+                    ("idsf", channel.idsf.mode),
                     ("idct", channel.idct.mode),
                 ] {
                     if mode > 3 {
@@ -309,6 +570,48 @@ impl FrameSyntax {
                             mode,
                         });
                     }
+                }
+                let expected_idwl =
+                    IdwlEncodingSyntax::kind_for_dispatch(channel.idwl.mode, channel.channel_index);
+                if channel.idwl.encoding.kind() != expected_idwl {
+                    return Err(FrameSyntaxError::InvalidIdwlEncoding {
+                        group: group_index,
+                        channel: channel_index,
+                        expected: expected_idwl,
+                        actual: channel.idwl.encoding.kind(),
+                    });
+                }
+                if let Err(detail) = channel
+                    .idwl
+                    .encoding
+                    .validate(syntax.header.quant_header as usize)
+                {
+                    return Err(FrameSyntaxError::InvalidIdwlPayload {
+                        group: group_index,
+                        channel: channel_index,
+                        detail,
+                    });
+                }
+                let expected_idsf =
+                    IdsfEncodingSyntax::kind_for_dispatch(channel.idsf.mode, channel.channel_index);
+                if channel.idsf.encoding.kind() != expected_idsf {
+                    return Err(FrameSyntaxError::InvalidIdsfEncoding {
+                        group: group_index,
+                        channel: channel_index,
+                        expected: expected_idsf,
+                        actual: channel.idsf.encoding.kind(),
+                    });
+                }
+                if let Err(detail) = channel
+                    .idsf
+                    .encoding
+                    .validate(syntax.header.quant_unit_count)
+                {
+                    return Err(FrameSyntaxError::InvalidIdsfPayload {
+                        group: group_index,
+                        channel: channel_index,
+                        detail,
+                    });
                 }
                 if let Some(previous) = channel.previous_channel
                     && previous >= syntax.channels.len()
@@ -405,8 +708,262 @@ impl BlockGroupSyntax {
 }
 
 impl ChannelSyntax {
+    pub(crate) fn idwl(&self) -> &IdwlSyntax {
+        &self.idwl
+    }
+
     pub(crate) fn idct(&self) -> &IdctSyntax {
         &self.idct
+    }
+
+    pub(crate) fn idsf(&self) -> &IdsfSyntax {
+        &self.idsf
+    }
+}
+
+impl IdwlEncodingSyntax {
+    fn kind_for_dispatch(mode: u32, channel_index: u32) -> &'static str {
+        match (mode & 3) + ((channel_index & 1) << 2) {
+            0 | 4 => "raw",
+            1 => "direct",
+            2 => "grouped",
+            3 | 7 => "delta",
+            5 => "previous",
+            6 => "progressive-previous",
+            _ => unreachable!("masked IDWL dispatch index"),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Raw { .. } => "raw",
+            Self::Direct { .. } => "direct",
+            Self::Grouped { .. } => "grouped",
+            Self::Delta { .. } => "delta",
+            Self::Previous {
+                progressive: false, ..
+            } => "previous",
+            Self::Previous {
+                progressive: true, ..
+            } => "progressive-previous",
+        }
+    }
+
+    fn validate(&self, config_count: usize) -> Result<(), &'static str> {
+        match self {
+            Self::Raw { word_lengths } => (word_lengths.len() == config_count)
+                .then_some(())
+                .ok_or("raw word-length count"),
+            Self::Direct {
+                count,
+                prefix_count,
+                residual_bits,
+                values,
+                ..
+            } => {
+                if *count > config_count {
+                    return Err("direct active count");
+                }
+                if *prefix_count > *count {
+                    return Err("direct prefix count");
+                }
+                if *residual_bits > 3 {
+                    return Err("direct residual width");
+                }
+                (values.len() == *count)
+                    .then_some(())
+                    .ok_or("direct value count")
+            }
+            Self::Grouped {
+                count,
+                huffman_selector,
+                group_flags,
+                symbols,
+                ..
+            } => {
+                if *count > config_count {
+                    return Err("grouped active count");
+                }
+                if *huffman_selector > 1 {
+                    return Err("grouped Huffman selector");
+                }
+                if group_flags.len() * 2 > *count {
+                    return Err("grouped flag count");
+                }
+                (symbols.len() == *count)
+                    .then_some(())
+                    .ok_or("grouped symbol count")
+            }
+            Self::Delta {
+                count,
+                config_count: payload_config_count,
+                huffman_selector,
+                values,
+                ..
+            } => {
+                if *payload_config_count != config_count {
+                    return Err("delta config count");
+                }
+                if *count > config_count {
+                    return Err("delta active count");
+                }
+                if *huffman_selector > 3 {
+                    return Err("delta Huffman selector");
+                }
+                (values.len() == config_count)
+                    .then_some(())
+                    .ok_or("delta value count")
+            }
+            Self::Previous {
+                count,
+                config_count: payload_config_count,
+                huffman_selector,
+                current_values,
+                previous_values,
+                tail_flags,
+                ..
+            } => {
+                if *payload_config_count != config_count {
+                    return Err("previous config count");
+                }
+                if *count > config_count {
+                    return Err("previous active count");
+                }
+                if *huffman_selector > 3 {
+                    return Err("previous Huffman selector");
+                }
+                if current_values.len() != config_count {
+                    return Err("previous current-value count");
+                }
+                if previous_values.len() != config_count {
+                    return Err("previous predictor count");
+                }
+                (tail_flags.len() == config_count)
+                    .then_some(())
+                    .ok_or("previous tail-flag count")
+            }
+        }
+    }
+}
+
+impl IdsfEncodingSyntax {
+    fn kind_for_dispatch(mode: u32, channel_index: u32) -> &'static str {
+        match (mode & 3) + ((channel_index & 1) << 2) {
+            0 | 4 => "raw",
+            1 => "direct",
+            2 => "grouped",
+            3 => "delta",
+            5 => "previous",
+            6 => "progressive-previous",
+            7 => "empty",
+            _ => unreachable!("masked IDSF dispatch index"),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Raw { .. } => "raw",
+            Self::Direct { .. } => "direct",
+            Self::Grouped { .. } => "grouped",
+            Self::Delta { .. } => "delta",
+            Self::Previous {
+                progressive: false, ..
+            } => "previous",
+            Self::Previous {
+                progressive: true, ..
+            } => "progressive-previous",
+            Self::Empty => "empty",
+        }
+    }
+
+    fn validate(&self, quant_unit_count: usize) -> Result<(), &'static str> {
+        match self {
+            Self::Raw { values } => (values.len() == quant_unit_count)
+                .then_some(())
+                .ok_or("raw value count"),
+            Self::Direct {
+                mode_selector,
+                prefix_count,
+                residual_bits,
+                count,
+                values,
+                ..
+            } => {
+                if *count != quant_unit_count {
+                    return Err("direct quant-unit count");
+                }
+                if *mode_selector > 3 {
+                    return Err("direct compact selector");
+                }
+                if *prefix_count > *count {
+                    return Err("direct prefix count");
+                }
+                let max_residual_bits = if *mode_selector == 3 { 3 } else { 7 };
+                if *residual_bits > max_residual_bits {
+                    return Err("direct residual width");
+                }
+                (values.len() == *count)
+                    .then_some(())
+                    .ok_or("direct value count")
+            }
+            Self::Grouped {
+                huffman_selector,
+                count,
+                symbols,
+                ..
+            } => {
+                if *count != quant_unit_count {
+                    return Err("grouped quant-unit count");
+                }
+                if *huffman_selector > 3 {
+                    return Err("grouped Huffman selector");
+                }
+                (symbols.len() == *count)
+                    .then_some(())
+                    .ok_or("grouped symbol count")
+            }
+            Self::Delta {
+                mode_selector,
+                huffman_selector,
+                count,
+                values,
+                ..
+            } => {
+                if *count != quant_unit_count {
+                    return Err("delta quant-unit count");
+                }
+                if *mode_selector > 3 {
+                    return Err("delta compact selector");
+                }
+                if *huffman_selector > 3 {
+                    return Err("delta Huffman selector");
+                }
+                (values.len() == *count)
+                    .then_some(())
+                    .ok_or("delta value count")
+            }
+            Self::Previous {
+                huffman_selector,
+                count,
+                current_values,
+                previous_values,
+                ..
+            } => {
+                if *count != quant_unit_count {
+                    return Err("previous quant-unit count");
+                }
+                if *huffman_selector > 3 {
+                    return Err("previous Huffman selector");
+                }
+                if current_values.len() != *count {
+                    return Err("previous current-value count");
+                }
+                (previous_values.len() == *count)
+                    .then_some(())
+                    .ok_or("previous predictor count")
+            }
+            Self::Empty => Ok(()),
+        }
     }
 }
 
@@ -547,6 +1104,52 @@ mod tests {
                 let index = mode + channel_index * 4;
                 assert_eq!(
                     IdctEncodingSyntax::for_dispatch(mode as u32, channel_index as u32).kind(),
+                    expected[index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idwl_dispatch_mapping_covers_every_mode_and_channel_parity() {
+        let expected = [
+            "raw",
+            "direct",
+            "grouped",
+            "delta",
+            "raw",
+            "previous",
+            "progressive-previous",
+            "delta",
+        ];
+        for channel_index in 0..2 {
+            for mode in 0..4 {
+                let index = mode + channel_index * 4;
+                assert_eq!(
+                    IdwlEncodingSyntax::kind_for_dispatch(mode as u32, channel_index as u32),
+                    expected[index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idsf_dispatch_mapping_covers_every_mode_and_channel_parity() {
+        let expected = [
+            "raw",
+            "direct",
+            "grouped",
+            "delta",
+            "raw",
+            "previous",
+            "progressive-previous",
+            "empty",
+        ];
+        for channel_index in 0..2 {
+            for mode in 0..4 {
+                let index = mode + channel_index * 4;
+                assert_eq!(
+                    IdsfEncodingSyntax::kind_for_dispatch(mode as u32, channel_index as u32),
                     expected[index]
                 );
             }
