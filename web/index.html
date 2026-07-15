@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="color-scheme" content="dark">
+        <title>ATRAC Encoder</title>
+        <link rel="stylesheet" href="./styles.css">
+    </head>
+    <body>
+        <main class="shell">
+            <header class="hero">
+                <p class="eyebrow">Rust · WebAssembly · Local only</p>
+                <h1>ATRAC Encoder</h1>
+                <p class="lede">
+                    Encode 44.1 kHz, 16-bit PCM WAV files to ATRAC3 or
+                    ATRAC3plus without uploading audio anywhere.
+                </p>
+            </header>
+
+            <section class="card" aria-labelledby="encoder-heading">
+                <div class="card-heading">
+                    <div>
+                        <p class="step">01</p>
+                        <h2 id="encoder-heading">Choose a WAV</h2>
+                    </div>
+                    <p id="wasm-status" class="runtime-status" aria-live="polite">
+                        Loading encoder…
+                    </p>
+                </div>
+
+                <form id="encode-form">
+                    <label class="file-drop" for="wav-file">
+                        <span class="file-drop-title">Select an audio file</span>
+                        <span class="file-drop-detail">PCM WAV · mono or stereo · 44.1 kHz · 16-bit</span>
+                        <input id="wav-file" name="wav-file" type="file" accept=".wav,audio/wav,audio/x-wav">
+                    </label>
+
+                    <dl id="metadata" class="metadata" hidden>
+                        <div>
+                            <dt>File</dt>
+                            <dd id="meta-name">—</dd>
+                        </div>
+                        <div>
+                            <dt>Duration</dt>
+                            <dd id="meta-duration">—</dd>
+                        </div>
+                        <div>
+                            <dt>Format</dt>
+                            <dd id="meta-format">—</dd>
+                        </div>
+                        <div>
+                            <dt>PCM frames</dt>
+                            <dd id="meta-frames">—</dd>
+                        </div>
+                    </dl>
+
+                    <div class="settings">
+                        <label>
+                            <span>Codec</span>
+                            <select id="codec" name="codec" disabled>
+                                <option value="at3">ATRAC3</option>
+                                <option value="at3p">ATRAC3plus</option>
+                            </select>
+                        </label>
+                        <label>
+                            <span>Bitrate</span>
+                            <select id="bitrate" name="bitrate" disabled></select>
+                        </label>
+                    </div>
+
+                    <button id="encode-button" class="primary" type="submit" disabled>
+                        Encode and download
+                    </button>
+                </form>
+            </section>
+
+            <section class="card progress-card" aria-labelledby="progress-heading">
+                <div class="card-heading compact">
+                    <div>
+                        <p class="step">02</p>
+                        <h2 id="progress-heading">Progress</h2>
+                    </div>
+                    <output id="progress-percent" for="encode-form">0%</output>
+                </div>
+                <progress id="progress" max="100" value="0">0%</progress>
+                <div class="progress-footer">
+                    <p id="job-status" role="status" aria-live="polite">Waiting for a valid WAV.</p>
+                    <p id="frame-status">0 / 0 frames</p>
+                </div>
+                <p id="checksum" class="checksum" hidden></p>
+                <a id="download-again" class="download-again" hidden>Download again</a>
+            </section>
+
+            <p id="error" class="error" role="alert" hidden></p>
+        </main>
+
+        <script type="module" src="./app.js"></script>
+    </body>
+</html>

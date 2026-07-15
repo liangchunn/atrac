@@ -1,4 +1,5 @@
 /target
+/web/pkg
 .DS_Store
 __pycache__/
 /amaf
