@@ -40,7 +40,9 @@ use crate::bitstream::writer::BitWriter;
 #[cfg(any(test, debug_assertions))]
 use crate::coding::allocation::zeroth_band_shape_counts_at5;
 use crate::coding::allocation::{ZerothActivitySummary, zeroth_activity_summary_at5};
-use crate::coding::calc_block::{CalcFrameEntry, CalcFrameOutput, calc_channel_block_frame_at5};
+use crate::coding::calc_block::{
+    CalcFrameEntry, CalcFrameOutput, CodingScratch, calc_channel_block_frame_with_scratch_at5,
+};
 use crate::encoder::cfg_bridge::FrameConfig;
 #[cfg(any(test, debug_assertions))]
 use crate::encoder::cfg_bridge::build_cfg_window;
@@ -53,7 +55,7 @@ use crate::encoder::coding_bridge::{
 use crate::encoder::coding_params::CodingParams;
 use crate::encoder::frontend::{
     FRONTEND_CHANNEL_COUNT, FrontendCoreCallReport, FrontendError, FrontendState,
-    frontend_core_call_at5,
+    frontend_encode_call_at5,
 };
 use crate::encoder::packing_prep::{
     GHA_HAS_PREVIOUS, GhaPackingPrep, PackingPrepError, gha_packing_prep_from_frontend,
@@ -530,6 +532,8 @@ pub struct FrameDriver {
     params: CodingParams,
     /// The next core-call index this driver will process (starts at 0).
     next_core_call: u32,
+    /// Reused bounded working storage for the coding passes.
+    coding_scratch: Box<CodingScratch>,
 }
 
 /// The first output-bearing core call (native delay/priming: calls 0..6 produce
@@ -598,6 +602,7 @@ impl FrameDriver {
             prior_level_words: vec![vec![15; 8]; channel_count],
             params,
             next_core_call: 0,
+            coding_scratch: Box::new(CodingScratch::new(channel_count)),
         }
     }
 
@@ -632,7 +637,7 @@ impl FrameDriver {
     /// here.
     pub fn step_channels(&mut self, inputs: &[&[f32]]) -> Result<Option<EncodedFrame>, FrameError> {
         let core_call = self.next_core_call;
-        let report = frontend_core_call_at5(&mut self.frontend, inputs, SYNTHETIC_ARENA_HEADER)?;
+        let report = frontend_encode_call_at5(&mut self.frontend, inputs, SYNTHETIC_ARENA_HEADER)?;
         // The init roll carries per-call; run it for EVERY call (priming too), so
         // the gain double-buffer is correct at every output call.
         let init_aux = init_roll_step(&mut self.roll, &self.frontend, &report)?;
@@ -672,7 +677,7 @@ impl FrameDriver {
         inputs: [&[f32]; FRONTEND_CHANNEL_COUNT],
     ) -> Result<Option<u32>, FrameError> {
         let core_call = self.next_core_call;
-        let report = frontend_core_call_at5(&mut self.frontend, &inputs, SYNTHETIC_ARENA_HEADER)?;
+        let report = frontend_encode_call_at5(&mut self.frontend, &inputs, SYNTHETIC_ARENA_HEADER)?;
         let init_aux = init_roll_step(&mut self.roll, &self.frontend, &report)?;
         self.next_core_call += 1;
 
@@ -776,7 +781,8 @@ impl FrameDriver {
             effective_band_count,
         } = self.assemble_calc_entry(report, init_aux)?;
         frame.prior_level_words.clone_from(&self.prior_level_words);
-        let out = calc_channel_block_frame_at5(&frame).map_err(FrameError::Calc)?;
+        let out = calc_channel_block_frame_with_scratch_at5(&frame, &mut self.coding_scratch)
+            .map_err(FrameError::Calc)?;
         self.prior_level_words = out
             .channels
             .iter()
@@ -908,3 +914,22 @@ const _: () = {
     assert!(ATRAC3PLUS_352.channels() as usize == DEFAULT_CHANNEL_COUNT);
     assert!(!GHA_HAS_PREVIOUS[0] && GHA_HAS_PREVIOUS[1]);
 };
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    #[test]
+    fn coding_window_backing_is_stable_across_output_frames() {
+        let mut driver = FrameDriver::new();
+        let before = driver.coding_scratch.window_ptrs();
+        let left = [0.0f32; crate::encoder::frontend::FRONTEND_FRAME_SAMPLES];
+        let right = [0.0f32; crate::encoder::frontend::FRONTEND_FRAME_SAMPLES];
+
+        for _ in 0..=FIRST_OUTPUT_CORE_CALL + 1 {
+            driver.step([&left, &right]).unwrap();
+        }
+
+        assert_eq!(driver.coding_scratch.window_ptrs(), before);
+    }
+}

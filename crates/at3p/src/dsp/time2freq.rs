@@ -1177,7 +1177,16 @@ fn time2freq_record_overshoot_stage_at5(
     // peaks, then equalizes the two channels' peak surfaces per band.
     for band in 0..band_limit {
         for ch in 0..channel_count {
-            let mut samples = channels[ch].band_inputs[band].clone();
+            let source = &channels[ch].band_inputs[band];
+            if source.len() < 256 {
+                return Err(Time2FreqError::BandDataTooShort {
+                    band,
+                    needed: 256,
+                    actual: source.len(),
+                });
+            }
+            let mut samples = [0.0f32; 256];
+            samples.copy_from_slice(&source[..256]);
             if let Some(pass) = time2freq_window_pass_at5(
                 &mut samples,
                 &previous_records[ch][band],
@@ -1208,7 +1217,8 @@ fn time2freq_record_overshoot_stage_at5(
 
         for ch in 0..channel_count {
             let source = &channels[ch].band_inputs[band];
-            let mut windowed = source.clone();
+            let mut windowed = [0.0f32; 256];
+            windowed.copy_from_slice(&source[..256]);
             time2freq_overshoot_correct_at5(
                 source,
                 &mut windowed,

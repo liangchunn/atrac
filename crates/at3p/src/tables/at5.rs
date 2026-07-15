@@ -16,6 +16,7 @@ use super::generated::{
     SAA_IDTF_STEREO,
 };
 use super::view::{f32_table, i16_table, i32_table, u16_table, u32_table};
+use std::sync::LazyLock;
 
 pub const SFTBL_AT5_ENTRIES: usize = 64;
 pub const SFTBL_GHA_AT5_ENTRIES: usize = 64;
@@ -470,18 +471,41 @@ pub fn tlev_thred_096_at5() -> [f32; TLEV_THRED_AT5_ENTRIES] {
 }
 
 #[allow(clippy::approx_constant)]
-pub fn sin_at5() -> [f32; SIN_AT5_ENTRIES] {
+fn build_sin_at5() -> [f32; SIN_AT5_ENTRIES] {
     std::array::from_fn(|index| {
         ((index as f64) * 6.283185307179586_f64 * 0.00048828125_f64).sin() as f32
     })
 }
 
 #[allow(clippy::approx_constant)]
-pub fn win_at5() -> [f32; WIN_AT5_ENTRIES] {
+fn build_win_at5() -> [f32; WIN_AT5_ENTRIES] {
     std::array::from_fn(|index| {
         let cosine = ((index as f64) * 0.00390625_f64 * 6.283185307179586_f64).cos() as f32;
         ((1.0_f64 - f64::from(cosine)) * 0.5_f64) as f32
     })
+}
+
+static SIN_AT5: LazyLock<[f32; SIN_AT5_ENTRIES]> = LazyLock::new(build_sin_at5);
+static WIN_AT5: LazyLock<[f32; WIN_AT5_ENTRIES]> = LazyLock::new(build_win_at5);
+
+/// Compatibility accessor for callers that own the generated table.
+pub fn sin_at5() -> [f32; SIN_AT5_ENTRIES] {
+    *sin_at5_ref()
+}
+
+/// Borrow the process-wide sine table without copying or recomputing it.
+pub(crate) fn sin_at5_ref() -> &'static [f32; SIN_AT5_ENTRIES] {
+    &SIN_AT5
+}
+
+/// Compatibility accessor for callers that own the generated table.
+pub fn win_at5() -> [f32; WIN_AT5_ENTRIES] {
+    *win_at5_ref()
+}
+
+/// Borrow the process-wide window table without copying or recomputing it.
+pub(crate) fn win_at5_ref() -> &'static [f32; WIN_AT5_ENTRIES] {
+    &WIN_AT5
 }
 
 pub fn idspcqu_tail_count(table_index: usize) -> Option<usize> {
@@ -490,5 +514,26 @@ pub fn idspcqu_tail_count(table_index: usize) -> Option<usize> {
         None
     } else {
         Some(usize::from(value) + 1)
+    }
+}
+
+#[cfg(test)]
+mod generated_table_tests {
+    use super::*;
+
+    #[test]
+    fn lazy_trigonometric_tables_preserve_generated_bits_and_identity() {
+        let sin = sin_at5_ref();
+        let window = win_at5_ref();
+
+        assert!(std::ptr::eq(sin, sin_at5_ref()));
+        assert!(std::ptr::eq(window, win_at5_ref()));
+
+        for (cached, generated) in sin.iter().zip(build_sin_at5()) {
+            assert_eq!(cached.to_bits(), generated.to_bits());
+        }
+        for (cached, generated) in window.iter().zip(build_win_at5()) {
+            assert_eq!(cached.to_bits(), generated.to_bits());
+        }
     }
 }

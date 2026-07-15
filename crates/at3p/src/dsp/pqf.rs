@@ -46,17 +46,24 @@ fn polyphase(window: &[f32], bank_a: &[f32], bank_b: &[f32]) -> [f32; PQF_BANDS]
     let mut acc = [0.0f32; PQF_BANDS];
     for section in 0..PQF_SECTIONS {
         let base = 0x20 * section;
-        for lane in 0..PQF_BANDS {
-            let (sample_a, sample_b) = if lane < 8 {
-                (window[0x10 + base + lane], window[0x1f + base - lane])
-            } else {
-                (
-                    window[0x20 + base + lane - 8],
-                    window[0x2f + base - (lane - 8)],
-                )
-            };
-            let coef_index = PQF_BANDS * section + lane;
-            acc[lane] = sample_b * bank_b[coef_index] + sample_a * bank_a[coef_index] + acc[lane];
+        let coef_base = PQF_BANDS * section;
+
+        // Two fixed-width, lane-independent loops give LLVM a simple SLP/loop
+        // vectorization surface without changing the accumulation order across
+        // sections or introducing a target-specific implementation.
+        for lane in 0..8 {
+            let sample_a = window[0x10 + base + lane];
+            let sample_b = window[0x1f + base - lane];
+            let coef_index = coef_base + lane;
+            let pair = sample_b * bank_b[coef_index] + sample_a * bank_a[coef_index];
+            acc[lane] = pair + acc[lane];
+        }
+        for lane in 0..8 {
+            let sample_a = window[0x20 + base + lane];
+            let sample_b = window[0x2f + base - lane];
+            let coef_index = coef_base + 8 + lane;
+            let pair = sample_b * bank_b[coef_index] + sample_a * bank_a[coef_index];
+            acc[8 + lane] = pair + acc[8 + lane];
         }
     }
     acc
@@ -210,4 +217,68 @@ pub fn pqf_analysis_at5(delay: &[f32], input: &[f32]) -> Result<PqfAnalysisOutpu
         subbands,
         delay: buffer[PQF_INPUT_SAMPLES..].to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scalar_polyphase(window: &[f32], bank_a: &[f32], bank_b: &[f32]) -> [f32; PQF_BANDS] {
+        let mut acc = [0.0f32; PQF_BANDS];
+        for section in 0..PQF_SECTIONS {
+            let base = 0x20 * section;
+            for lane in 0..PQF_BANDS {
+                let (sample_a, sample_b) = if lane < 8 {
+                    (window[0x10 + base + lane], window[0x1f + base - lane])
+                } else {
+                    (
+                        window[0x20 + base + lane - 8],
+                        window[0x2f + base - (lane - 8)],
+                    )
+                };
+                let coef_index = PQF_BANDS * section + lane;
+                acc[lane] =
+                    sample_b * bank_b[coef_index] + sample_a * bank_a[coef_index] + acc[lane];
+            }
+        }
+        acc
+    }
+
+    fn assert_same_bits(actual: [f32; PQF_BANDS], expected: [f32; PQF_BANDS]) {
+        for (lane, (actual, expected)) in actual.into_iter().zip(expected).enumerate() {
+            assert_eq!(actual.to_bits(), expected.to_bits(), "lane {lane}");
+        }
+    }
+
+    #[test]
+    fn vectorization_shape_preserves_scalar_polyphase_bits() {
+        let coefficients = pqf_ana_coef_at5();
+        let bank_a = &coefficients[..PQF_COEF_BANK_FLOATS];
+        let bank_b = &coefficients[PQF_COEF_BANK_FLOATS..2 * PQF_COEF_BANK_FLOATS];
+
+        let zero = [0.0f32; 0x190];
+        assert_same_bits(
+            polyphase(&zero, bank_a, bank_b),
+            scalar_polyphase(&zero, bank_a, bank_b),
+        );
+
+        for impulse in [0x10, 0x1f, 0x80, 0x18f] {
+            let mut window = [0.0f32; 0x190];
+            window[impulse] = 1.0;
+            assert_same_bits(
+                polyphase(&window, bank_a, bank_b),
+                scalar_polyphase(&window, bank_a, bank_b),
+            );
+        }
+
+        let mut bits = 0x1234_5678u32;
+        let random: [f32; 0x190] = std::array::from_fn(|_| {
+            bits = bits.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((bits >> 8) as i32 as f32) * (1.0 / 8_388_608.0)
+        });
+        assert_same_bits(
+            polyphase(&random, bank_a, bank_b),
+            scalar_polyphase(&random, bank_a, bank_b),
+        );
+    }
 }

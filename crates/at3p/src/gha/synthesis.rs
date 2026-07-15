@@ -1,5 +1,5 @@
 use crate::gha::power::{PowerCheckError, check_power_level_at5, check_power_level_dual_at5};
-use crate::tables::at5::{SIN_AT5_ENTRIES, amtbl_gha, sftbl_gha_at5, sin_at5};
+use crate::tables::at5::{SIN_AT5_ENTRIES, amtbl_gha, sftbl_gha_at5, sin_at5_ref};
 
 pub const COMPONENT_SAMPLES: usize = 256;
 const WINDOW_LOW: f32 = f32::from_bits(0x3e15_f000);
@@ -69,7 +69,7 @@ pub fn calc_component_at5(
         });
     }
 
-    let sin_table = sin_at5();
+    let sin_table = sin_at5_ref();
     let previous_phase = ((start as isize - 1) * frequency as isize).rem_euclid(2048) as usize;
     let end_phase = (frequency * end) & 0x7ff;
     let mut phase = previous_phase;
@@ -153,7 +153,7 @@ pub fn synthesis_wav_at5(
         });
     }
 
-    let sin_table = sin_at5();
+    let sin_table = sin_at5_ref();
     let scale_table = sftbl_gha_at5();
     let amplitude_table = amtbl_gha();
 
@@ -257,7 +257,7 @@ fn check_component_inputs(
     if frequency >= SIN_AT5_ENTRIES {
         return Err(GhaSynthesisError::UnsupportedFrequency { frequency });
     }
-    if frequency > 0 && frequency < SIN_AT5_ENTRIES && sin_at5()[frequency].to_bits() == 0 {
+    if frequency > 0 && frequency < SIN_AT5_ENTRIES && sin_at5_ref()[frequency].to_bits() == 0 {
         return Err(GhaSynthesisError::UnsupportedFrequency { frequency });
     }
 

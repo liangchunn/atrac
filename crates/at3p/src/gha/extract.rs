@@ -3,7 +3,7 @@ use crate::gha::power::{PowerCheckError, check_power_level_at5};
 use crate::gha::synthesis::{
     COMPONENT_SAMPLES, GhaSynthesisError, GhaSynthesisState, GhaWaveRecord, synthesis_wav_at5,
 };
-use crate::tables::at5::{WIN_AT5_UPPER_HALF_INDEX, win_at5};
+use crate::tables::at5::{WIN_AT5_UPPER_HALF_INDEX, win_at5_ref};
 
 const MAX_EXTRACT_BANDS_AT5: usize = 16;
 const MAX_EXTRACT_NWAVS_AT5: usize = 0x30;
@@ -626,7 +626,7 @@ pub fn extract_ghwave_residual_at5(
     let current_windowed_applied =
         windows_both || (current_wave_count > 0 && current.row_words[0] == 0);
 
-    let window = win_at5();
+    let window = win_at5_ref();
     if delayed_windowed_applied {
         for (index, sample) in delayed_buffer.iter_mut().enumerate() {
             *sample *= window[WIN_AT5_UPPER_HALF_INDEX + index];

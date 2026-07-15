@@ -699,6 +699,25 @@ pub fn frontend_core_call_at5(
     pcm_inputs: &[&[f32]],
     record_arena_header: i32,
 ) -> Result<FrontendCoreCallReport, FrontendError> {
+    frontend_core_call_with_capture_at5(state, pcm_inputs, record_arena_header, true)
+}
+
+/// Encoder-facing frontend call. It advances exactly the same rolling state as
+/// [`frontend_core_call_at5`] without retaining the large extract diagnostics.
+pub(crate) fn frontend_encode_call_at5(
+    state: &mut FrontendState,
+    pcm_inputs: &[&[f32]],
+    record_arena_header: i32,
+) -> Result<FrontendCoreCallReport, FrontendError> {
+    frontend_core_call_with_capture_at5(state, pcm_inputs, record_arena_header, false)
+}
+
+fn frontend_core_call_with_capture_at5(
+    state: &mut FrontendState,
+    pcm_inputs: &[&[f32]],
+    record_arena_header: i32,
+    capture_extract_diagnostics: bool,
+) -> Result<FrontendCoreCallReport, FrontendError> {
     // Fatal-per-run: once a prior call tore the rolling state, refuse to compute
     // on it. The run is dead; report the original poisoning point cheaply.
     if let Some(at) = state.poisoned {
@@ -723,7 +742,12 @@ pub fn frontend_core_call_at5(
 
     // Everything past here mutates rolling state; a failure leaves it torn, so
     // poison the state before propagating.
-    match frontend_core_call_body_at5(state, pcm_inputs, record_arena_header) {
+    match frontend_core_call_body_at5(
+        state,
+        pcm_inputs,
+        record_arena_header,
+        capture_extract_diagnostics,
+    ) {
         Ok(report) => Ok(report),
         Err(error) => {
             if state.poisoned.is_none() {
@@ -751,6 +775,7 @@ fn frontend_core_call_body_at5(
     state: &mut FrontendState,
     pcm_inputs: &[&[f32]],
     record_arena_header: i32,
+    capture_extract_diagnostics: bool,
 ) -> Result<FrontendCoreCallReport, FrontendError> {
     // Prologue ring rotation, in lockstep with the native pointer-ring rotation
     // `sigproc_frame_at5` performs on `SigprocChannelPointers.ring`.
@@ -781,15 +806,25 @@ fn frontend_core_call_body_at5(
 
     let mut extract_output = None;
     let mut extract_input_band_windows = None;
+    let mut gha_ran = false;
     if sigproc_report.gha_should_run {
         let input_windows = state.extract_band_windows();
-        let output = run_extract(state, &input_windows, record_arena_header)?;
+        if capture_extract_diagnostics {
+            extract_input_band_windows = Some(input_windows.clone());
+        }
+        let mut output = run_extract(state, input_windows, record_arena_header)?;
+        gha_ran = true;
         // Store the fresh output into the current-output slot (`*(obj+0x24)`).
         let last = SIGPROC_CHANNEL_RING_SLOTS - 1;
         for channel in 0..state.channel_count {
             let arena = &mut state.arena_ring[channel][last];
-            arena.rows = output.output_rows[channel].clone();
-            arena.records = output.row_records[channel].clone();
+            if capture_extract_diagnostics {
+                arena.rows = output.output_rows[channel].clone();
+                arena.records = output.row_records[channel].clone();
+            } else {
+                arena.rows = std::mem::take(&mut output.output_rows[channel]);
+                arena.records = std::mem::take(&mut output.row_records[channel]);
+            }
             arena.header_mode = output.header.mode as u32;
             arena.header_active = output.header_words[0];
             // Extract writes channel-0's header words `[active, mode,
@@ -797,8 +832,15 @@ fn frontend_core_call_body_at5(
             // arena root (`*(obj+0x24)`), so they ride the ring alongside the
             // rows/records (slice 2.1c, E1/E2).
             arena.header_band_count = output.header_words[2];
-            arena.shared = output.shared.clone();
-            arena.opposite = output.opposite.clone();
+            let can_move_shared =
+                !capture_extract_diagnostics && channel + 1 == state.channel_count;
+            if can_move_shared {
+                arena.shared = std::mem::take(&mut output.shared);
+                arena.opposite = std::mem::take(&mut output.opposite);
+            } else {
+                arena.shared = output.shared.clone();
+                arena.opposite = output.opposite.clone();
+            }
         }
         // Apply the residual subtraction back into slot 4 (the first slot of
         // the extract window) of every band. It rolls down toward slot 0 over
@@ -825,8 +867,9 @@ fn frontend_core_call_body_at5(
         if output.header.sets_global_mode_flag {
             state.sigproc.header_flag_word |= 1;
         }
-        extract_output = Some(output);
-        extract_input_band_windows = Some(input_windows);
+        if capture_extract_diagnostics {
+            extract_output = Some(output);
+        }
     }
 
     // Detector + MDCT: run `time2freq_at5` live over the active QMF bands x 2
@@ -845,7 +888,7 @@ fn frontend_core_call_body_at5(
 
     Ok(FrontendCoreCallReport {
         sigproc: sigproc_report,
-        gha_ran: extract_output.is_some(),
+        gha_ran,
         extract_input_band_windows,
         extract_output,
         time2freq,
@@ -1022,7 +1065,7 @@ fn detector_window_bin0_peak(window: &[f32]) -> f32 {
 
 fn run_extract(
     state: &FrontendState,
-    band_windows: &[Vec<Vec<f32>>],
+    band_windows: Vec<Vec<Vec<f32>>>,
     record_arena_header: i32,
 ) -> Result<GhaExtractOutput, FrontendError> {
     // Delayed rows/records come from ring slot 3 (`*(obj+0x20)`), the previous
@@ -1053,7 +1096,7 @@ fn run_extract(
         // mask-1/2 arm dispatches on the front mode decision, so it stays live
         // even when this is false (evidence item 3).
         header_0xd0_enabled: state.gha_enabled,
-        band_windows: band_windows.to_vec(),
+        band_windows,
         delayed_rows,
         delayed_records,
         delayed_header_mode,
@@ -1061,4 +1104,32 @@ fn run_extract(
         record_arena_header,
     };
     Ok(extract_ghwave_at5(input)?)
+}
+
+#[cfg(test)]
+mod lean_path_tests {
+    use super::*;
+
+    #[test]
+    fn lean_encoder_call_matches_full_state_without_retaining_diagnostics() {
+        let left = [0.0f32; FRONTEND_FRAME_SAMPLES];
+        let right = [0.0f32; FRONTEND_FRAME_SAMPLES];
+        let inputs = [&left[..], &right[..]];
+        let mut full_state = FrontendState::new_zeroed(FRONTEND_CHANNEL_COUNT);
+        let mut lean_state = full_state.clone();
+
+        let full = frontend_core_call_at5(&mut full_state, &inputs, 0).unwrap();
+        let lean = frontend_encode_call_at5(&mut lean_state, &inputs, 0).unwrap();
+
+        assert!(full.extract_input_band_windows.is_some());
+        assert!(full.extract_output.is_some());
+        assert!(lean.extract_input_band_windows.is_none());
+        assert!(lean.extract_output.is_none());
+        assert!(lean.gha_ran);
+        assert_eq!(
+            format!("{:?}", full.time2freq),
+            format!("{:?}", lean.time2freq)
+        );
+        assert_eq!(format!("{full_state:?}"), format!("{lean_state:?}"));
+    }
 }

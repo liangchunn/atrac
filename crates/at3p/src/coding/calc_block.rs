@@ -385,15 +385,15 @@ pub struct CalcGainRow {
 /// rows (`+0x80`).
 #[derive(Debug, Clone)]
 struct Plane {
-    picks: Vec<i32>,
-    costs: Vec<i16>,
+    picks: [i32; CALC_BANDS_AT5],
+    costs: [i16; CALC_BANDS_AT5 * CALC_CANDIDATES_AT5],
 }
 
 impl Plane {
     fn zeroed() -> Self {
         Plane {
-            picks: vec![0i32; CALC_BANDS_AT5],
-            costs: vec![0i16; CALC_BANDS_AT5 * CALC_CANDIDATES_AT5],
+            picks: [0i32; CALC_BANDS_AT5],
+            costs: [0i16; CALC_BANDS_AT5 * CALC_CANDIDATES_AT5],
         }
     }
 }
@@ -550,9 +550,12 @@ fn parse_idct_block(words: &[u32]) -> IdctBlockState {
 }
 
 fn parse_plane(words: &[u32]) -> Plane {
-    let picks = words[..CALC_BANDS_AT5].iter().map(|&w| w as i32).collect();
+    let mut picks = [0i32; CALC_BANDS_AT5];
+    for (dst, &word) in picks.iter_mut().zip(&words[..CALC_BANDS_AT5]) {
+        *dst = word as i32;
+    }
     let cost_words = &words[CALC_BANDS_AT5..CALC_BANDS_AT5 + 128];
-    let mut costs = vec![0i16; CALC_BANDS_AT5 * CALC_CANDIDATES_AT5];
+    let mut costs = [0i16; CALC_BANDS_AT5 * CALC_CANDIDATES_AT5];
     for (i, w) in cost_words.iter().enumerate() {
         costs[i * 2] = (*w & 0xffff) as u16 as i16;
         costs[i * 2 + 1] = ((*w >> 16) & 0xffff) as u16 as i16;
@@ -685,11 +688,60 @@ fn shell_sort_desc(keys: &mut [i32], indices: &mut [i32]) {
 pub fn calc_channel_block_frame_at5(
     entry: &CalcFrameEntry,
 ) -> Result<CalcFrameOutput, CalcBlockError> {
-    calc_channel_block_frame_impl_at5(entry)
+    calc_channel_block_frame_with_scratch_at5(entry, &mut CodingScratch::new(entry.channels.len()))
+}
+
+/// Persistent coding-side storage used by the computed frame driver.
+pub(crate) struct CodingScratch {
+    windows: Vec<Vec<Vec<f32>>>,
+}
+
+impl CodingScratch {
+    pub(crate) fn new(channel_count: usize) -> Self {
+        let nsps = nsps_at5();
+        Self {
+            windows: (0..channel_count)
+                .map(|_| {
+                    (0..CALC_BANDS_AT5)
+                        .map(|band| vec![0.0; nsps[band] as usize])
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    fn load_windows(&mut self, entry: &CalcFrameEntry) {
+        debug_assert_eq!(self.windows.len(), entry.channels.len());
+        let isps = isps_at5();
+        for (channel, source) in entry.channels.iter().enumerate() {
+            for band in 0..CALC_BANDS_AT5 {
+                let base = isps[band] as usize;
+                let count = self.windows[channel][band].len();
+                self.windows[channel][band].copy_from_slice(&source.spectrum[base..base + count]);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn window_ptrs(&self) -> Vec<*const f32> {
+        self.windows
+            .iter()
+            .flat_map(|channel| channel.iter().map(Vec::as_ptr))
+            .collect()
+    }
+}
+
+pub(crate) fn calc_channel_block_frame_with_scratch_at5(
+    entry: &CalcFrameEntry,
+    scratch: &mut CodingScratch,
+) -> Result<CalcFrameOutput, CalcBlockError> {
+    scratch.load_windows(entry);
+    calc_channel_block_frame_impl_at5(entry, &mut scratch.windows)
 }
 
 fn calc_channel_block_frame_impl_at5(
     entry: &CalcFrameEntry,
+    windows: &mut Vec<Vec<Vec<f32>>>,
 ) -> Result<CalcFrameOutput, CalcBlockError> {
     let n = entry.channels.len();
     if n == 0 || n > 2 {
@@ -736,11 +788,6 @@ fn calc_channel_block_frame_impl_at5(
     // phase-B destructive band-kill (native zeroes `param_2[ch]`'s band and
     // every later section reads the same buffer): the zeroed bands must be
     // visible to sections 7-14 (QUANT, level words, fifth/sixth, adjust).
-    let mut windows: Vec<Vec<Vec<f32>>> = entry
-        .channels
-        .iter()
-        .map(|ch| band_windows(&ch.spectrum))
-        .collect();
     let mut idsf_cc: Vec<Vec<i32>> = entry.channels.iter().map(|c| c.idsf_cc.clone()).collect();
     let mut word_lengths: Vec<Vec<i32>> =
         entry.channels.iter().map(|c| c.o_1b5f8.clone()).collect();
@@ -881,7 +928,7 @@ fn calc_channel_block_frame_impl_at5(
                     activity: &entry.channels[ch].activity_14c,
                     quant_bands: &quant_raw[ch],
                     word_lengths: word_lengths[ch].clone(),
-                    picks: plane.picks.clone(),
+                    picks: plane.picks.to_vec(),
                     pick_costs,
                     idwl_init_bits: 0,
                 }
@@ -913,7 +960,9 @@ fn calc_channel_block_frame_impl_at5(
             let sel = mode_1074[ch] as usize;
             word_lengths[ch] = out.channels[ch].word_lengths.clone();
             slot46[ch][sel] = out.channels[ch].quant_state_total;
-            planes[ch][sel].picks = out.channels[ch].picks.clone();
+            planes[ch][sel]
+                .picks
+                .copy_from_slice(&out.channels[ch].picks);
             for band in 0..bands {
                 let pick = usize::try_from(out.channels[ch].picks[band]).map_err(|_| {
                     CalcBlockError::OutOfScope("second pass produced a negative candidate pick")
@@ -967,7 +1016,7 @@ fn calc_channel_block_frame_impl_at5(
     // --- Post-second over-budget Phase A: +0xcc high-band raise loop. ---
     if budget < i32::from(s_12e) && s_114 > 0 {
         phase_a_raise_loop(
-            &windows,
+            windows,
             &word_lengths,
             &mut idsf_cc,
             &mut planes,
@@ -1051,7 +1100,7 @@ fn calc_channel_block_frame_impl_at5(
     if budget < i32::from(s_12e) {
         phase_b_band_kill(
             &entry.shared_row_94,
-            &mut windows,
+            windows,
             &mut word_lengths,
             &mut idsf_cc,
             &mut planes,
@@ -1068,7 +1117,7 @@ fn calc_channel_block_frame_impl_at5(
     // --- Section 7: chosen-plane copy into o_1b578 + stereo forcing. ---
     for ch in 0..n {
         let picks = &planes[ch][mode_1074[ch] as usize].picks;
-        selectors[ch] = picks.clone();
+        selectors[ch] = picks.to_vec();
     }
     // Section 7 selector forcing (decompile 44620-44663). Stereo
     // (`param_4 == 2`) forces ch1's `+0x1b578` selector to 1 at every band
@@ -1313,8 +1362,8 @@ fn calc_channel_block_frame_impl_at5(
                     band_idsf: idsf_cc[ch].clone(),
                     band_scale: scale_f32[ch].clone(),
                     spectra: windows[ch].clone(),
-                    active_costs: planes[ch][sel].costs.clone(),
-                    trial_costs: planes[ch][other].costs.clone(),
+                    active_costs: planes[ch][sel].costs.to_vec(),
+                    trial_costs: planes[ch][other].costs.to_vec(),
                     idct_block: idct_blocks[ch].clone(),
                     quant_bits_46: slot46[ch][sel],
                     obj_mode: obj_mode[ch],
@@ -1337,9 +1386,11 @@ fn calc_channel_block_frame_impl_at5(
             .map_err(|_| CalcBlockError::OutOfScope("eighth pass failed"))?;
         for ch in 0..n {
             let sel = mode_1074[ch] as usize;
-            windows[ch] = out.channels[ch].spectra.clone();
+            windows[ch].clone_from(&out.channels[ch].spectra);
             selectors[ch] = out.channels[ch].selector_row.clone();
-            planes[ch][sel].costs = out.channels[ch].active_costs.clone();
+            planes[ch][sel]
+                .costs
+                .copy_from_slice(&out.channels[ch].active_costs);
             slot46[ch][sel] = out.channels[ch].quant_bits_46;
             idct_blocks[ch] = out.channels[ch].idct_block.clone();
         }
@@ -1738,8 +1789,8 @@ pub fn phase_a_raise_loop_replay(
         }
         planes.push({
             let mut plane = Plane::zeroed();
-            plane.picks = input.picks[ch].clone();
-            plane.costs = input.costs[ch].clone();
+            plane.picks.copy_from_slice(&input.picks[ch]);
+            plane.costs.copy_from_slice(&input.costs[ch]);
             let mut pair = [Plane::zeroed(), Plane::zeroed()];
             pair[sel] = plane;
             pair
@@ -1800,10 +1851,10 @@ pub fn phase_a_raise_loop_replay(
     s_12e = recompute_selected_total(input.s_12a, &slot46, &mode_1074)?;
 
     let picks = (0..n)
-        .map(|ch| planes[ch][mode_1074[ch] as usize].picks.clone())
+        .map(|ch| planes[ch][mode_1074[ch] as usize].picks.to_vec())
         .collect();
     let costs = (0..n)
-        .map(|ch| planes[ch][mode_1074[ch] as usize].costs.clone())
+        .map(|ch| planes[ch][mode_1074[ch] as usize].costs.to_vec())
         .collect();
 
     Ok(PhaseAReplayOutput {
@@ -2032,8 +2083,8 @@ pub fn phase_b_band_kill_replay(
         .map(|ch| {
             let sel = input.mode_1074[ch] as usize;
             let mut plane = Plane::zeroed();
-            plane.picks = input.picks[ch].clone();
-            plane.costs = input.costs[ch].clone();
+            plane.picks.copy_from_slice(&input.picks[ch]);
+            plane.costs.copy_from_slice(&input.costs[ch]);
             let mut pair = [Plane::zeroed(), Plane::zeroed()];
             pair[sel] = plane;
             pair
@@ -2055,10 +2106,10 @@ pub fn phase_b_band_kill_replay(
         input.candidate_count,
     )?;
     let picks = (0..n)
-        .map(|ch| planes[ch][input.mode_1074[ch] as usize].picks.clone())
+        .map(|ch| planes[ch][input.mode_1074[ch] as usize].picks.to_vec())
         .collect();
     let costs = (0..n)
-        .map(|ch| planes[ch][input.mode_1074[ch] as usize].costs.clone())
+        .map(|ch| planes[ch][input.mode_1074[ch] as usize].costs.to_vec())
         .collect();
     Ok(PhaseBReplayOutput {
         idsf_cc,
@@ -2274,8 +2325,8 @@ fn run_fifth_sixth(
                 FifthChannelState {
                     word_lengths: word_lengths[ch].clone(),
                     selector_row: selectors[ch].clone(),
-                    active_costs: planes[ch][sel].costs.clone(),
-                    trial_costs: planes[ch][other].costs.clone(),
+                    active_costs: planes[ch][sel].costs.to_vec(),
+                    trial_costs: planes[ch][other].costs.to_vec(),
                     idct_block: idct_blocks[ch].clone(),
                     wlc_block: wlc_blocks[ch].clone(),
                     quant_bits_46: slot46[ch][sel],
@@ -2330,7 +2381,9 @@ fn run_fifth_sixth(
             let sel = mode_1074[ch] as usize;
             word_lengths[ch] = out.channels[ch].word_lengths.clone();
             selectors[ch] = out.channels[ch].selector_row.clone();
-            planes[ch][sel].costs = out.channels[ch].active_costs.clone();
+            planes[ch][sel]
+                .costs
+                .copy_from_slice(&out.channels[ch].active_costs);
             slot46[ch][sel] = out.channels[ch].quant_bits_46;
             idct_blocks[ch] = out.channels[ch].idct_block.clone();
             wlc_blocks[ch] = out.channels[ch].wlc_block.clone();
@@ -2364,8 +2417,8 @@ fn run_fifth_sixth(
                     word_lengths: word_lengths[ch].clone(),
                     selector_row: selectors[ch].clone(),
                     band_idsf: idsf_cc[ch].clone(),
-                    active_costs: planes[ch][sel].costs.clone(),
-                    trial_costs: planes[ch][other].costs.clone(),
+                    active_costs: planes[ch][sel].costs.to_vec(),
+                    trial_costs: planes[ch][other].costs.to_vec(),
                     idct_block: idct_blocks[ch].clone(),
                     quant_bits_46: slot46[ch][sel],
                     quant_bands: &quant_raw[ch],
@@ -2393,7 +2446,9 @@ fn run_fifth_sixth(
             let sel = mode_1074[ch] as usize;
             selectors[ch] = out.channels[ch].selector_row.clone();
             idsf_cc[ch] = out.channels[ch].band_idsf.clone();
-            planes[ch][sel].costs = out.channels[ch].active_costs.clone();
+            planes[ch][sel]
+                .costs
+                .copy_from_slice(&out.channels[ch].active_costs);
             slot46[ch][sel] = out.channels[ch].quant_bits_46;
             idct_blocks[ch] = out.channels[ch].idct_block.clone();
         }

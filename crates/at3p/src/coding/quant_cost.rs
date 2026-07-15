@@ -276,8 +276,43 @@ pub fn quant_cost_accumulate_at5(
 }
 
 use crate::coding::quant::{QuantError, quant_at5};
-use crate::entropy::group::hc_mkgrp_ex_at5;
+use crate::entropy::group::{hc_mkgrp_ex_at5, hc_mkgrp_ex_into_at5};
 use crate::tables::generated::{SAA_MASK, SAA_WL};
+use std::cell::RefCell;
+
+pub(crate) const QUANT_COST_MAX_SAMPLES: usize = 128;
+const QUANT_COST_BYTE_CAPACITY: usize = QUANT_COST_MAX_SAMPLES * 2;
+const QUANT_COST_BUFFER_SLOTS: usize = 6;
+
+/// Reusable bounded storage for the live AT3plus quant-unit sizes.
+pub(crate) struct QuantCostScratch {
+    quantized: [i16; QUANT_COST_MAX_SAMPLES],
+    absolute: [i16; QUANT_COST_MAX_SAMPLES],
+    quant_bytes: [u8; QUANT_COST_BYTE_CAPACITY],
+    abs_bytes: [u8; QUANT_COST_BYTE_CAPACITY],
+    buffers: [[i16; QUANT_COST_MAX_SAMPLES]; QUANT_COST_BUFFER_SLOTS],
+    buffer_lens: [usize; QUANT_COST_BUFFER_SLOTS],
+    valid: [bool; QUANT_COST_BUFFER_SLOTS],
+}
+
+impl Default for QuantCostScratch {
+    fn default() -> Self {
+        Self {
+            quantized: [0; QUANT_COST_MAX_SAMPLES],
+            absolute: [0; QUANT_COST_MAX_SAMPLES],
+            quant_bytes: [0; QUANT_COST_BYTE_CAPACITY],
+            abs_bytes: [0; QUANT_COST_BYTE_CAPACITY],
+            buffers: [[0; QUANT_COST_MAX_SAMPLES]; QUANT_COST_BUFFER_SLOTS],
+            buffer_lens: [0; QUANT_COST_BUFFER_SLOTS],
+            valid: [false; QUANT_COST_BUFFER_SLOTS],
+        }
+    }
+}
+
+thread_local! {
+    static QUANT_COST_SCRATCH: RefCell<QuantCostScratch> =
+        RefCell::new(QuantCostScratch::default());
+}
 
 /// The composed `quant_nontone_nspecs_at5` cost surface for one band
 /// (native `0xc150`): quantize the spectrum via `QUANT_at5`, fold
@@ -288,6 +323,143 @@ use crate::tables::generated::{SAA_MASK, SAA_WL};
 /// candidate cost shorts (the caller's `+0xb88` row).
 #[allow(clippy::too_many_arguments)]
 pub fn quant_nontone_costs_at5(
+    spectrum: &[f32],
+    word_length: usize,
+    idsf: usize,
+    threshold_scale: f32,
+    count: usize,
+    state: usize,
+    candidate_count: usize,
+) -> Result<[u16; QUANT_COST_CANDIDATES], QuantError> {
+    if count > QUANT_COST_MAX_SAMPLES {
+        return quant_nontone_costs_allocating_at5(
+            spectrum,
+            word_length,
+            idsf,
+            threshold_scale,
+            count,
+            state,
+            candidate_count,
+        );
+    }
+    QUANT_COST_SCRATCH.with(|cell| {
+        if let Ok(mut scratch) = cell.try_borrow_mut() {
+            quant_nontone_costs_with_scratch_at5(
+                spectrum,
+                word_length,
+                idsf,
+                threshold_scale,
+                count,
+                state,
+                candidate_count,
+                &mut scratch,
+            )
+        } else {
+            // Preserve reentrant behavior for unusual external call stacks.
+            quant_nontone_costs_with_scratch_at5(
+                spectrum,
+                word_length,
+                idsf,
+                threshold_scale,
+                count,
+                state,
+                candidate_count,
+                &mut QuantCostScratch::default(),
+            )
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quant_nontone_costs_with_scratch_at5(
+    spectrum: &[f32],
+    word_length: usize,
+    idsf: usize,
+    threshold_scale: f32,
+    count: usize,
+    state: usize,
+    candidate_count: usize,
+    scratch: &mut QuantCostScratch,
+) -> Result<[u16; QUANT_COST_CANDIDATES], QuantError> {
+    debug_assert!(count <= QUANT_COST_MAX_SAMPLES);
+    scratch.valid.fill(false);
+    scratch.buffer_lens.fill(0);
+
+    let quantized = &mut scratch.quantized[..count];
+    quantized.fill(0);
+    quant_at5(
+        spectrum,
+        quantized,
+        word_length,
+        idsf,
+        threshold_scale,
+        count,
+    )?;
+
+    let mut nonzero: u16 = 0;
+    for index in 0..count {
+        let value = quantized[index];
+        scratch.absolute[index] = value.wrapping_abs();
+        nonzero += u16::from(value != 0);
+        let quant_bytes = (value as u16).to_le_bytes();
+        let abs_bytes = (scratch.absolute[index] as u16).to_le_bytes();
+        scratch.quant_bytes[index * 2..index * 2 + 2].copy_from_slice(&quant_bytes);
+        scratch.abs_bytes[index * 2..index * 2 + 2].copy_from_slice(&abs_bytes);
+    }
+
+    let mut costs = [0u16; QUANT_COST_CANDIDATES];
+    for candidate in 0..candidate_count.min(QUANT_COST_CANDIDATES) {
+        let Some(descriptor) = quant_cost_descriptor_at5(state, candidate, word_length) else {
+            continue;
+        };
+        let domain = usize::from(descriptor.seed_nonzero);
+        let slot = domain * 3
+            + match descriptor.buffer_selector {
+                1 => 0,
+                2 => 1,
+                _ => 2,
+            };
+        if !scratch.valid[slot] {
+            let len = match (domain, descriptor.buffer_selector) {
+                (1, 1) => {
+                    scratch.buffers[slot][..count].copy_from_slice(&scratch.absolute[..count]);
+                    count
+                }
+                _ => {
+                    let (bytes, row) = if domain == 0 {
+                        (&scratch.quant_bytes[..count * 2], 0)
+                    } else {
+                        (&scratch.abs_bytes[..count * 2], 1)
+                    };
+                    let group_size = match descriptor.buffer_selector {
+                        1 => 1,
+                        2 => 2,
+                        _ => 4,
+                    };
+                    let bit_width = SAA_WL[row * 8 + word_length];
+                    let mask = u16::from(SAA_MASK[row * 8 + word_length]);
+                    hc_mkgrp_ex_into_at5(
+                        bytes,
+                        count,
+                        group_size,
+                        bit_width,
+                        mask,
+                        &mut scratch.buffers[slot],
+                    )
+                    .unwrap_or(0)
+                }
+            };
+            scratch.buffer_lens[slot] = len;
+            scratch.valid[slot] = true;
+        }
+        let symbols = &scratch.buffers[slot][..scratch.buffer_lens[slot]];
+        costs[candidate] = quant_cost_accumulate_at5(&descriptor, symbols, count, nonzero);
+    }
+    Ok(costs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quant_nontone_costs_allocating_at5(
     spectrum: &[f32],
     word_length: usize,
     idsf: usize,
@@ -358,4 +530,50 @@ pub fn quant_nontone_costs_at5(
         costs[candidate] = quant_cost_accumulate_at5(&descriptor, symbols, count, nonzero);
     }
     Ok(costs)
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_scratch_matches_allocating_reference_for_live_shapes() {
+        let spectrum: [f32; QUANT_COST_MAX_SAMPLES] = std::array::from_fn(|index| {
+            let centered = (index as i32 % 19) - 9;
+            centered as f32 * 0.03125
+        });
+        let mut scratch = QuantCostScratch::default();
+
+        for count in [16, 32, 64, 128] {
+            for word_length in 1..=QUANT_COST_WORD_LENGTHS {
+                for state in 0..QUANT_COST_STATES {
+                    let expected = quant_nontone_costs_allocating_at5(
+                        &spectrum,
+                        word_length,
+                        8,
+                        1.0,
+                        count,
+                        state,
+                        QUANT_COST_CANDIDATES,
+                    )
+                    .unwrap();
+                    let actual = quant_nontone_costs_with_scratch_at5(
+                        &spectrum,
+                        word_length,
+                        8,
+                        1.0,
+                        count,
+                        state,
+                        QUANT_COST_CANDIDATES,
+                        &mut scratch,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "count={count} wl={word_length} state={state}"
+                    );
+                }
+            }
+        }
+    }
 }

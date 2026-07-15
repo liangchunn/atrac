@@ -50,6 +50,47 @@ pub fn hc_mkgrp_ex_at5(
     bit_width: u8,
     magnitude_mask: u16,
 ) -> Result<Vec<u16>, GroupError> {
+    let mut out = vec![0u16; symbol_count];
+    let len = hc_mkgrp_ex_core_at5(
+        input_words_le,
+        symbol_count,
+        group_size,
+        bit_width,
+        magnitude_mask,
+        |index, value| out[index] = value,
+    )?;
+    out.truncate(len);
+    Ok(out)
+}
+
+/// Allocation-free `hc_mkgrp_Ex_at5` surface. The caller provides room for
+/// at least `symbol_count` values, which covers every supported group size.
+pub(crate) fn hc_mkgrp_ex_into_at5(
+    input_words_le: &[u8],
+    symbol_count: usize,
+    group_size: usize,
+    bit_width: u8,
+    magnitude_mask: u16,
+    out: &mut [i16],
+) -> Result<usize, GroupError> {
+    hc_mkgrp_ex_core_at5(
+        input_words_le,
+        symbol_count,
+        group_size,
+        bit_width,
+        magnitude_mask,
+        |index, value| out[index] = value as i16,
+    )
+}
+
+fn hc_mkgrp_ex_core_at5(
+    input_words_le: &[u8],
+    symbol_count: usize,
+    group_size: usize,
+    bit_width: u8,
+    magnitude_mask: u16,
+    mut write: impl FnMut(usize, u16),
+) -> Result<usize, GroupError> {
     validate_bit_width(bit_width)?;
 
     let required_len = symbol_count
@@ -65,13 +106,12 @@ pub fn hc_mkgrp_ex_at5(
     match group_size {
         1 => {
             validate_len("hc_mkgrp_Ex_at5", symbol_count, group_size, 4)?;
-            let mut out = Vec::with_capacity(symbol_count);
             for index in 0..symbol_count {
                 let start = index * 2;
                 let value = u16::from_le_bytes([input_words_le[start], input_words_le[start + 1]]);
-                out.push(value & magnitude_mask);
+                write(index, value & magnitude_mask);
             }
-            Ok(out)
+            Ok(symbol_count)
         }
         2 | 4 => {
             let required_multiple = if group_size == 2 { 8 } else { 16 };
@@ -81,13 +121,33 @@ pub fn hc_mkgrp_ex_at5(
                 group_size,
                 required_multiple,
             )?;
-            let low_bytes: Vec<u8> = (0..symbol_count)
-                .map(|index| input_words_le[index * 2])
-                .collect();
-            Ok(pack_unsigned_low_bytes(&low_bytes, group_size, bit_width)?
-                .into_iter()
-                .map(|group| group.value)
-                .collect())
+            let mask = mask_q_at5()[bit_width as usize];
+            let shift = u32::from(bit_width & 0x1f);
+            let mut output_index = 0usize;
+
+            for symbol_base in (0..symbol_count).step_by(required_multiple) {
+                let packed = if group_size == 2 {
+                    let first = lane_word_ex(input_words_le, symbol_base, [0, 2, 4, 6]) & mask;
+                    let second = lane_word_ex(input_words_le, symbol_base, [1, 3, 5, 7]) & mask;
+                    first.wrapping_shl(shift) | second
+                } else {
+                    let first = lane_word_ex(input_words_le, symbol_base, [0, 4, 8, 12]) & mask;
+                    let second = lane_word_ex(input_words_le, symbol_base, [1, 5, 9, 13]) & mask;
+                    let third = lane_word_ex(input_words_le, symbol_base, [2, 6, 10, 14]) & mask;
+                    let fourth = lane_word_ex(input_words_le, symbol_base, [3, 7, 11, 15]) & mask;
+                    (((first.wrapping_shl(shift) | second).wrapping_shl(shift) | third)
+                        .wrapping_shl(shift))
+                        | fourth
+                };
+                for byte_index in 0..4 {
+                    write(
+                        output_index,
+                        ((packed >> (24 - byte_index * 8)) & 0xff) as u16,
+                    );
+                    output_index += 1;
+                }
+            }
+            Ok(output_index)
         }
         _ => Err(GroupError::UnsupportedGroupSize { group_size }),
     }
@@ -250,6 +310,12 @@ fn lane_word<const N: usize>(chunk: &[u8], indices: [usize; N]) -> u32 {
     indices
         .into_iter()
         .fold(0_u32, |word, index| (word << 8) | u32::from(chunk[index]))
+}
+
+fn lane_word_ex<const N: usize>(input_words_le: &[u8], base: usize, indices: [usize; N]) -> u32 {
+    indices.into_iter().fold(0_u32, |word, index| {
+        (word << 8) | u32::from(input_words_le[(base + index) * 2])
+    })
 }
 
 fn push_packed_bytes(out: &mut Vec<GroupedSymbol>, packed: u32) {

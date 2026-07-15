@@ -5,7 +5,7 @@ use crate::gha::synthesis::{
     COMPONENT_SAMPLES, ComponentResult, GhaSynthesisError, GhaWaveRecord, calc_component_at5,
 };
 use crate::tables::at5::{
-    SIN_AT5_ENTRIES, amtbl_gha, ip256_at5, sc256_at5, sftbl_gha_at5, sin_at5,
+    SIN_AT5_ENTRIES, amtbl_gha, ip256_at5, sc256_at5, sftbl_gha_at5, sin_at5_ref,
 };
 
 const TWO_PI_AT5: f32 = f32::from_bits(0x40c9_0fdb);
@@ -1429,7 +1429,7 @@ fn subtract_sine_at5(
     scale: f32,
 ) {
     let mut phase = (start as i64 - 0x81) * frequency as i64 + phase_units as i64;
-    let sin_table = sin_at5();
+    let sin_table = sin_at5_ref();
     for sample in &mut samples[start..end] {
         let phase_index = (phase + frequency as i64).rem_euclid(SIN_AT5_ENTRIES as i64) as usize;
         *sample =
