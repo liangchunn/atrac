@@ -198,9 +198,57 @@ pub fn quant_cost_descriptor_at5(
 
 /// Code length for a symbol: byte at `table + 2 + symbol * 4` (each
 /// code-table entry is 4 bytes with the bit length at `+2`).
-fn code_length(descriptor: &QuantCostDescriptor, symbol: i16) -> u16 {
-    let index = (descriptor.table_zero_offset as isize + 2 + symbol as isize * 4) as usize;
-    u16::from(descriptor.table[index])
+#[inline(always)]
+fn code_length(table: &[u8], table_base: isize, symbol: i16) -> u16 {
+    let index = (table_base + symbol as isize * 4) as usize;
+    u16::from(table[index])
+}
+
+#[inline]
+fn quant_cost_mode_4(table: &[u8], table_base: isize, groups: &[[i16; 4]], mut cost: u16) -> u16 {
+    for &[s0, s1, s2, s3] in groups {
+        cost = cost.wrapping_add(1);
+        if s0 != 0 || s1 != 0 || s2 != 0 || s3 != 0 {
+            cost = cost
+                .wrapping_add(code_length(table, table_base, s0))
+                .wrapping_add(code_length(table, table_base, s1))
+                .wrapping_add(code_length(table, table_base, s2))
+                .wrapping_add(code_length(table, table_base, s3));
+        }
+    }
+    cost
+}
+
+#[inline]
+fn quant_cost_mode_2(table: &[u8], table_base: isize, groups: &[[i16; 4]], mut cost: u16) -> u16 {
+    for &[s0, s1, s2, s3] in groups {
+        if s0 == 0 && s1 == 0 {
+            cost = cost.wrapping_add(2);
+        } else {
+            cost = cost
+                .wrapping_add(code_length(table, table_base, s0))
+                .wrapping_add(code_length(table, table_base, s1))
+                .wrapping_add(2);
+        }
+        if s2 != 0 || s3 != 0 {
+            cost = cost
+                .wrapping_add(code_length(table, table_base, s2))
+                .wrapping_add(code_length(table, table_base, s3));
+        }
+    }
+    cost
+}
+
+#[inline]
+fn quant_cost_mode_1(table: &[u8], table_base: isize, groups: &[[i16; 4]], mut cost: u16) -> u16 {
+    for &[s0, s1, s2, s3] in groups {
+        cost = cost
+            .wrapping_add(code_length(table, table_base, s0))
+            .wrapping_add(code_length(table, table_base, s1))
+            .wrapping_add(code_length(table, table_base, s2))
+            .wrapping_add(code_length(table, table_base, s3));
+    }
+    cost
 }
 
 /// The three cost-accumulation modes over a grouped symbol buffer
@@ -213,66 +261,29 @@ pub fn quant_cost_accumulate_at5(
     nonzero_count: u16,
 ) -> u16 {
     let iterations = count >> (descriptor.count_shift & 0x1f);
-    let mut cost: u16 = if descriptor.seed_nonzero {
+    let cost: u16 = if descriptor.seed_nonzero {
         nonzero_count
     } else {
         0
     };
-    if descriptor.mode & 4 != 0 {
-        let mut index = 0usize;
-        while index < iterations {
-            cost = cost.wrapping_add(1);
-            let (s0, s1, s2, s3) = (
-                symbols[index],
-                symbols[index + 1],
-                symbols[index + 2],
-                symbols[index + 3],
-            );
-            if s0 != 0 || s1 != 0 || s2 != 0 || s3 != 0 {
-                cost = cost
-                    .wrapping_add(code_length(descriptor, s0))
-                    .wrapping_add(code_length(descriptor, s1))
-                    .wrapping_add(code_length(descriptor, s2))
-                    .wrapping_add(code_length(descriptor, s3));
-            }
-            index += 4;
-        }
-    } else if descriptor.mode & 2 != 0 {
-        let mut index = 0usize;
-        while index < iterations {
-            let (s0, s1, s2, s3) = (
-                symbols[index],
-                symbols[index + 1],
-                symbols[index + 2],
-                symbols[index + 3],
-            );
-            if s0 == 0 && s1 == 0 {
-                cost = cost.wrapping_add(2);
-            } else {
-                cost = cost
-                    .wrapping_add(code_length(descriptor, s0))
-                    .wrapping_add(code_length(descriptor, s1))
-                    .wrapping_add(2);
-            }
-            if s2 != 0 || s3 != 0 {
-                cost = cost
-                    .wrapping_add(code_length(descriptor, s2))
-                    .wrapping_add(code_length(descriptor, s3));
-            }
-            index += 4;
-        }
-    } else if descriptor.mode & 1 != 0 {
-        let mut index = 0usize;
-        while index < iterations {
-            cost = cost
-                .wrapping_add(code_length(descriptor, symbols[index]))
-                .wrapping_add(code_length(descriptor, symbols[index + 1]))
-                .wrapping_add(code_length(descriptor, symbols[index + 2]))
-                .wrapping_add(code_length(descriptor, symbols[index + 3]));
-            index += 4;
-        }
+    if descriptor.mode & 7 == 0 {
+        return cost;
     }
-    cost
+    let consumed = iterations.div_ceil(4).checked_mul(4).unwrap();
+    let (groups, remainder) = symbols[..consumed].as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
+    let table = descriptor.table;
+    let table_base = descriptor.table_zero_offset as isize + 2;
+
+    if descriptor.mode & 4 != 0 {
+        quant_cost_mode_4(table, table_base, groups, cost)
+    } else if descriptor.mode & 2 != 0 {
+        quant_cost_mode_2(table, table_base, groups, cost)
+    } else if descriptor.mode & 1 != 0 {
+        quant_cost_mode_1(table, table_base, groups, cost)
+    } else {
+        cost
+    }
 }
 
 use crate::coding::quant::{QuantError, quant_at5};
@@ -530,6 +541,132 @@ fn quant_nontone_costs_allocating_at5(
         costs[candidate] = quant_cost_accumulate_at5(&descriptor, symbols, count, nonzero);
     }
     Ok(costs)
+}
+
+#[cfg(test)]
+mod accumulate_tests {
+    use super::*;
+
+    fn scalar_reference(
+        descriptor: &QuantCostDescriptor,
+        symbols: &[i16],
+        count: usize,
+        nonzero_count: u16,
+    ) -> u16 {
+        let iterations = count >> (descriptor.count_shift & 0x1f);
+        let mut cost = if descriptor.seed_nonzero {
+            nonzero_count
+        } else {
+            0
+        };
+        let length = |symbol| {
+            let index = (descriptor.table_zero_offset as isize + 2 + symbol as isize * 4) as usize;
+            u16::from(descriptor.table[index])
+        };
+        let mut index = 0usize;
+        while index < iterations {
+            let (s0, s1, s2, s3) = (
+                symbols[index],
+                symbols[index + 1],
+                symbols[index + 2],
+                symbols[index + 3],
+            );
+            if descriptor.mode & 4 != 0 {
+                cost = cost.wrapping_add(1);
+                if s0 != 0 || s1 != 0 || s2 != 0 || s3 != 0 {
+                    cost = cost
+                        .wrapping_add(length(s0))
+                        .wrapping_add(length(s1))
+                        .wrapping_add(length(s2))
+                        .wrapping_add(length(s3));
+                }
+            } else if descriptor.mode & 2 != 0 {
+                if s0 == 0 && s1 == 0 {
+                    cost = cost.wrapping_add(2);
+                } else {
+                    cost = cost
+                        .wrapping_add(length(s0))
+                        .wrapping_add(length(s1))
+                        .wrapping_add(2);
+                }
+                if s2 != 0 || s3 != 0 {
+                    cost = cost.wrapping_add(length(s2)).wrapping_add(length(s3));
+                }
+            } else if descriptor.mode & 1 != 0 {
+                cost = cost
+                    .wrapping_add(length(s0))
+                    .wrapping_add(length(s1))
+                    .wrapping_add(length(s2))
+                    .wrapping_add(length(s3));
+            }
+            index += 4;
+        }
+        cost
+    }
+
+    #[test]
+    fn grouped_accumulator_matches_scalar_for_every_descriptor() {
+        for state in 0..QUANT_COST_STATES {
+            for candidate in 0..QUANT_COST_CANDIDATES {
+                for word_length in 1..=QUANT_COST_WORD_LENGTHS {
+                    let descriptor =
+                        quant_cost_descriptor_at5(state, candidate, word_length).unwrap();
+                    let table_base = descriptor.table_zero_offset as isize + 2;
+                    let min_symbol = (-(table_base / 4)).max(i16::MIN as isize) as i16;
+                    let max_symbol = ((descriptor.table.len() as isize - 1 - table_base) / 4)
+                        .min(i16::MAX as isize) as i16;
+                    let low = min_symbol.max(-1);
+                    let high = max_symbol.min(1);
+                    let pattern = [0, high, low, 0, high, 0, low, high];
+                    let symbols: Vec<i16> = pattern.into_iter().cycle().take(128).collect();
+
+                    let actual = quant_cost_accumulate_at5(&descriptor, &symbols, 128, 37);
+                    let expected = scalar_reference(&descriptor, &symbols, 128, 37);
+                    assert_eq!(
+                        actual, expected,
+                        "state={state} candidate={candidate} wl={word_length}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_accumulator_preserves_partial_group_and_wrapping() {
+        static TABLE: [u8; 7] = [0, 0, 255, 0, 0, 0, 255];
+        for mode in [1, 2, 4] {
+            let descriptor = QuantCostDescriptor {
+                table: &TABLE,
+                table_zero_offset: 0,
+                buffer_selector: 1,
+                mode,
+                count_shift: 0,
+                seed_nonzero: true,
+            };
+            let symbols = vec![0i16; 1_024];
+            for count in [0, 1, 5, 128, 1_024] {
+                assert_eq!(
+                    quant_cost_accumulate_at5(&descriptor, &symbols, count, u16::MAX - 3),
+                    scalar_reference(&descriptor, &symbols, count, u16::MAX - 3),
+                    "mode={mode} count={count}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_op_mode_does_not_consume_symbols() {
+        let descriptor = QuantCostDescriptor {
+            table: &[],
+            table_zero_offset: 0,
+            buffer_selector: 1,
+            mode: 0,
+            count_shift: 0,
+            seed_nonzero: true,
+        };
+
+        assert_eq!(quant_cost_accumulate_at5(&descriptor, &[], 4, 17), 17);
+    }
 }
 
 #[cfg(test)]

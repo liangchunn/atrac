@@ -5,7 +5,7 @@ use crate::gha::synthesis::{
     COMPONENT_SAMPLES, ComponentResult, GhaSynthesisError, GhaWaveRecord, calc_component_at5,
 };
 use crate::tables::at5::{
-    SIN_AT5_ENTRIES, amtbl_gha, ip256_at5, sc256_at5, sftbl_gha_at5, sin_at5_ref,
+    SIN_AT5_ENTRIES, amtbl_gha, ip256_at5_ref, sc256_at5_ref, sftbl_gha_at5, sin_at5_ref,
 };
 
 const TWO_PI_AT5: f32 = f32::from_bits(0x40c9_0fdb);
@@ -245,19 +245,13 @@ pub fn analysis_sine_at5_sub(
     let mut accepted = 0usize;
     let mut active = true;
     let mut coarse_bin = initial_coarse_bin.unwrap();
-    let ip_table = ip256_at5();
-    let sc_table = sc256_at5();
+    let ip_table = ip256_at5_ref();
+    let sc_table = sc256_at5_ref();
 
     while accepted < max_waves && active {
         if accepted > 0 {
             let mut dft_bins = [0.0_f32; 129];
-            dft_x_at5(
-                &local,
-                COMPONENT_SAMPLES,
-                &mut dft_bins,
-                &ip_table,
-                &sc_table,
-            )?;
+            dft_x_at5(&local, COMPONENT_SAMPLES, &mut dft_bins, ip_table, sc_table)?;
             match strongest_positive_dft_bin_at5(&dft_bins) {
                 Some(bin) => coarse_bin = bin,
                 None => break,
@@ -346,8 +340,8 @@ pub fn analysis_general_at5_sub(
     let mut accepted = 0usize;
     let mut active = true;
     let mut coarse_bin = initial_coarse_bin.unwrap();
-    let ip_table = ip256_at5();
-    let sc_table = sc256_at5();
+    let ip_table = ip256_at5_ref();
+    let sc_table = sc256_at5_ref();
     let ratio_limit = general_power_ratio_limit_at5(channel_count, profile_selector);
     let mut raw_amplitudes = [0.0_f32; MAX_SINE_WAVES_AT5];
     let mut raw_phases = [0_u32; MAX_SINE_WAVES_AT5];
@@ -356,13 +350,7 @@ pub fn analysis_general_at5_sub(
     while accepted < max_waves && active {
         if accepted > 0 {
             let mut dft_bins = [0.0_f32; 129];
-            dft_x_at5(
-                &local,
-                COMPONENT_SAMPLES,
-                &mut dft_bins,
-                &ip_table,
-                &sc_table,
-            )?;
+            dft_x_at5(&local, COMPONENT_SAMPLES, &mut dft_bins, ip_table, sc_table)?;
             for (bin, &weight) in dft_bins.iter_mut().zip(&dft_weights[..129]) {
                 *bin *= weight;
             }
@@ -797,15 +785,9 @@ pub fn analysis_general_initial_bin_at5(
     local[start..end].copy_from_slice(&samples[start..end]);
 
     let mut dft_bins = [0.0_f32; 129];
-    let ip_table = ip256_at5();
-    let sc_table = sc256_at5();
-    dft_x_at5(
-        &local,
-        COMPONENT_SAMPLES,
-        &mut dft_bins,
-        &ip_table,
-        &sc_table,
-    )?;
+    let ip_table = ip256_at5_ref();
+    let sc_table = sc256_at5_ref();
+    dft_x_at5(&local, COMPONENT_SAMPLES, &mut dft_bins, ip_table, sc_table)?;
     for (bin, &weight) in dft_bins.iter_mut().zip(&dft_weights[..129]) {
         *bin *= weight;
     }
@@ -830,15 +812,9 @@ pub fn analysis_general_tilt_weights_at5(
     local[start..end].copy_from_slice(&samples[start..end]);
 
     let mut dft_bins = [0.0_f32; 129];
-    let ip_table = ip256_at5();
-    let sc_table = sc256_at5();
-    dft_x_at5(
-        &local,
-        COMPONENT_SAMPLES,
-        &mut dft_bins,
-        &ip_table,
-        &sc_table,
-    )?;
+    let ip_table = ip256_at5_ref();
+    let sc_table = sc256_at5_ref();
+    dft_x_at5(&local, COMPONENT_SAMPLES, &mut dft_bins, ip_table, sc_table)?;
 
     let low = dft_bins[..0x40].iter().sum::<f32>();
     let high = dft_bins[0x40..0x80].iter().sum::<f32>();
@@ -879,8 +855,8 @@ pub fn analysis_general_shared_weights_at5(
         mix_seq_at5(channel_a, channel_b, &mut mixed, COMPONENT_SAMPLES)?;
     }
 
-    let ip_table = ip256_at5();
-    let sc_table = sc256_at5();
+    let ip_table = ip256_at5_ref();
+    let sc_table = sc256_at5_ref();
     let mut local = [0.0_f32; COMPONENT_SAMPLES];
     local[start..end].copy_from_slice(&mixed[start..end]);
     let mut mixed_bins = [0.0_f32; 129];
@@ -888,8 +864,8 @@ pub fn analysis_general_shared_weights_at5(
         &local,
         COMPONENT_SAMPLES,
         &mut mixed_bins,
-        &ip_table,
-        &sc_table,
+        ip_table,
+        sc_table,
     )?;
 
     let mut channel_a_bins = [0.0_f32; 129];
@@ -897,16 +873,16 @@ pub fn analysis_general_shared_weights_at5(
         channel_a,
         COMPONENT_SAMPLES,
         &mut channel_a_bins,
-        &ip_table,
-        &sc_table,
+        ip_table,
+        sc_table,
     )?;
     let mut channel_b_bins = [0.0_f32; 129];
     dft_x_at5(
         channel_b,
         COMPONENT_SAMPLES,
         &mut channel_b_bins,
-        &ip_table,
-        &sc_table,
+        ip_table,
+        sc_table,
     )?;
 
     let mut weights = [0.0_f32; 129];

@@ -5,7 +5,7 @@ use crate::dsp::gain::{
     GC_SET_POINTS_OUTPUT_GROUP_STRIDE_WORDS, GC_SET_POINTS_OUTPUT_RECORD_WORDS, GainPassError,
     GcSetPointWords, gc_set_points_at5,
 };
-use crate::tables::at5::{half_hannwin_at5, ip016_at5, lngain_at5, sc016_at5};
+use crate::tables::at5::{half_hannwin_at5, ip016_at5_ref, lngain_at5, sc016_at5_ref};
 
 pub const GAIN_DETECT_SLOTS: usize = 4;
 pub const GAIN_DETECT_STATE_CHANNELS: usize = 2;
@@ -83,9 +83,10 @@ pub struct GainDetectPeakBins {
     max_value: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GainDetectPeakSpan {
-    slots: Vec<usize>,
+    slots: [usize; GAIN_DETECT_HISTORY_PEAK_VALUES],
+    len: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -204,7 +205,8 @@ pub struct GainDetectCandidateSourceCall {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GainDetectCandidateSourceQueue {
-    records: Vec<([u32; GAIN_DETECT_EMIT_RECORD_WORDS], i32)>,
+    records: [([u32; GAIN_DETECT_EMIT_RECORD_WORDS], i32); GAIN_DETECT_HISTORY_PEAK_VALUES],
+    record_count: usize,
     cursor_index: usize,
     next_side: GainDetectCandidateSide,
 }
@@ -532,20 +534,33 @@ pub fn gain_detect_over_seven_prune_at5(
 pub fn gain_detect_over_seven_prune_three_pool_at5(
     pools: &mut GainDetectPrunePools,
 ) -> Result<GainDetectOverSevenPruneResult, GainDetectCandidateLoopError> {
+    let [pool0, pool1, pool2] = &mut pools.pools;
+    gain_detect_over_seven_prune_slices_at5(
+        [&mut pool0[..], &mut pool1[..], &mut pool2[..]],
+        &mut pools.removed,
+        &mut pools.duplicates,
+        &mut pools.level_totals,
+    )
+}
+
+fn gain_detect_over_seven_prune_slices_at5(
+    mut pools: [&mut [GainDetectCandidateListRecord]; GAIN_DETECT_PRUNE_POOLS],
+    removed: &mut [i32; GAIN_DETECT_PRUNE_POOLS],
+    duplicates: &mut [i32; GAIN_DETECT_PRUNE_POOLS],
+    level_totals: &mut [i32; GAIN_DETECT_PEAK_BINS],
+) -> Result<GainDetectOverSevenPruneResult, GainDetectCandidateLoopError> {
     let mut iterations_run = 0usize;
 
     loop {
-        let pool1_count = pools.pools[1].len() as i32;
-        let remaining = (pool1_count - pools.duplicates[1]) - pools.removed[1];
+        let pool1_count = pools[1].len() as i32;
+        let remaining = (pool1_count - duplicates[1]) - removed[1];
         if remaining <= 7 {
             break;
         }
 
         let choice = {
-            let level_totals = pools.level_totals;
-            let Some(choice) =
-                gain_detect_best_over_seven_choice_at5(pools.pools[1], &level_totals)?
-            else {
+            let totals = *level_totals;
+            let Some(choice) = gain_detect_best_over_seven_choice_at5(pools[1], &totals)? else {
                 // The gate passed with no active pool-1 record, which no
                 // observed call reaches.
                 return Err(GainDetectCandidateLoopError::PruneLoopUnsupported {
@@ -557,20 +572,21 @@ pub fn gain_detect_over_seven_prune_three_pool_at5(
 
         match choice {
             GainDetectOverSevenChoice::Merge(candidate) => {
-                let mut level_totals = pools.level_totals;
-                gain_detect_apply_over_seven_merge_at5(
-                    pools.pools[1],
-                    candidate,
-                    &mut level_totals,
-                )?;
-                pools.level_totals = level_totals;
+                let mut totals = *level_totals;
+                gain_detect_apply_over_seven_merge_at5(pools[1], candidate, &mut totals)?;
+                *level_totals = totals;
                 // Native `local_56c[1] += 1` (decompile 32381): the merge
                 // collapses two records onto one location, adding a duplicate.
-                pools.duplicates[1] += 1;
+                duplicates[1] += 1;
             }
             GainDetectOverSevenChoice::Remove { removed_index } => {
-                let increments = gain_detect_apply_over_seven_removal_at5(pools, removed_index)?;
-                for (counter, delta) in pools.removed.iter_mut().zip(increments) {
+                let increments = gain_detect_apply_over_seven_removal_slices_at5(
+                    &mut pools,
+                    duplicates,
+                    level_totals,
+                    removed_index,
+                )?;
+                for (counter, delta) in removed.iter_mut().zip(increments) {
                     *counter += delta;
                 }
             }
@@ -585,8 +601,8 @@ pub fn gain_detect_over_seven_prune_three_pool_at5(
 
     Ok(GainDetectOverSevenPruneResult {
         iterations_run,
-        duplicate_count: pools.duplicates[1].max(0) as usize,
-        removed_count: pools.removed[1].max(0) as usize,
+        duplicate_count: duplicates[1].max(0) as usize,
+        removed_count: removed[1].max(0) as usize,
     })
 }
 
@@ -601,7 +617,13 @@ pub fn gain_detect_apply_over_seven_removal_replay_at5(
     pools: &mut GainDetectPrunePools,
     removed_index: usize,
 ) -> Result<[i32; GAIN_DETECT_PRUNE_POOLS], GainDetectCandidateLoopError> {
-    gain_detect_apply_over_seven_removal_at5(pools, removed_index)
+    let [pool0, pool1, pool2] = &mut pools.pools;
+    gain_detect_apply_over_seven_removal_slices_at5(
+        &mut [&mut pool0[..], &mut pool1[..], &mut pool2[..]],
+        &mut pools.duplicates,
+        &mut pools.level_totals,
+        removed_index,
+    )
 }
 
 pub fn gain_detect_stereo_update_gate_at5(
@@ -1002,15 +1024,19 @@ impl GainDetectCandidateSourceQueue {
             source_index,
             GAIN_DETECT_HISTORY_PEAK_VALUES - 1,
         )?;
+        let mut records =
+            [([0u32; GAIN_DETECT_EMIT_RECORD_WORDS], 0); GAIN_DETECT_HISTORY_PEAK_VALUES];
+        records[0] = (source_words, source_index);
         Ok(Self {
-            records: vec![(source_words, source_index)],
+            records,
+            record_count: 1,
             cursor_index: 0,
             next_side: GainDetectCandidateSide::Lower,
         })
     }
 
     pub fn record_count(&self) -> usize {
-        self.records.len()
+        self.record_count
     }
 
     pub fn cursor_index(&self) -> usize {
@@ -1027,23 +1053,24 @@ impl GainDetectCandidateSourceQueue {
             destination_index,
             GAIN_DETECT_HISTORY_PEAK_VALUES - 1,
         )?;
-        if self.records.len() == GAIN_DETECT_HISTORY_PEAK_VALUES {
+        if self.record_count == GAIN_DETECT_HISTORY_PEAK_VALUES {
             return Err(SigprocError::CountOutOfRange {
                 name: "gain_detect_candidate_source_record_count",
-                value: self.records.len() + 1,
+                value: self.record_count + 1,
                 max: GAIN_DETECT_HISTORY_PEAK_VALUES,
             });
         }
-        self.records.push((destination_words, destination_index));
+        self.records[self.record_count] = (destination_words, destination_index);
+        self.record_count += 1;
         Ok(())
     }
 
     pub fn next_call(&mut self) -> Result<Option<GainDetectCandidateSourceCall>, SigprocError> {
         loop {
-            let Some((source_words, source_index)) = self.records.get(self.cursor_index).copied()
-            else {
+            if self.cursor_index == self.record_count {
                 return Ok(None);
-            };
+            }
+            let (source_words, source_index) = self.records[self.cursor_index];
             match self.next_side {
                 GainDetectCandidateSide::Lower => {
                     self.next_side = GainDetectCandidateSide::Upper;
@@ -1160,7 +1187,7 @@ impl GainDetectPeakBins {
 
 impl GainDetectPeakSpan {
     pub fn slots(&self) -> &[usize] {
-        &self.slots
+        &self.slots[..self.len]
     }
 }
 
@@ -1410,7 +1437,9 @@ pub fn gain_detect_peak_span_at5(
         (prev_max_slot, prev_max_slot + 1, prev_peak_slot_plus_32 + 1)
     };
 
-    let mut slots = vec![head_slot];
+    let mut slots = [0usize; GAIN_DETECT_HISTORY_PEAK_VALUES];
+    slots[0] = head_slot;
+    let mut len = 1usize;
     for candidate in start_slot..end_slot {
         check_index(
             "gain_detect_span_slot",
@@ -1418,15 +1447,17 @@ pub fn gain_detect_peak_span_at5(
             GAIN_DETECT_HISTORY_PEAK_VALUES - 1,
         )?;
 
-        let insert_at = slots[1..]
+        let insert_at = slots[1..len]
             .iter()
             .position(|slot| history_peaks[*slot] < history_peaks[candidate])
             .map(|offset| offset + 1)
-            .unwrap_or(slots.len());
-        slots.insert(insert_at, candidate);
+            .unwrap_or(len);
+        slots.copy_within(insert_at..len, insert_at + 1);
+        slots[insert_at] = candidate;
+        len += 1;
     }
 
-    Ok(GainDetectPeakSpan { slots })
+    Ok(GainDetectPeakSpan { slots, len })
 }
 
 pub fn gain_detect_weight_at5(dft_output: &[f32]) -> Result<GainDetectWeight, SigprocError> {
@@ -1478,16 +1509,16 @@ pub fn gain_detect_window_weight_at5(
             source_window[GAIN_DETECT_WEIGHT_WINDOW_VALUES - 1 - index] * window[index];
     }
 
-    let ip_table = ip016_at5();
-    let sc_table = sc016_at5();
+    let ip_table = ip016_at5_ref();
+    let sc_table = sc016_at5_ref();
     let mut dft_output = [0.0; GAIN_DETECT_WEIGHT_DFT_OUTPUT_VALUES];
     dft_v_at5(
         &input,
         1,
         GAIN_DETECT_WEIGHT_WINDOW_VALUES,
         &mut dft_output,
-        &ip_table,
-        &sc_table,
+        ip_table,
+        sc_table,
     )
     .map_err(SigprocError::Transform)?;
 
@@ -1542,7 +1573,7 @@ pub const GAIN_DETECT_BAND_WINDOW_VALUES: usize = GAIN_DETECT_ACTIVITY_INPUT_VAL
 pub const GAIN_DETECT_BAND_WINDOW_PEAK_OFFSET: usize =
     GAIN_DETECT_ACTIVITY_INITIAL_FLAGS * GAIN_DETECT_PEAK_GROUP_VALUES;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GainDetectBandFront {
     pub peaks: GainDetectPeakBins,
     pub activity: GainDetectActivityFlags,
@@ -1617,6 +1648,112 @@ pub struct GainDetectBandOutcome {
     pub next_pool_records: Vec<GainDetectCandidateListRecord>,
 }
 
+/// Preserve the public time-to-frequency output shape on the lean path while
+/// carrying the exceptional `prune_blocked` signal to the coding bridge. The
+/// normal path returns an empty vector and allocates nothing; marker outcomes
+/// are materialized only when a blocked compaction actually occurs.
+pub(crate) fn gain_detect_prune_markers_at5(
+    band_count: usize,
+    blocked: &[bool],
+) -> Vec<GainDetectBandOutcome> {
+    if !blocked.iter().take(band_count).any(|value| *value) {
+        return Vec::new();
+    }
+    let front = GainDetectBandFront {
+        peaks: GainDetectPeakBins {
+            bins: [0.0; GAIN_DETECT_PEAK_BINS],
+            max_index: 0,
+            max_value: 0.0,
+        },
+        activity: GainDetectActivityFlags {
+            quad_flags: [0; GAIN_DETECT_ACTIVITY_FLAGS],
+        },
+        weights: [GainDetectWeight {
+            weight: 0.0,
+            accepted: false,
+        }; GAIN_DETECT_PEAK_BINS],
+    };
+    (0..band_count)
+        .map(|band| GainDetectBandOutcome {
+            front,
+            span_slots: Vec::new(),
+            gc_calls: Vec::new(),
+            gc_records: Vec::new(),
+            duplicate_count: 0,
+            final_duplicate_count: 0,
+            prune_iterations_run: 0,
+            prune_removed_count: 0,
+            prune_pool2_removed_count: 0,
+            level_totals: [0; GAIN_DETECT_PEAK_BINS],
+            prune: false,
+            prune_blocked: blocked.get(band).copied().unwrap_or(false),
+            compact_point_words: [0; GAIN_DETECT_POINT_WORDS],
+            next_pool_records: Vec::new(),
+        })
+        .collect()
+}
+
+/// Reusable bounded storage for one native per-band detector call. The native
+/// lists are capped at 32 records and the source/call chain at 64 entries.
+pub(crate) struct GainDetectScratch {
+    gc_calls: [Option<GainDetectCandidateLoopCall>; GAIN_DETECT_HISTORY_PEAK_VALUES],
+    gc_records: [GainDetectCandidateListRecord; GAIN_DETECT_PEAK_BINS],
+    pool0_records: [GainDetectCandidateListRecord; GAIN_DETECT_PEAK_BINS],
+    pool2_records: [GainDetectCandidateListRecord; GAIN_DETECT_PEAK_BINS],
+    next_pool_records: [GainDetectCandidateListRecord; GAIN_DETECT_PEAK_BINS],
+    compact_candidates: [GainDetectEmitCandidate; GAIN_DETECT_PEAK_BINS],
+    compact_visited: [bool; GAIN_DETECT_PEAK_BINS],
+    compact_emitted: [(i32, i32); GAIN_DETECT_POINTS],
+}
+
+impl Default for GainDetectScratch {
+    fn default() -> Self {
+        const EMPTY: GainDetectCandidateListRecord =
+            GainDetectCandidateListRecord::from_native_words([0i32; GAIN_DETECT_EMIT_RECORD_WORDS]);
+        const EMPTY_EMIT: GainDetectEmitCandidate = GainDetectEmitCandidate {
+            words: [0i32; GAIN_DETECT_EMIT_RECORD_WORDS],
+            next_index: None,
+        };
+        Self {
+            gc_calls: [None; GAIN_DETECT_HISTORY_PEAK_VALUES],
+            gc_records: [EMPTY; GAIN_DETECT_PEAK_BINS],
+            pool0_records: [EMPTY; GAIN_DETECT_PEAK_BINS],
+            pool2_records: [EMPTY; GAIN_DETECT_PEAK_BINS],
+            next_pool_records: [EMPTY; GAIN_DETECT_PEAK_BINS],
+            compact_candidates: [EMPTY_EMIT; GAIN_DETECT_PEAK_BINS],
+            compact_visited: [false; GAIN_DETECT_PEAK_BINS],
+            compact_emitted: [(0, 0); GAIN_DETECT_POINTS],
+        }
+    }
+}
+
+impl GainDetectScratch {
+    pub(crate) fn next_pool_records(
+        &self,
+        outcome: &GainDetectLeanOutcome,
+    ) -> &[GainDetectCandidateListRecord] {
+        &self.next_pool_records[..outcome.next_pool_count]
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GainDetectLeanOutcome {
+    pub front: GainDetectBandFront,
+    span: GainDetectPeakSpan,
+    gc_call_count: usize,
+    gc_record_count: usize,
+    duplicate_count: usize,
+    final_duplicate_count: usize,
+    prune_iterations_run: usize,
+    prune_removed_count: usize,
+    pub prune_pool2_removed_count: usize,
+    level_totals: [i32; GAIN_DETECT_PEAK_BINS],
+    prune: bool,
+    pub prune_blocked: bool,
+    pub compact_point_words: [i32; GAIN_DETECT_POINT_WORDS],
+    next_pool_count: usize,
+}
+
 /// Composed per-band `detect_gainc_data_new_at5` pipeline over the ported
 /// stages: band front, peak span over the seeded spectrum history,
 /// candidate prep scalars, the gc_set candidate loop, fresh-record list
@@ -1626,7 +1763,7 @@ pub struct GainDetectBandOutcome {
 /// and the rebased persistent pool; band-state writeback and history
 /// rotation remain separate ported helpers.
 #[allow(clippy::too_many_arguments)]
-pub fn gain_detect_band_at5(
+pub(crate) fn gain_detect_band_with_scratch_at5(
     band_window: &[f32],
     spectrum: &[f32],
     envelope: &[f32],
@@ -1640,7 +1777,9 @@ pub fn gain_detect_band_at5(
     persistent_records: &mut [GainDetectCandidateListRecord],
     output_records: &mut [u32],
     counts: &mut [i32],
-) -> Result<GainDetectBandOutcome, GainDetectCandidateLoopError> {
+    scratch: &mut GainDetectScratch,
+    capture_calls: bool,
+) -> Result<GainDetectLeanOutcome, GainDetectCandidateLoopError> {
     let front = gain_detect_band_front_at5(band_window)?;
     let span = gain_detect_peak_span_at5(
         &spectrum[..GAIN_DETECT_HISTORY_PEAK_VALUES.min(spectrum.len())],
@@ -1661,7 +1800,7 @@ pub fn gain_detect_band_at5(
     let bounds_words = gain_detect_candidate_bounds_words_at5(&prep);
     let (initial_words, initial_index) =
         gain_detect_candidate_initial_source_words_at5(&prep, span.slots()[0])?;
-    let gc_calls = gain_detect_candidate_gc_set_loop_at5(
+    let gc_call_count = gain_detect_candidate_gc_set_loop_into_at5(
         &span,
         initial_words,
         initial_index,
@@ -1671,10 +1810,19 @@ pub fn gain_detect_band_at5(
         envelope,
         output_records,
         counts,
+        capture_calls.then_some(&mut scratch.gc_calls),
     )?;
 
     let gc_count = counts.first().copied().unwrap_or(0).max(0) as usize;
-    let mut gc_records = Vec::with_capacity(gc_count);
+    if gc_count > GAIN_DETECT_PEAK_BINS {
+        return Err(SigprocError::CountOutOfRange {
+            name: "gain_detect_candidate_list_count",
+            value: gc_count,
+            max: GAIN_DETECT_PEAK_BINS,
+        }
+        .into());
+    }
+    let gc_records = &mut scratch.gc_records[..gc_count];
     for record_index in 0..gc_count {
         let base = record_index * GC_SET_POINTS_OUTPUT_RECORD_WORDS;
         let mut words = [0i32; GAIN_DETECT_EMIT_RECORD_WORDS];
@@ -1687,19 +1835,27 @@ pub fn gain_detect_band_at5(
         // Fresh records enter the over-seven gate with width word 10 zero
         // (`gain_detect_state_trace.ndjson`, call 6 ch0 band13 pre-merge).
         words[10] = 0;
-        gc_records.push(GainDetectCandidateListRecord::from_native_words(words));
+        gc_records[record_index] = GainDetectCandidateListRecord::from_native_words(words);
     }
-    let gc_bounds = gain_detect_insert_candidate_list_at5(&mut gc_records)?;
+    let gc_bounds = gain_detect_insert_candidate_list_at5(gc_records)?;
     let duplicate_count =
-        gain_detect_duplicate_location_count_at5(&gc_records, gc_bounds.head_index())?;
-    let level_totals = gain_detect_level_totals_at5(&gc_records, gc_bounds.head_index())?;
+        gain_detect_duplicate_location_count_at5(gc_records, gc_bounds.head_index())?;
+    let level_totals = gain_detect_level_totals_at5(gc_records, gc_bounds.head_index())?;
 
     // Pool 2 (`local_116c`, high-location fresh pool = gc output slab group 1)
     // and pool 0 (`local_296c`, list A = the carried persistent pool). Native
     // addresses removal-branch partners into all three pools relative to the
     // node's pool 1 (decompile 32387); pools 0/2 are partner targets only.
     let pool2_count = counts.get(1).copied().unwrap_or(0).max(0) as usize;
-    let mut pool2_records = Vec::with_capacity(pool2_count);
+    if pool2_count > GAIN_DETECT_PEAK_BINS {
+        return Err(SigprocError::CountOutOfRange {
+            name: "gain_detect_candidate_list_count",
+            value: pool2_count,
+            max: GAIN_DETECT_PEAK_BINS,
+        }
+        .into());
+    }
+    let pool2_records = &mut scratch.pool2_records[..pool2_count];
     for record_index in 0..pool2_count {
         let base = GC_SET_POINTS_OUTPUT_GROUP_STRIDE_WORDS
             + record_index * GC_SET_POINTS_OUTPUT_RECORD_WORDS;
@@ -1710,9 +1866,18 @@ pub fn gain_detect_band_at5(
         {
             *word = *source as i32;
         }
-        pool2_records.push(GainDetectCandidateListRecord::from_native_words(words));
+        pool2_records[record_index] = GainDetectCandidateListRecord::from_native_words(words);
     }
-    let mut pool0_records: Vec<GainDetectCandidateListRecord> = persistent_records.to_vec();
+    if persistent_records.len() > GAIN_DETECT_PEAK_BINS {
+        return Err(SigprocError::CountOutOfRange {
+            name: "gain_detect_candidate_list_count",
+            value: persistent_records.len(),
+            max: GAIN_DETECT_PEAK_BINS,
+        }
+        .into());
+    }
+    let pool0_records = &mut scratch.pool0_records[..persistent_records.len()];
+    pool0_records.copy_from_slice(persistent_records);
 
     // Native over-seven prune/removal gate at `detect_gainc_data_new_at5`
     // decompile 32035 (`7 < (gc_count - duplicates) - removed[1]`), where
@@ -1727,22 +1892,24 @@ pub fn gain_detect_band_at5(
         // removal branch's per-pool dup bookkeeping. Pool 0 is rebuilt fresh here
         // rather than carried because its only observable use in this call is the
         // per-pool dup decrement on a pool-0 partner removal.
-        let pool0_bounds = gain_detect_insert_candidate_list_at5(&mut pool0_records)?;
+        let pool0_bounds = gain_detect_insert_candidate_list_at5(pool0_records)?;
         let pool0_dup =
-            gain_detect_duplicate_location_count_at5(&pool0_records, pool0_bounds.head_index())?;
-        let pool2_bounds = gain_detect_insert_candidate_list_at5(&mut pool2_records)?;
+            gain_detect_duplicate_location_count_at5(pool0_records, pool0_bounds.head_index())?;
+        let pool2_bounds = gain_detect_insert_candidate_list_at5(pool2_records)?;
         let pool2_dup =
-            gain_detect_duplicate_location_count_at5(&pool2_records, pool2_bounds.head_index())?;
+            gain_detect_duplicate_location_count_at5(pool2_records, pool2_bounds.head_index())?;
 
-        let mut pools = GainDetectPrunePools {
-            pools: [&mut pool0_records, &mut gc_records, &mut pool2_records],
-            removed: [0, carried_removed_count as i32, 0],
-            duplicates: [pool0_dup as i32, duplicate_count as i32, pool2_dup as i32],
-            level_totals,
-        };
-        let result = gain_detect_over_seven_prune_three_pool_at5(&mut pools)?;
-        pool2_removed = pools.removed[2].max(0) as usize;
-        final_level_totals = pools.level_totals;
+        let mut removed = [0, carried_removed_count as i32, 0];
+        let mut duplicates = [pool0_dup as i32, duplicate_count as i32, pool2_dup as i32];
+        let mut totals = level_totals;
+        let result = gain_detect_over_seven_prune_slices_at5(
+            [&mut *pool0_records, &mut *gc_records, &mut *pool2_records],
+            &mut removed,
+            &mut duplicates,
+            &mut totals,
+        )?;
+        pool2_removed = removed[2].max(0) as usize;
+        final_level_totals = totals;
         result
     } else {
         GainDetectOverSevenPruneResult {
@@ -1784,18 +1951,22 @@ pub fn gain_detect_band_at5(
     // over-accumulates past 7 emittable points, emit an all-zero placeholder
     // and flag it (`prune_blocked`) rather than crashing.
     let mut prune_blocked = false;
-    let compact_point_words =
-        match gain_detect_compact_record_from_candidate_list_at5(persistent_records) {
-            Ok(record) => record.point_words()?,
-            Err(SigprocError::CountOutOfRange {
-                name: "gain_detect_emit_point_count",
-                ..
-            }) => {
-                prune_blocked = true;
-                [0i32; GAIN_DETECT_POINT_WORDS]
-            }
-            Err(error) => return Err(error.into()),
-        };
+    let compact_point_words = match gain_detect_compact_record_from_candidate_list_with_scratch_at5(
+        persistent_records,
+        &mut scratch.compact_candidates,
+        &mut scratch.compact_visited,
+        &mut scratch.compact_emitted,
+    ) {
+        Ok(record) => record.point_words()?,
+        Err(SigprocError::CountOutOfRange {
+            name: "gain_detect_emit_point_count",
+            ..
+        }) => {
+            prune_blocked = true;
+            [0i32; GAIN_DETECT_POINT_WORDS]
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     // The merged list-B pool (gc_set output group 0 = native `local_1d6c`).
     // This is what the native writeback copies to the channel block and what
@@ -1803,20 +1974,22 @@ pub fn gain_detect_band_at5(
     // words; zero only the run-specific linked-list pointer words `words[2..4]`.
     // Word 10 carries the accumulated merge width and must survive into the
     // next pool.
-    let mut next_pool_records = Vec::with_capacity(gc_count);
-    for record in &gc_records {
+    for (destination, record) in scratch.next_pool_records[..gc_count]
+        .iter_mut()
+        .zip(gc_records.iter())
+    {
         let mut words = *record.words();
         words[2] = 0;
         words[3] = 0;
         words[4] = 0;
-        next_pool_records.push(GainDetectCandidateListRecord::from_native_words(words));
+        *destination = GainDetectCandidateListRecord::from_native_words(words);
     }
 
-    Ok(GainDetectBandOutcome {
+    Ok(GainDetectLeanOutcome {
         front,
-        span_slots: span.slots().to_vec(),
-        gc_calls,
-        gc_records,
+        span,
+        gc_call_count,
+        gc_record_count: gc_count,
         duplicate_count,
         final_duplicate_count: prune_result.duplicate_count,
         prune_iterations_run: prune_result.iterations_run,
@@ -1826,7 +1999,62 @@ pub fn gain_detect_band_at5(
         prune,
         prune_blocked,
         compact_point_words,
-        next_pool_records,
+        next_pool_count: gc_count,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gain_detect_band_at5(
+    band_window: &[f32],
+    spectrum: &[f32],
+    envelope: &[f32],
+    prev_max_slot: usize,
+    prev_peak_slot_plus_32: usize,
+    prev_level_a: f32,
+    prev_level_b: f32,
+    stored_peak_a: f32,
+    current_bin0_peak: f32,
+    carried_removed_count: usize,
+    persistent_records: &mut [GainDetectCandidateListRecord],
+    output_records: &mut [u32],
+    counts: &mut [i32],
+) -> Result<GainDetectBandOutcome, GainDetectCandidateLoopError> {
+    let mut scratch = GainDetectScratch::default();
+    let lean = gain_detect_band_with_scratch_at5(
+        band_window,
+        spectrum,
+        envelope,
+        prev_max_slot,
+        prev_peak_slot_plus_32,
+        prev_level_a,
+        prev_level_b,
+        stored_peak_a,
+        current_bin0_peak,
+        carried_removed_count,
+        persistent_records,
+        output_records,
+        counts,
+        &mut scratch,
+        true,
+    )?;
+    Ok(GainDetectBandOutcome {
+        front: lean.front,
+        span_slots: lean.span.slots().to_vec(),
+        gc_calls: scratch.gc_calls[..lean.gc_call_count]
+            .iter()
+            .map(|call| call.expect("captured detector call"))
+            .collect(),
+        gc_records: scratch.gc_records[..lean.gc_record_count].to_vec(),
+        duplicate_count: lean.duplicate_count,
+        final_duplicate_count: lean.final_duplicate_count,
+        prune_iterations_run: lean.prune_iterations_run,
+        prune_removed_count: lean.prune_removed_count,
+        prune_pool2_removed_count: lean.prune_pool2_removed_count,
+        level_totals: lean.level_totals,
+        prune: lean.prune,
+        prune_blocked: lean.prune_blocked,
+        compact_point_words: lean.compact_point_words,
+        next_pool_records: scratch.next_pool_records[..lean.next_pool_count].to_vec(),
     })
 }
 
@@ -2103,6 +2331,40 @@ pub fn gain_detect_candidate_gc_set_loop_at5(
     output_records: &mut [u32],
     counts: &mut [i32],
 ) -> Result<Vec<GainDetectCandidateLoopCall>, GainDetectCandidateLoopError> {
+    let mut call_slots = [None; GAIN_DETECT_HISTORY_PEAK_VALUES];
+    let call_count = gain_detect_candidate_gc_set_loop_into_at5(
+        span,
+        initial_source_words,
+        initial_source_index,
+        active_span_count,
+        bounds_words,
+        spectrum,
+        envelope,
+        output_records,
+        counts,
+        Some(&mut call_slots),
+    )?;
+    Ok(call_slots[..call_count]
+        .iter()
+        .map(|call| call.expect("captured detector call"))
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gain_detect_candidate_gc_set_loop_into_at5(
+    span: &GainDetectPeakSpan,
+    initial_source_words: [u32; GAIN_DETECT_EMIT_RECORD_WORDS],
+    initial_source_index: i32,
+    active_span_count: usize,
+    bounds_words: &[u32],
+    spectrum: &[f32],
+    envelope: &[f32],
+    output_records: &mut [u32],
+    counts: &mut [i32],
+    mut call_slots: Option<
+        &mut [Option<GainDetectCandidateLoopCall>; GAIN_DETECT_HISTORY_PEAK_VALUES],
+    >,
+) -> Result<usize, GainDetectCandidateLoopError> {
     check_storage(
         "gain_detect_candidate_bounds_words",
         bounds_words.len(),
@@ -2111,7 +2373,7 @@ pub fn gain_detect_candidate_gc_set_loop_at5(
     let mut cursor = GainDetectCandidateLoopCursor::new(active_span_count)?;
     let mut queue =
         GainDetectCandidateSourceQueue::new(initial_source_words, initial_source_index)?;
-    let mut calls = Vec::new();
+    let mut call_count = 0usize;
 
     while cursor.should_continue() {
         let source_call =
@@ -2154,7 +2416,7 @@ pub fn gain_detect_candidate_gc_set_loop_at5(
 
         cursor.observe_gc_set_result(gc_set_result)?;
         queue.push_destination(destination_words_after, destination_index)?;
-        calls.push(GainDetectCandidateLoopCall {
+        let call = GainDetectCandidateLoopCall {
             source_record_index: source_call.source_record_index(),
             side: source_call.side(),
             source_words: *source_call.source_words(),
@@ -2163,10 +2425,14 @@ pub fn gain_detect_candidate_gc_set_loop_at5(
             destination_words_after,
             destination_index,
             gc_set_result,
-        });
+        };
+        if let Some(slots) = call_slots.as_deref_mut() {
+            slots[call_count] = Some(call);
+        }
+        call_count += 1;
     }
 
-    Ok(calls)
+    Ok(call_count)
 }
 
 pub fn gain_detect_insert_candidate_list_at5(
@@ -2353,10 +2619,55 @@ pub fn gain_detect_compact_record_from_candidate_list_at5(
     gain_detect_compact_record_from_emit_chain_at5(&candidates, head_index, level_bounds)
 }
 
+fn gain_detect_compact_record_from_candidate_list_with_scratch_at5(
+    records: &mut [GainDetectCandidateListRecord],
+    candidates: &mut [GainDetectEmitCandidate],
+    visited: &mut [bool],
+    emitted: &mut [(i32, i32)],
+) -> Result<GainDetectRecord, SigprocError> {
+    check_storage(
+        "gain_detect_compact_candidates",
+        candidates.len(),
+        records.len(),
+    )?;
+    let head_index = gain_detect_emit_chain_rebuild_fold_at5(records)?;
+    let candidates = &mut candidates[..records.len()];
+    for (candidate, record) in candidates.iter_mut().zip(records.iter()) {
+        *candidate = record.as_emit_candidate();
+    }
+    let level_bounds =
+        gain_detect_normalize_emit_chain_levels_with_visited_at5(candidates, head_index, visited)?;
+    gain_detect_compact_record_from_emit_chain_with_scratch_at5(
+        candidates,
+        head_index,
+        level_bounds,
+        visited,
+        emitted,
+    )
+}
+
 pub fn gain_detect_compact_record_from_emit_chain_at5(
     candidates: &[GainDetectEmitCandidate],
     head_index: Option<usize>,
     bounds: GainDetectEmitLevelBounds,
+) -> Result<GainDetectRecord, SigprocError> {
+    let mut visited = vec![false; candidates.len()];
+    let mut emitted = [(0i32, 0i32); GAIN_DETECT_POINTS];
+    gain_detect_compact_record_from_emit_chain_with_scratch_at5(
+        candidates,
+        head_index,
+        bounds,
+        &mut visited,
+        &mut emitted,
+    )
+}
+
+fn gain_detect_compact_record_from_emit_chain_with_scratch_at5(
+    candidates: &[GainDetectEmitCandidate],
+    head_index: Option<usize>,
+    bounds: GainDetectEmitLevelBounds,
+    visited: &mut [bool],
+    emitted: &mut [(i32, i32)],
 ) -> Result<GainDetectRecord, SigprocError> {
     // Native compact emission loop in `detect_gainc_data_new_at5`
     // (native 0x39c40), region 0x3a48c..0x3a590 plus the far block
@@ -2404,8 +2715,10 @@ pub fn gain_detect_compact_record_from_emit_chain_at5(
         });
     }
 
-    let mut visited = vec![false; candidates.len()];
-    let mut emitted = Vec::new();
+    check_storage("gain_detect_emit_visited", visited.len(), candidates.len())?;
+    check_storage("gain_detect_emit_points", emitted.len(), GAIN_DETECT_POINTS)?;
+    visited[..candidates.len()].fill(false);
+    let mut emitted_count = 0usize;
     let mut prev_level = 0;
     loop {
         if visited[index] {
@@ -2425,14 +2738,15 @@ pub fn gain_detect_compact_record_from_emit_chain_at5(
         )?;
         let clamped_level = candidate.words[1].clamp(min_level, max_level);
         if clamped_level != prev_level {
-            if emitted.len() == GAIN_DETECT_POINTS {
+            if emitted_count == GAIN_DETECT_POINTS {
                 return Err(SigprocError::CountOutOfRange {
                     name: "gain_detect_emit_point_count",
-                    value: emitted.len() + 1,
+                    value: emitted_count + 1,
                     max: GAIN_DETECT_POINTS,
                 });
             }
-            emitted.push((location as i32, gain_detect_level_id_at5(clamped_level)));
+            emitted[emitted_count] = (location as i32, gain_detect_level_id_at5(clamped_level));
+            emitted_count += 1;
         }
         prev_level = clamped_level;
 
@@ -2449,8 +2763,9 @@ pub fn gain_detect_compact_record_from_emit_chain_at5(
         index = next_index;
     }
 
-    record.words[0] = emitted.len() as i32;
-    for (output_index, (location, level_id)) in emitted.into_iter().rev().enumerate() {
+    record.words[0] = emitted_count as i32;
+    for output_index in 0..emitted_count {
+        let (location, level_id) = emitted[emitted_count - 1 - output_index];
         record.words[1 + output_index] = location;
         record.words[8 + output_index] = level_id;
     }
@@ -2461,6 +2776,15 @@ pub fn gain_detect_compact_record_from_emit_chain_at5(
 pub fn gain_detect_normalize_emit_chain_levels_at5(
     candidates: &mut [GainDetectEmitCandidate],
     head_index: Option<usize>,
+) -> Result<GainDetectEmitLevelBounds, SigprocError> {
+    let mut visited = vec![false; candidates.len()];
+    gain_detect_normalize_emit_chain_levels_with_visited_at5(candidates, head_index, &mut visited)
+}
+
+fn gain_detect_normalize_emit_chain_levels_with_visited_at5(
+    candidates: &mut [GainDetectEmitCandidate],
+    head_index: Option<usize>,
+    visited: &mut [bool],
 ) -> Result<GainDetectEmitLevelBounds, SigprocError> {
     let mut bounds = GainDetectEmitLevelBounds::new(0, 0);
     let Some(mut index) = head_index else {
@@ -2475,7 +2799,12 @@ pub fn gain_detect_normalize_emit_chain_levels_at5(
         });
     }
 
-    let mut visited = vec![false; candidates.len()];
+    check_storage(
+        "gain_detect_normalize_visited",
+        visited.len(),
+        candidates.len(),
+    )?;
+    visited[..candidates.len()].fill(false);
     let mut cumulative_level = 0;
     loop {
         if visited[index] {
@@ -2857,8 +3186,10 @@ fn gain_detect_prune_same_location_neighbour_at5(
 /// counters, and the call-1981 ch1 band12 pool-0 event shows removed
 /// [0,0,0]->[1,1,0] with node-loc and partner-loc word[1]s both subtracted from
 /// the totals. Objdump-verified at native 0x3bfbc..0x3c128.
-fn gain_detect_apply_over_seven_removal_at5(
-    pools: &mut GainDetectPrunePools,
+fn gain_detect_apply_over_seven_removal_slices_at5(
+    pools: &mut [&mut [GainDetectCandidateListRecord]; GAIN_DETECT_PRUNE_POOLS],
+    duplicates: &mut [i32; GAIN_DETECT_PRUNE_POOLS],
+    level_totals: &mut [i32; GAIN_DETECT_PEAK_BINS],
     removed_index: usize,
 ) -> Result<[i32; GAIN_DETECT_PRUNE_POOLS], GainDetectCandidateLoopError> {
     let mut increments = [0i32; GAIN_DETECT_PRUNE_POOLS];
@@ -2866,7 +3197,7 @@ fn gain_detect_apply_over_seven_removal_at5(
     // Partner first (native flags the partner before the node, decompile
     // 32384..32428), addressed relative to the node's pool 1.
     let (has_partner, partner_word8, partner_word9) = {
-        let node = &pools.pools[1][removed_index];
+        let node = &pools[1][removed_index];
         (node.words[7] != 0, node.words[8], node.words[9])
     };
     if has_partner {
@@ -2883,20 +3214,26 @@ fn gain_detect_apply_over_seven_removal_at5(
         }
         let partner_pool = partner_pool as usize;
         let partner_index = partner_word9 as usize;
-        if partner_index >= pools.pools[partner_pool].len() {
+        if partner_index >= pools[partner_pool].len() {
             return Err(SigprocError::IndexOutOfRange {
                 name: "gain_detect_prune_removal_partner",
                 value: partner_index,
-                max: pools.pools[partner_pool].len().saturating_sub(1),
+                max: pools[partner_pool].len().saturating_sub(1),
             }
             .into());
         }
-        gain_detect_prune_flag_removal_at5(pools, partner_pool, partner_index)?;
+        gain_detect_prune_flag_removal_at5(
+            pools,
+            duplicates,
+            level_totals,
+            partner_pool,
+            partner_index,
+        )?;
         increments[partner_pool] += 1;
     }
 
     // Then the node itself, in pool 1.
-    gain_detect_prune_flag_removal_at5(pools, 1, removed_index)?;
+    gain_detect_prune_flag_removal_at5(pools, duplicates, level_totals, 1, removed_index)?;
     increments[1] += 1;
 
     Ok(increments)
@@ -2907,21 +3244,23 @@ fn gain_detect_apply_over_seven_removal_at5(
 /// `-= word[1]` at the record's location bin. Shared across the partner and
 /// node arms of the removal branch (decompile 32388..32406 / 32429..32446).
 fn gain_detect_prune_flag_removal_at5(
-    pools: &mut GainDetectPrunePools,
+    pools: &mut [&mut [GainDetectCandidateListRecord]; GAIN_DETECT_PRUNE_POOLS],
+    duplicates: &mut [i32; GAIN_DETECT_PRUNE_POOLS],
+    level_totals: &mut [i32; GAIN_DETECT_PEAK_BINS],
     pool: usize,
     index: usize,
 ) -> Result<(), GainDetectCandidateLoopError> {
-    let neighbour = gain_detect_prune_same_location_neighbour_at5(pools.pools[pool], index)?;
+    let neighbour = gain_detect_prune_same_location_neighbour_at5(pools[pool], index)?;
     if neighbour {
-        pools.duplicates[pool] -= 1;
+        duplicates[pool] -= 1;
     }
-    let record = &mut pools.pools[pool][index];
+    let record = &mut pools[pool][index];
     let slot = checked_nonnegative_index(
         "gain_detect_prune_removal_location",
         record.words[0],
         GAIN_DETECT_PEAK_BINS - 1,
     )?;
-    pools.level_totals[slot] -= record.words[1];
+    level_totals[slot] -= record.words[1];
     record.words[5] = 1;
     Ok(())
 }
@@ -2992,4 +3331,111 @@ fn check_candidate_bound(name: &'static str, value: i32) -> Result<i32, SigprocE
         });
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    #[test]
+    fn lean_gain_core_matches_diagnostics_and_reuses_backing_storage() {
+        let band_window = [0.0f32; GAIN_DETECT_BAND_WINDOW_VALUES];
+        let spectrum = [0.0f32; GAIN_DETECT_HISTORY_PEAK_VALUES];
+        let envelope = [0.0f32; GAIN_DETECT_HISTORY_PEAK_VALUES];
+        let mut diagnostic_persistent = Vec::new();
+        let mut lean_persistent = Vec::new();
+        let mut diagnostic_output = vec![0u32; 2 * GC_SET_POINTS_OUTPUT_GROUP_STRIDE_WORDS];
+        let mut lean_output = diagnostic_output.clone();
+        let mut diagnostic_counts = vec![0i32; 2];
+        let mut lean_counts = diagnostic_counts.clone();
+
+        let diagnostic = gain_detect_band_at5(
+            &band_window,
+            &spectrum,
+            &envelope,
+            0,
+            GAIN_DETECT_PEAK_BINS,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            &mut diagnostic_persistent,
+            &mut diagnostic_output,
+            &mut diagnostic_counts,
+        )
+        .unwrap();
+
+        let mut scratch = GainDetectScratch::default();
+        let addresses = (
+            scratch.gc_calls.as_ptr(),
+            scratch.gc_records.as_ptr(),
+            scratch.pool0_records.as_ptr(),
+            scratch.pool2_records.as_ptr(),
+            scratch.next_pool_records.as_ptr(),
+            scratch.compact_candidates.as_ptr(),
+            scratch.compact_visited.as_ptr(),
+            scratch.compact_emitted.as_ptr(),
+        );
+        let lean = gain_detect_band_with_scratch_at5(
+            &band_window,
+            &spectrum,
+            &envelope,
+            0,
+            GAIN_DETECT_PEAK_BINS,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            &mut lean_persistent,
+            &mut lean_output,
+            &mut lean_counts,
+            &mut scratch,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(lean.compact_point_words, diagnostic.compact_point_words);
+        assert_eq!(lean.prune_blocked, diagnostic.prune_blocked);
+        assert_eq!(lean_output, diagnostic_output);
+        assert_eq!(lean_counts, diagnostic_counts);
+        assert_eq!(lean_persistent, diagnostic_persistent);
+        assert_eq!(
+            scratch.next_pool_records(&lean),
+            diagnostic.next_pool_records
+        );
+
+        let _ = gain_detect_band_with_scratch_at5(
+            &band_window,
+            &spectrum,
+            &envelope,
+            0,
+            GAIN_DETECT_PEAK_BINS,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            &mut lean_persistent,
+            &mut lean_output,
+            &mut lean_counts,
+            &mut scratch,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            addresses,
+            (
+                scratch.gc_calls.as_ptr(),
+                scratch.gc_records.as_ptr(),
+                scratch.pool0_records.as_ptr(),
+                scratch.pool2_records.as_ptr(),
+                scratch.next_pool_records.as_ptr(),
+                scratch.compact_candidates.as_ptr(),
+                scratch.compact_visited.as_ptr(),
+                scratch.compact_emitted.as_ptr(),
+            )
+        );
+    }
 }

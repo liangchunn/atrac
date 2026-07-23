@@ -20,14 +20,15 @@ use crate::dsp::sigproc::{
     GAIN_DETECT_BAND_WINDOW_PEAK_OFFSET, GAIN_DETECT_BAND_WINDOW_VALUES,
     GAIN_DETECT_HISTORY_PEAK_VALUES, GAIN_DETECT_PEAK_BINS, GainDetectBandOutcome,
     GainDetectBandStateWritebackFields, GainDetectCandidateListRecord,
-    GainDetectCandidateLoopError, gain_detect_band_at5, gain_detect_band_state_writeback_at5,
+    GainDetectCandidateLoopError, GainDetectLeanOutcome, GainDetectScratch, gain_detect_band_at5,
+    gain_detect_band_state_writeback_at5, gain_detect_band_with_scratch_at5,
     gain_detect_peak_bins_at5, gain_detect_primary_history_shift_at5,
-    gain_detect_secondary_history_shift_at5,
+    gain_detect_prune_markers_at5, gain_detect_secondary_history_shift_at5,
 };
 use crate::tables::at5::{
-    TLEV_THRED_AT5_ENTRIES, sc064_at5, sc128_at5, tlev_thred_064_at5, tlev_thred_096_at5,
+    TLEV_THRED_AT5_ENTRIES, sc064_at5_ref, sc128_at5_ref, tlev_thred_064_at5, tlev_thred_096_at5,
 };
-use crate::tables::at5::{ip064_at5, ip128_at5};
+use crate::tables::at5::{ip064_at5_ref, ip128_at5_ref};
 use crate::tables::at5::{rev_at5, wind0_at5, wind1_at5, wind2_at5, wind3_at5};
 
 pub const TIME2FREQ_BANDS_AT5: usize = 16;
@@ -142,10 +143,10 @@ pub fn time2freq_tonality_channel_at5(
         TONALITY_ACTIVE_LIMIT_DEFAULT
     };
 
-    let ip128 = ip128_at5();
-    let sc128 = sc128_at5();
-    let ip064 = ip064_at5();
-    let sc064 = sc064_at5();
+    let ip128 = ip128_at5_ref();
+    let sc128 = sc128_at5_ref();
+    let ip064 = ip064_at5_ref();
+    let sc064 = sc064_at5_ref();
 
     for band in 0..TIME2FREQ_BANDS_AT5 {
         if band < active_limit || bandwidth > TONALITY_WIDE_BAND_LIMIT {
@@ -172,8 +173,8 @@ pub fn time2freq_tonality_channel_at5(
                     stride,
                     count,
                     &mut magnitudes,
-                    &ip128,
-                    &sc128,
+                    ip128,
+                    sc128,
                 )?;
             } else {
                 dft_v_at5(
@@ -181,8 +182,8 @@ pub fn time2freq_tonality_channel_at5(
                     stride,
                     count,
                     &mut magnitudes,
-                    &ip064,
-                    &sc064,
+                    ip064,
+                    sc064,
                 )?;
             }
 
@@ -1651,6 +1652,126 @@ pub fn time2freq_channel_detect_at5(
     Ok((records, outcomes))
 }
 
+fn time2freq_channel_detect_lean_at5(
+    seeds: &mut [Time2FreqDetectorBandSeed],
+    band_limit: usize,
+    scratch: &mut GainDetectScratch,
+) -> Result<
+    (
+        Vec<[i32; TIME2FREQ_POINT_WORDS]>,
+        Vec<GainDetectBandOutcome>,
+    ),
+    Time2FreqError,
+> {
+    if seeds.len() < band_limit {
+        return Err(Time2FreqError::ChannelStateTooShort {
+            needed: band_limit,
+            actual: seeds.len(),
+        });
+    }
+    let mut records = vec![[0i32; TIME2FREQ_POINT_WORDS]; TIME2FREQ_BANDS_AT5.max(band_limit)];
+    let mut prune_blocked = [false; TIME2FREQ_BANDS_AT5];
+    for (band, record) in records.iter_mut().enumerate().take(band_limit) {
+        let seed = &mut seeds[band];
+        let outcome = gain_detect_band_with_scratch_at5(
+            &seed.band_window,
+            &seed.spectrum,
+            &seed.envelope,
+            seed.prev_max_slot,
+            seed.prev_peak_slot_plus_32,
+            seed.prev_level_a,
+            seed.prev_level_b,
+            seed.stored_peak_a,
+            seed.current_bin0_peak,
+            seed.carried_removed_count,
+            &mut seed.persistent_records,
+            &mut seed.output_records,
+            &mut seed.counts,
+            scratch,
+            false,
+        )?;
+        *record = outcome.compact_point_words;
+        prune_blocked[band] = outcome.prune_blocked;
+        time2freq_detector_seed_evolve_in_place_at5(seed, &outcome, scratch)?;
+    }
+    Ok((
+        records,
+        gain_detect_prune_markers_at5(band_limit, &prune_blocked),
+    ))
+}
+
+fn time2freq_detector_seed_evolve_in_place_at5(
+    seed: &mut Time2FreqDetectorBandSeed,
+    outcome: &GainDetectLeanOutcome,
+    scratch: &GainDetectScratch,
+) -> Result<(), Time2FreqError> {
+    if seed.spectrum.len() < GAIN_DETECT_HISTORY_PEAK_VALUES
+        || seed.envelope.len() < GAIN_DETECT_HISTORY_PEAK_VALUES
+    {
+        return Err(Time2FreqError::ChannelStateTooShort {
+            needed: GAIN_DETECT_HISTORY_PEAK_VALUES,
+            actual: seed.spectrum.len().min(seed.envelope.len()),
+        });
+    }
+
+    let next_stored_peak_a = seed.spectrum[GAIN_DETECT_PEAK_BINS - 1];
+    seed.spectrum
+        .copy_within(GAIN_DETECT_PEAK_BINS..GAIN_DETECT_HISTORY_PEAK_VALUES, 0);
+    for (destination, peak) in seed.spectrum[GAIN_DETECT_PEAK_BINS..GAIN_DETECT_HISTORY_PEAK_VALUES]
+        .iter_mut()
+        .zip(outcome.front.peaks.bins())
+    {
+        *destination = *peak;
+    }
+
+    seed.envelope
+        .copy_within(GAIN_DETECT_PEAK_BINS..2 * GAIN_DETECT_PEAK_BINS - 1, 0);
+    for (destination, weight) in seed.envelope
+        [GAIN_DETECT_PEAK_BINS - 1..GAIN_DETECT_HISTORY_PEAK_VALUES - 1]
+        .iter_mut()
+        .zip(outcome.front.weights.iter())
+    {
+        *destination = weight.weight();
+    }
+    seed.envelope[GAIN_DETECT_HISTORY_PEAK_VALUES - 1] = 0.0;
+
+    let writeback = gain_detect_band_state_writeback_at5(GainDetectBandStateWritebackFields {
+        prev_peak_slot_plus_32: seed.prev_peak_slot_plus_32,
+        current_peak_slot: outcome.front.peaks.max_index(),
+        previous_level_bits: seed.prev_level_b.to_bits(),
+        current_peak_value_bits: outcome.front.peaks.max_value().to_bits(),
+        gain_records_total: 0,
+        gain_records_removed: 0,
+        list_count_primary: 0,
+        list_count_secondary: 0,
+        active_chain_count: 0,
+        stereo_energy_a_bits: 0,
+        stereo_energy_b_bits: 0,
+    })
+    .map_err(Time2FreqError::from)?;
+    seed.prev_max_slot = writeback.prev_max_slot();
+    seed.prev_peak_slot_plus_32 = writeback.prev_peak_slot() + GAIN_DETECT_PEAK_BINS;
+    seed.prev_level_a = f32::from_bits(writeback.prev_level_a_bits());
+    seed.prev_level_b = f32::from_bits(writeback.prev_level_b_bits());
+    seed.stored_peak_a = next_stored_peak_a;
+    seed.current_bin0_peak = outcome.front.peaks.bins()[0];
+    seed.carried_removed_count = outcome.prune_pool2_removed_count;
+
+    let group1_count = seed.counts.get(1).copied().unwrap_or(0);
+    seed.counts.clear();
+    seed.counts.extend_from_slice(&[group1_count, 0]);
+
+    let slab_words = GC_SET_POINTS_OUTPUT_GROUPS * GC_SET_POINTS_OUTPUT_GROUP_STRIDE_WORDS;
+    seed.output_records
+        .copy_within(GC_SET_POINTS_OUTPUT_GROUP_STRIDE_WORDS..slab_words, 0);
+    seed.output_records[GC_SET_POINTS_OUTPUT_GROUP_STRIDE_WORDS..slab_words].fill(0);
+
+    seed.persistent_records.clear();
+    seed.persistent_records
+        .extend_from_slice(scratch.next_pool_records(outcome));
+    Ok(())
+}
+
 /// Evolve one per-band detector seed across a core call, per the native
 /// `detect_gainc_data_new_at5` writeback (decompile `32494..32530`). The
 /// `post_seed` is the seed state *after* `time2freq_channel_detect_at5` ran it
@@ -1916,7 +2037,17 @@ pub fn time2freq_at5(
     channels: &mut [Time2FreqChannelState],
     params: &Time2FreqParams,
 ) -> Result<Vec<Time2FreqChannelOutput>, Time2FreqError> {
-    time2freq_at5_impl(channels, params, None)
+    time2freq_at5_impl(channels, params, None, None)
+}
+
+/// Encoder-facing detector path that evolves seeds in place and omits the
+/// allocation-heavy per-band diagnostic outcomes.
+pub(crate) fn time2freq_encode_at5(
+    channels: &mut [Time2FreqChannelState],
+    params: &Time2FreqParams,
+    scratch: &mut GainDetectScratch,
+) -> Result<Vec<Time2FreqChannelOutput>, Time2FreqError> {
+    time2freq_at5_impl(channels, params, None, Some(scratch))
 }
 
 /// Like [`time2freq_at5`] but with the mode_cc==0 (64/48 kbps) `set_gainc_at5`
@@ -1935,7 +2066,7 @@ pub fn time2freq_at5_with_set_gainc(
     params: &Time2FreqParams,
     set_gainc: &mut Time2FreqSetGaincState,
 ) -> Result<Vec<Time2FreqChannelOutput>, Time2FreqError> {
-    time2freq_at5_impl(channels, params, Some(set_gainc))
+    time2freq_at5_impl(channels, params, Some(set_gainc), None)
 }
 
 /// Seed a fresh current gain-record plane from the tonality pre-pass, matching
@@ -2042,6 +2173,7 @@ fn time2freq_at5_impl(
     channels: &mut [Time2FreqChannelState],
     params: &Time2FreqParams,
     mut set_gainc: Option<&mut Time2FreqSetGaincState>,
+    mut gain_scratch: Option<&mut GainDetectScratch>,
 ) -> Result<Vec<Time2FreqChannelOutput>, Time2FreqError> {
     let cc = params.channel_count;
     if channels.len() < cc {
@@ -2174,10 +2306,22 @@ fn time2freq_at5_impl(
                     tonality_channels[channel_index].flags[band];
             }
             if params.detector_gate_open {
-                let (records, outcomes) =
-                    time2freq_channel_detect_at5(&mut channel.detector_seeds, params.band_limit)?;
-                current_records_per_channel.push(records);
-                detector_outcomes_per_channel.push(outcomes);
+                if let Some(scratch) = gain_scratch.as_deref_mut() {
+                    let (records, prune_markers) = time2freq_channel_detect_lean_at5(
+                        &mut channel.detector_seeds,
+                        params.band_limit,
+                        scratch,
+                    )?;
+                    current_records_per_channel.push(records);
+                    detector_outcomes_per_channel.push(prune_markers);
+                } else {
+                    let (records, outcomes) = time2freq_channel_detect_at5(
+                        &mut channel.detector_seeds,
+                        params.band_limit,
+                    )?;
+                    current_records_per_channel.push(records);
+                    detector_outcomes_per_channel.push(outcomes);
+                }
             } else {
                 current_records_per_channel.push(vec![
                     [0i32; TIME2FREQ_POINT_WORDS];

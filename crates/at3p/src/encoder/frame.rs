@@ -49,13 +49,13 @@ use crate::encoder::cfg_bridge::build_cfg_window;
 use crate::encoder::coding_bridge::{
     CodingBridgeError, GainRollState, InitGainHeaderWords, ZerothBridgeChannelAux,
     ZerothBridgeFrameAux, assemble_calc_frame_entry_with_init_for_params_at5,
-    assemble_gain_a_records, init_roll_step, zeroth_band_activity_from_frontend,
+    assemble_gain_a_records_with_band_count, init_roll_step, zeroth_band_activity_from_frontend,
     zeroth_tone_activity_from_frontend, zeroth_tone_words_from_frontend,
 };
 use crate::encoder::coding_params::CodingParams;
 use crate::encoder::frontend::{
-    FRONTEND_CHANNEL_COUNT, FrontendCoreCallReport, FrontendError, FrontendState,
-    frontend_encode_call_at5,
+    FRONTEND_CHANNEL_COUNT, FrontendCoreCallReport, FrontendError, FrontendScratch, FrontendState,
+    frontend_encode_call_with_scratch_at5,
 };
 use crate::encoder::packing_prep::{
     GHA_HAS_PREVIOUS, GhaPackingPrep, PackingPrepError, gha_packing_prep_from_frontend,
@@ -534,6 +534,8 @@ pub struct FrameDriver {
     next_core_call: u32,
     /// Reused bounded working storage for the coding passes.
     coding_scratch: Box<CodingScratch>,
+    /// Reused bounded detector storage for the lean frontend path.
+    frontend_scratch: Box<FrontendScratch>,
 }
 
 /// The first output-bearing core call (native delay/priming: calls 0..6 produce
@@ -603,6 +605,7 @@ impl FrameDriver {
             params,
             next_core_call: 0,
             coding_scratch: Box::new(CodingScratch::new(channel_count)),
+            frontend_scratch: Box::new(FrontendScratch::default()),
         }
     }
 
@@ -637,7 +640,12 @@ impl FrameDriver {
     /// here.
     pub fn step_channels(&mut self, inputs: &[&[f32]]) -> Result<Option<EncodedFrame>, FrameError> {
         let core_call = self.next_core_call;
-        let report = frontend_encode_call_at5(&mut self.frontend, inputs, SYNTHETIC_ARENA_HEADER)?;
+        let report = frontend_encode_call_with_scratch_at5(
+            &mut self.frontend,
+            inputs,
+            SYNTHETIC_ARENA_HEADER,
+            &mut self.frontend_scratch,
+        )?;
         // The init roll carries per-call; run it for EVERY call (priming too), so
         // the gain double-buffer is correct at every output call.
         let init_aux = init_roll_step(&mut self.roll, &self.frontend, &report)?;
@@ -677,7 +685,12 @@ impl FrameDriver {
         inputs: [&[f32]; FRONTEND_CHANNEL_COUNT],
     ) -> Result<Option<u32>, FrameError> {
         let core_call = self.next_core_call;
-        let report = frontend_encode_call_at5(&mut self.frontend, &inputs, SYNTHETIC_ARENA_HEADER)?;
+        let report = frontend_encode_call_with_scratch_at5(
+            &mut self.frontend,
+            &inputs,
+            SYNTHETIC_ARENA_HEADER,
+            &mut self.frontend_scratch,
+        )?;
         let init_aux = init_roll_step(&mut self.roll, &self.frontend, &report)?;
         self.next_core_call += 1;
 
@@ -824,7 +837,11 @@ impl FrameDriver {
         let channel_count = self.params.channels as usize;
         let mut objects = Vec::with_capacity(channel_count);
         for ch in 0..channel_count {
-            let gain_a_records = assemble_gain_a_records(ch, &channels_t2f[ch])?;
+            let gain_a_records = assemble_gain_a_records_with_band_count(
+                ch,
+                &channels_t2f[ch],
+                effective_band_count as usize,
+            )?;
             objects.push(ObjectInputs {
                 init_header: init_headers[ch],
                 gain_a_records,

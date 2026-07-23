@@ -31,7 +31,9 @@ use crate::dsp::set_gainc::{
     SET_GAINC_BANDS, SET_GAINC_HISTORY_A_FLOATS, SET_GAINC_HISTORY_B_FLOATS,
     SET_GAINC_SCRATCH_FLOATS, SetGaincPlane, SetGaincRow,
 };
-use crate::dsp::sigproc::{GAIN_DETECT_BAND_WINDOW_VALUES, GAIN_DETECT_PEAK_BINS};
+use crate::dsp::sigproc::{
+    GAIN_DETECT_BAND_WINDOW_VALUES, GAIN_DETECT_PEAK_BINS, GainDetectScratch,
+};
 use crate::dsp::sigproc_shell::{
     SIGPROC_BAND_COUNT, SIGPROC_BAND_SLOT_FLOATS, SIGPROC_BAND_SLOTS, SIGPROC_CHANNEL_RING_SLOTS,
     SIGPROC_DETECTOR_ARENA_WORDS, SIGPROC_PQF_DELAY_FLOATS, SigprocChannelPointers,
@@ -42,7 +44,7 @@ use crate::dsp::time2freq::{
     TIME2FREQ_POINT_WORDS, Time2FreqChannelOutput, Time2FreqChannelState,
     Time2FreqDetectorBandSeed, Time2FreqError, Time2FreqParams, Time2FreqSetGaincChannel,
     Time2FreqSetGaincState, time2freq_at5, time2freq_at5_with_set_gainc,
-    time2freq_detector_seed_evolve_at5,
+    time2freq_detector_seed_evolve_at5, time2freq_encode_at5,
 };
 use crate::gha::extract::{
     EXTRACT_GHA_ROW_WORD_COUNT_AT5, GhaExtractError, GhaExtractInput, GhaExtractOutput,
@@ -51,6 +53,11 @@ use crate::gha::extract::{
 use crate::gha::synthesis::GhaWaveRecord;
 
 pub const FRONTEND_FRAME_SAMPLES: usize = 2048;
+
+#[derive(Default)]
+pub(crate) struct FrontendScratch {
+    gain_detect: GainDetectScratch,
+}
 /// First rolled slot of the 384-sample band window `extract_ghwave_at5` reads.
 /// The slot ring rolls newest→slot 8, oldest→slot 0; `extract_ghwave_at5`
 /// reads slots 4..6 (empirically: reproduces the native extract-output timing
@@ -699,7 +706,7 @@ pub fn frontend_core_call_at5(
     pcm_inputs: &[&[f32]],
     record_arena_header: i32,
 ) -> Result<FrontendCoreCallReport, FrontendError> {
-    frontend_core_call_with_capture_at5(state, pcm_inputs, record_arena_header, true)
+    frontend_core_call_with_capture_at5(state, pcm_inputs, record_arena_header, true, None)
 }
 
 /// Encoder-facing frontend call. It advances exactly the same rolling state as
@@ -709,7 +716,29 @@ pub(crate) fn frontend_encode_call_at5(
     pcm_inputs: &[&[f32]],
     record_arena_header: i32,
 ) -> Result<FrontendCoreCallReport, FrontendError> {
-    frontend_core_call_with_capture_at5(state, pcm_inputs, record_arena_header, false)
+    let mut scratch = FrontendScratch::default();
+    frontend_core_call_with_capture_at5(
+        state,
+        pcm_inputs,
+        record_arena_header,
+        false,
+        Some(&mut scratch),
+    )
+}
+
+pub(crate) fn frontend_encode_call_with_scratch_at5(
+    state: &mut FrontendState,
+    pcm_inputs: &[&[f32]],
+    record_arena_header: i32,
+    scratch: &mut FrontendScratch,
+) -> Result<FrontendCoreCallReport, FrontendError> {
+    frontend_core_call_with_capture_at5(
+        state,
+        pcm_inputs,
+        record_arena_header,
+        false,
+        Some(scratch),
+    )
 }
 
 fn frontend_core_call_with_capture_at5(
@@ -717,6 +746,7 @@ fn frontend_core_call_with_capture_at5(
     pcm_inputs: &[&[f32]],
     record_arena_header: i32,
     capture_extract_diagnostics: bool,
+    mut scratch: Option<&mut FrontendScratch>,
 ) -> Result<FrontendCoreCallReport, FrontendError> {
     // Fatal-per-run: once a prior call tore the rolling state, refuse to compute
     // on it. The run is dead; report the original poisoning point cheaply.
@@ -747,6 +777,7 @@ fn frontend_core_call_with_capture_at5(
         pcm_inputs,
         record_arena_header,
         capture_extract_diagnostics,
+        scratch.as_deref_mut(),
     ) {
         Ok(report) => Ok(report),
         Err(error) => {
@@ -776,6 +807,7 @@ fn frontend_core_call_body_at5(
     pcm_inputs: &[&[f32]],
     record_arena_header: i32,
     capture_extract_diagnostics: bool,
+    mut scratch: Option<&mut FrontendScratch>,
 ) -> Result<FrontendCoreCallReport, FrontendError> {
     // Prologue ring rotation, in lockstep with the native pointer-ring rotation
     // `sigproc_frame_at5` performs on `SigprocChannelPointers.ring`.
@@ -883,7 +915,12 @@ fn frontend_core_call_body_at5(
     let time2freq_band_count = sigproc_report.writeback.band_count as usize;
     let mut time2freq = None;
     if sigproc_report.gha_should_run {
-        time2freq = Some(run_time2freq(state, time2freq_band_count)?);
+        time2freq = Some(run_time2freq(
+            state,
+            time2freq_band_count,
+            capture_extract_diagnostics,
+            scratch.as_deref_mut(),
+        )?);
     }
 
     Ok(FrontendCoreCallReport {
@@ -903,6 +940,8 @@ fn frontend_core_call_body_at5(
 fn run_time2freq(
     state: &mut FrontendState,
     active_band_count: usize,
+    capture_diagnostics: bool,
+    mut scratch: Option<&mut FrontendScratch>,
 ) -> Result<Vec<Time2FreqChannelOutput>, FrontendError> {
     let channel_count = state.channel_count;
     // `band_count` bounds the time2freq PROCESSING extent + the seed/record
@@ -948,7 +987,18 @@ fn run_time2freq(
                 prepass_disabled: state.sigproc.header_flag_word & 0x10 != 0,
             });
         }
-        outputs = time2freq_at5(&mut channel_states, &params)?;
+        outputs = if capture_diagnostics {
+            time2freq_at5(&mut channel_states, &params)?
+        } else {
+            time2freq_encode_at5(
+                &mut channel_states,
+                &params,
+                &mut scratch
+                    .as_deref_mut()
+                    .expect("encoder call supplies frontend scratch")
+                    .gain_detect,
+            )?
+        };
     } else {
         // mode_cc == 0 (64/48): the descending `set_gainc_at5` dispatch over the
         // shared detector arena + per-channel persistent history / prev+cur
@@ -1027,6 +1077,14 @@ fn run_time2freq(
     if mode_cc {
         let persistent_bands = state.band_count;
         for channel in 0..channel_count {
+            if !capture_diagnostics {
+                state.detector_seeds[channel] =
+                    std::mem::take(&mut channel_states[channel].detector_seeds);
+                for band in 0..band_count {
+                    state.previous_records[channel][band] = outputs[channel].final_records[band];
+                }
+                continue;
+            }
             let mut next_seeds = Vec::with_capacity(persistent_bands);
             for band in 0..persistent_bands {
                 if band < band_count {
@@ -1109,6 +1167,42 @@ fn run_extract(
 #[cfg(test)]
 mod lean_path_tests {
     use super::*;
+    use crate::encoder::coding_params::CodingParams;
+    use crate::encoder::profile::{ATRAC3PLUS_128, ATRAC3PLUS_MONO_64};
+
+    fn assert_time2freq_parity(full: &[Time2FreqChannelOutput], lean: &[Time2FreqChannelOutput]) {
+        for (full_channel, lean_channel) in full.iter().zip(lean) {
+            assert_eq!(
+                full_channel
+                    .spectra
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                lean_channel
+                    .spectra
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                full_channel
+                    .delayed_out
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                lean_channel
+                    .delayed_out
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(full_channel.final_records, lean_channel.final_records);
+            assert_eq!(full_channel.tonality, lean_channel.tonality);
+            assert_eq!(full_channel.band_outcomes, lean_channel.band_outcomes);
+            assert!(!full_channel.detector_outcomes.is_empty());
+            assert!(lean_channel.detector_outcomes.is_empty());
+        }
+    }
 
     #[test]
     fn lean_encoder_call_matches_full_state_without_retaining_diagnostics() {
@@ -1126,10 +1220,78 @@ mod lean_path_tests {
         assert!(lean.extract_input_band_windows.is_none());
         assert!(lean.extract_output.is_none());
         assert!(lean.gha_ran);
-        assert_eq!(
-            format!("{:?}", full.time2freq),
-            format!("{:?}", lean.time2freq)
+        assert_time2freq_parity(
+            full.time2freq.as_ref().unwrap(),
+            lean.time2freq.as_ref().unwrap(),
         );
         assert_eq!(format!("{full_state:?}"), format!("{lean_state:?}"));
+
+        let mut left = [0.0f32; FRONTEND_FRAME_SAMPLES];
+        let mut right = [0.0f32; FRONTEND_FRAME_SAMPLES];
+        for call in 1..100u32 {
+            for (index, sample) in left.iter_mut().enumerate() {
+                *sample = ((index as i32 * 31 + call as i32 * 17) % 257 - 128) as f32 / 128.0;
+            }
+            for (index, sample) in right.iter_mut().enumerate() {
+                *sample = ((index as i32 * 19 + call as i32 * 29) % 251 - 125) as f32 / 128.0;
+            }
+            let inputs = [&left[..], &right[..]];
+            let full = frontend_core_call_at5(&mut full_state, &inputs, 0).unwrap();
+            let lean = frontend_encode_call_at5(&mut lean_state, &inputs, 0).unwrap();
+            assert_time2freq_parity(
+                full.time2freq.as_ref().unwrap(),
+                lean.time2freq.as_ref().unwrap(),
+            );
+            assert_eq!(format!("{full_state:?}"), format!("{lean_state:?}"));
+        }
+    }
+
+    #[test]
+    fn lean_encoder_call_matches_full_state_for_parity_profiles() {
+        for (profile, sample_frames) in [(ATRAC3PLUS_MONO_64, 6144usize), (ATRAC3PLUS_128, 6145)] {
+            let params = CodingParams::for_profile(&profile);
+            let channel_count = profile.channels() as usize;
+            let mut full_state =
+                FrontendState::new_zeroed_for_selector(channel_count, params.selector);
+            full_state.sigproc_mode = params.mode_a;
+            full_state.band_limit = params.band_index as i32;
+            full_state.gha_enabled = params.gha_enabled;
+            full_state.mode_cc = params.mode_cc;
+            let mut lean_state = full_state.clone();
+            let mut scratch = FrontendScratch::default();
+
+            for call in 0..16usize {
+                let mut channels = vec![vec![0.0f32; FRONTEND_FRAME_SAMPLES]; channel_count];
+                let source_start = call * FRONTEND_FRAME_SAMPLES;
+                for (channel, samples) in channels.iter_mut().enumerate() {
+                    for (index, sample) in samples.iter_mut().enumerate() {
+                        let frame = source_start + index;
+                        if frame < sample_frames {
+                            *sample = ((frame as i32 * 43 + channel as i32 * 997) % 50_003 - 25_001)
+                                as f32;
+                        }
+                    }
+                }
+                let inputs: Vec<&[f32]> = channels.iter().map(Vec::as_slice).collect();
+                let full = frontend_core_call_at5(&mut full_state, &inputs, 0).unwrap();
+                let lean = frontend_encode_call_with_scratch_at5(
+                    &mut lean_state,
+                    &inputs,
+                    0,
+                    &mut scratch,
+                )
+                .unwrap();
+                assert_time2freq_parity(
+                    full.time2freq.as_ref().unwrap(),
+                    lean.time2freq.as_ref().unwrap(),
+                );
+                assert_eq!(
+                    format!("{full_state:?}"),
+                    format!("{lean_state:?}"),
+                    "{} kbps call {call}",
+                    profile.bitrate_kbps(),
+                );
+            }
+        }
     }
 }

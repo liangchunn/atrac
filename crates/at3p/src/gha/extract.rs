@@ -929,14 +929,14 @@ pub fn extract_ghwave_band_peak_scan_at5(
         });
     }
     let mut bins = [0.0f32; 129];
-    let ip_table = crate::tables::at5::ip256_at5();
-    let sc_table = crate::tables::at5::sc256_at5();
+    let ip_table = crate::tables::at5::ip256_at5_ref();
+    let sc_table = crate::tables::at5::sc256_at5_ref();
     crate::dsp::fft::dft_x_at5(
         &samples[..COMPONENT_SAMPLES],
         COMPONENT_SAMPLES,
         &mut bins,
-        &ip_table,
-        &sc_table,
+        ip_table,
+        sc_table,
     )
     .map_err(|_| GhaExtractError::InputTooShort {
         needed: COMPONENT_SAMPLES,

@@ -204,43 +204,43 @@ pub fn rev_at5() -> [u8; REV_AT5_ENTRIES] {
 }
 
 pub fn ip016_at5() -> [u32; IP016_AT5_ENTRIES] {
-    u32_table(&G_A_IP016_AT5).expect("generated g_a_ip016_at5 length should be 2 u32s")
+    *ip016_at5_ref()
 }
 
 pub fn ip032_at5() -> [u32; IP032_AT5_ENTRIES] {
-    u32_table(&G_A_IP032_AT5).expect("generated g_a_ip032_at5 length should be 2 u32s")
+    *ip032_at5_ref()
 }
 
 pub fn ip064_at5() -> [u32; IP064_AT5_ENTRIES] {
-    u32_table(&G_A_IP064_AT5).expect("generated g_a_ip064_at5 length should be 4 u32s")
+    *ip064_at5_ref()
 }
 
 pub fn ip128_at5() -> [u32; IP128_AT5_ENTRIES] {
-    u32_table(&G_A_IP128_AT5).expect("generated g_a_ip128_at5 length should be 4 u32s")
+    *ip128_at5_ref()
 }
 
 pub fn ip256_at5() -> [u32; IP256_AT5_ENTRIES] {
-    u32_table(&G_A_IP256_AT5).expect("generated g_a_ip256_at5 length should be 8 u32s")
+    *ip256_at5_ref()
 }
 
 pub fn sc016_at5() -> [f32; SC016_AT5_ENTRIES] {
-    f32_table(&G_A_SC016_AT5).expect("generated g_a_sc016_at5 length should be 8 f32s")
+    *sc016_at5_ref()
 }
 
 pub fn sc032_at5() -> [f32; SC032_AT5_ENTRIES] {
-    f32_table(&G_A_SC032_AT5).expect("generated g_a_sc032_at5 length should be 16 f32s")
+    *sc032_at5_ref()
 }
 
 pub fn sc064_at5() -> [f32; SC064_AT5_ENTRIES] {
-    f32_table(&G_A_SC064_AT5).expect("generated g_a_sc064_at5 length should be 32 f32s")
+    *sc064_at5_ref()
 }
 
 pub fn sc128_at5() -> [f32; SC128_AT5_ENTRIES] {
-    f32_table(&G_A_SC128_AT5).expect("generated g_a_sc128_at5 length should be 64 f32s")
+    *sc128_at5_ref()
 }
 
 pub fn sc256_at5() -> [f32; SC256_AT5_ENTRIES] {
-    f32_table(&G_A_SC256_AT5).expect("generated g_a_sc256_at5 length should be 128 f32s")
+    *sc256_at5_ref()
 }
 
 pub fn sc_at5() -> [f32; SC_AT5_ENTRIES] {
@@ -487,6 +487,76 @@ fn build_win_at5() -> [f32; WIN_AT5_ENTRIES] {
 
 static SIN_AT5: LazyLock<[f32; SIN_AT5_ENTRIES]> = LazyLock::new(build_sin_at5);
 static WIN_AT5: LazyLock<[f32; WIN_AT5_ENTRIES]> = LazyLock::new(build_win_at5);
+static IP016_AT5: LazyLock<[u32; IP016_AT5_ENTRIES]> = LazyLock::new(|| {
+    u32_table(&G_A_IP016_AT5).expect("generated g_a_ip016_at5 length should be 2 u32s")
+});
+static IP032_AT5: LazyLock<[u32; IP032_AT5_ENTRIES]> = LazyLock::new(|| {
+    u32_table(&G_A_IP032_AT5).expect("generated g_a_ip032_at5 length should be 2 u32s")
+});
+static IP064_AT5: LazyLock<[u32; IP064_AT5_ENTRIES]> = LazyLock::new(|| {
+    u32_table(&G_A_IP064_AT5).expect("generated g_a_ip064_at5 length should be 4 u32s")
+});
+static IP128_AT5: LazyLock<[u32; IP128_AT5_ENTRIES]> = LazyLock::new(|| {
+    u32_table(&G_A_IP128_AT5).expect("generated g_a_ip128_at5 length should be 4 u32s")
+});
+static IP256_AT5: LazyLock<[u32; IP256_AT5_ENTRIES]> = LazyLock::new(|| {
+    u32_table(&G_A_IP256_AT5).expect("generated g_a_ip256_at5 length should be 8 u32s")
+});
+static SC016_AT5: LazyLock<[f32; SC016_AT5_ENTRIES]> = LazyLock::new(|| {
+    f32_table(&G_A_SC016_AT5).expect("generated g_a_sc016_at5 length should be 8 f32s")
+});
+static SC032_AT5: LazyLock<[f32; SC032_AT5_ENTRIES]> = LazyLock::new(|| {
+    f32_table(&G_A_SC032_AT5).expect("generated g_a_sc032_at5 length should be 16 f32s")
+});
+static SC064_AT5: LazyLock<[f32; SC064_AT5_ENTRIES]> = LazyLock::new(|| {
+    f32_table(&G_A_SC064_AT5).expect("generated g_a_sc064_at5 length should be 32 f32s")
+});
+static SC128_AT5: LazyLock<[f32; SC128_AT5_ENTRIES]> = LazyLock::new(|| {
+    f32_table(&G_A_SC128_AT5).expect("generated g_a_sc128_at5 length should be 64 f32s")
+});
+static SC256_AT5: LazyLock<[f32; SC256_AT5_ENTRIES]> = LazyLock::new(|| {
+    f32_table(&G_A_SC256_AT5).expect("generated g_a_sc256_at5 length should be 128 f32s")
+});
+
+pub(crate) fn ip016_at5_ref() -> &'static [u32; IP016_AT5_ENTRIES] {
+    &IP016_AT5
+}
+
+pub(crate) fn ip032_at5_ref() -> &'static [u32; IP032_AT5_ENTRIES] {
+    &IP032_AT5
+}
+
+pub(crate) fn ip064_at5_ref() -> &'static [u32; IP064_AT5_ENTRIES] {
+    &IP064_AT5
+}
+
+pub(crate) fn ip128_at5_ref() -> &'static [u32; IP128_AT5_ENTRIES] {
+    &IP128_AT5
+}
+
+pub(crate) fn ip256_at5_ref() -> &'static [u32; IP256_AT5_ENTRIES] {
+    &IP256_AT5
+}
+
+pub(crate) fn sc016_at5_ref() -> &'static [f32; SC016_AT5_ENTRIES] {
+    &SC016_AT5
+}
+
+pub(crate) fn sc032_at5_ref() -> &'static [f32; SC032_AT5_ENTRIES] {
+    &SC032_AT5
+}
+
+pub(crate) fn sc064_at5_ref() -> &'static [f32; SC064_AT5_ENTRIES] {
+    &SC064_AT5
+}
+
+pub(crate) fn sc128_at5_ref() -> &'static [f32; SC128_AT5_ENTRIES] {
+    &SC128_AT5
+}
+
+pub(crate) fn sc256_at5_ref() -> &'static [f32; SC256_AT5_ENTRIES] {
+    &SC256_AT5
+}
 
 /// Compatibility accessor for callers that own the generated table.
 pub fn sin_at5() -> [f32; SIN_AT5_ENTRIES] {
@@ -535,5 +605,56 @@ mod generated_table_tests {
         for (cached, generated) in window.iter().zip(build_win_at5()) {
             assert_eq!(cached.to_bits(), generated.to_bits());
         }
+    }
+
+    #[test]
+    fn lazy_fft_tables_preserve_generated_bits_and_identity() {
+        macro_rules! check_ip {
+            ($borrowed:expr, $owned:expr, $raw:expr, $len:expr) => {{
+                let borrowed = $borrowed;
+                assert!(std::ptr::eq(borrowed, $borrowed));
+                assert_eq!(*borrowed, $owned);
+                assert_eq!(*borrowed, u32_table::<$len>($raw).unwrap());
+            }};
+        }
+        macro_rules! check_sc {
+            ($borrowed:expr, $owned:expr, $raw:expr, $len:expr) => {{
+                let borrowed = $borrowed;
+                assert!(std::ptr::eq(borrowed, $borrowed));
+                let owned = $owned;
+                let generated = f32_table::<$len>($raw).unwrap();
+                assert_eq!(
+                    borrowed
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    owned
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    borrowed
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    generated
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }};
+        }
+
+        check_ip!(ip016_at5_ref(), ip016_at5(), &G_A_IP016_AT5, 2);
+        check_ip!(ip032_at5_ref(), ip032_at5(), &G_A_IP032_AT5, 2);
+        check_ip!(ip064_at5_ref(), ip064_at5(), &G_A_IP064_AT5, 4);
+        check_ip!(ip128_at5_ref(), ip128_at5(), &G_A_IP128_AT5, 4);
+        check_ip!(ip256_at5_ref(), ip256_at5(), &G_A_IP256_AT5, 8);
+        check_sc!(sc016_at5_ref(), sc016_at5(), &G_A_SC016_AT5, 8);
+        check_sc!(sc032_at5_ref(), sc032_at5(), &G_A_SC032_AT5, 16);
+        check_sc!(sc064_at5_ref(), sc064_at5(), &G_A_SC064_AT5, 32);
+        check_sc!(sc128_at5_ref(), sc128_at5(), &G_A_SC128_AT5, 64);
+        check_sc!(sc256_at5_ref(), sc256_at5(), &G_A_SC256_AT5, 128);
     }
 }

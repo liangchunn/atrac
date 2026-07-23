@@ -237,9 +237,23 @@ pub fn rdftv_at5(
     }
 
     let data = &mut data[..count];
-    rdftv_permute(data, &ip_table[..ip_needed], count);
-    rdftv_kernel(data, &sc_table[..sc_needed], count);
+    let ip_table = &ip_table[..ip_needed];
+    let sc_table = &sc_table[..sc_needed];
+    match count {
+        16 => rdftv_fixed_at5::<16>(data.try_into().unwrap(), ip_table, sc_table),
+        32 => rdftv_fixed_at5::<32>(data.try_into().unwrap(), ip_table, sc_table),
+        64 => rdftv_fixed_at5::<64>(data.try_into().unwrap(), ip_table, sc_table),
+        128 => rdftv_fixed_at5::<128>(data.try_into().unwrap(), ip_table, sc_table),
+        256 => rdftv_fixed_at5::<256>(data.try_into().unwrap(), ip_table, sc_table),
+        _ => unreachable!("rdftv_ip_entries accepted an unsupported count"),
+    }
     Ok(())
+}
+
+#[inline]
+fn rdftv_fixed_at5<const N: usize>(data: &mut [f32; N], ip_table: &[u32], sc_table: &[f32]) {
+    rdftv_permute(data, ip_table, N);
+    rdftv_kernel(data, sc_table, N);
 }
 
 pub fn dft_v_at5(
@@ -269,22 +283,54 @@ pub fn dft_v_at5(
             actual: output.len(),
         });
     }
-
-    let mut data = [0.0f32; 256];
-    for index in 0..count {
-        data[index] = input[index * stride];
+    let ip_needed = rdftv_ip_entries(count)?;
+    if ip_table.len() < ip_needed {
+        return Err(FftError::PermutationTableTooShort {
+            needed: ip_needed,
+            actual: ip_table.len(),
+        });
+    }
+    let sc_needed = count / 2;
+    if sc_table.len() < sc_needed {
+        return Err(FftError::TableTooShort {
+            needed: sc_needed,
+            actual: sc_table.len(),
+        });
     }
 
-    rdftv_at5(&mut data[..count], ip_table, sc_table, count)?;
+    match count {
+        16 => dft_v_fixed_at5::<16>(input, stride, output, ip_table, sc_table),
+        32 => dft_v_fixed_at5::<32>(input, stride, output, ip_table, sc_table),
+        64 => dft_v_fixed_at5::<64>(input, stride, output, ip_table, sc_table),
+        128 => dft_v_fixed_at5::<128>(input, stride, output, ip_table, sc_table),
+        256 => dft_v_fixed_at5::<256>(input, stride, output, ip_table, sc_table),
+        _ => unreachable!("shape validation accepted an unsupported DFT count"),
+    }
+}
+
+#[inline]
+fn dft_v_fixed_at5<const N: usize>(
+    input: &[f32],
+    stride: usize,
+    output: &mut [f32],
+    ip_table: &[u32],
+    sc_table: &[f32],
+) -> Result<(), FftError> {
+    let mut data = [0.0f32; N];
+    for (index, value) in data.iter_mut().enumerate() {
+        *value = input[index * stride];
+    }
+
+    rdftv_fixed_at5(&mut data, ip_table, sc_table);
     let nyquist = data[1];
     data[1] = 0.0;
 
-    for bin in 0..count / 2 {
+    for bin in 0..N / 2 {
         let real = data[bin * 2];
         let imag = data[bin * 2 + 1];
         output[bin] = (real * real + imag * imag).sqrt();
     }
-    output[count / 2] = nyquist.abs();
+    output[N / 2] = nyquist.abs();
 
     Ok(())
 }
@@ -807,4 +853,109 @@ fn rdftv_real_postprocess(data: &mut [f32], table: &[f32], count: usize) {
     let f2 = data[1];
     data[1] = data[0] - f2;
     data[0] += f2;
+}
+
+#[cfg(test)]
+mod fixed_shape_tests {
+    use super::*;
+    use crate::tables::at5::{
+        ip016_at5_ref, ip032_at5_ref, ip064_at5_ref, ip128_at5_ref, ip256_at5_ref, sc016_at5_ref,
+        sc032_at5_ref, sc064_at5_ref, sc128_at5_ref, sc256_at5_ref,
+    };
+
+    fn tables(count: usize) -> (&'static [u32], &'static [f32]) {
+        match count {
+            16 => (ip016_at5_ref(), sc016_at5_ref()),
+            32 => (ip032_at5_ref(), sc032_at5_ref()),
+            64 => (ip064_at5_ref(), sc064_at5_ref()),
+            128 => (ip128_at5_ref(), sc128_at5_ref()),
+            256 => (ip256_at5_ref(), sc256_at5_ref()),
+            _ => unreachable!(),
+        }
+    }
+
+    fn reference_dft_v(
+        input: &[f32],
+        stride: usize,
+        count: usize,
+        ip_table: &[u32],
+        sc_table: &[f32],
+    ) -> Vec<f32> {
+        let mut data = [0.0f32; 256];
+        for index in 0..count {
+            data[index] = input[index * stride];
+        }
+        rdftv_permute(&mut data[..count], ip_table, count);
+        rdftv_kernel(&mut data[..count], sc_table, count);
+        let nyquist = data[1];
+        data[1] = 0.0;
+        let mut output = vec![0.0f32; count / 2 + 1];
+        for bin in 0..count / 2 {
+            let real = data[bin * 2];
+            let imag = data[bin * 2 + 1];
+            output[bin] = (real * real + imag * imag).sqrt();
+        }
+        output[count / 2] = nyquist.abs();
+        output
+    }
+
+    #[test]
+    fn fixed_rdft_shapes_preserve_scalar_bits() {
+        for count in [16, 32, 64, 128, 256] {
+            let (ip_table, sc_table) = tables(count);
+            let mut cases = vec![vec![0.0f32; count]];
+            let mut impulse = vec![0.0f32; count];
+            impulse[count / 3] = -0.75;
+            cases.push(impulse);
+            cases.push(
+                (0..count)
+                    .map(|index| ((index * 73 % 257) as f32 - 128.0) / 64.0)
+                    .collect(),
+            );
+
+            for expected in cases {
+                let mut actual = expected.clone();
+                rdftv_at5(&mut actual, ip_table, sc_table, count).unwrap();
+                let mut scalar = expected;
+                rdftv_permute(&mut scalar, ip_table, count);
+                rdftv_kernel(&mut scalar, sc_table, count);
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    scalar
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_dft_gather_preserves_full_scratch_reference_bits() {
+        for count in [16, 32, 64, 128, 256] {
+            let (ip_table, sc_table) = tables(count);
+            for stride in [1, 2] {
+                let input_len = (count - 1) * stride + 1;
+                let input: Vec<f32> = (0..input_len)
+                    .map(|index| ((index * 43 % 251) as f32 - 125.0) / 32.0)
+                    .collect();
+                let expected = reference_dft_v(&input, stride, count, ip_table, sc_table);
+                let mut actual = vec![0.0f32; count / 2 + 1];
+                dft_v_at5(&input, stride, count, &mut actual, ip_table, sc_table).unwrap();
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
 }

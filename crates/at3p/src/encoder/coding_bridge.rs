@@ -338,7 +338,12 @@ pub fn assemble_init_frame_state_with_selector_at5(
     let channel_count = channels_t2f.len();
     let mut channels = Vec::with_capacity(channel_count);
     for (index, (output, channel_aux)) in channels_t2f.iter().zip(aux).enumerate() {
-        channels.push(assemble_channel(index, output, channel_aux)?);
+        channels.push(assemble_channel(
+            index,
+            output,
+            channel_aux,
+            gain_band_count,
+        )?);
     }
 
     Ok(InitFrameState {
@@ -373,6 +378,7 @@ fn assemble_channel(
     channel: usize,
     output: &Time2FreqChannelOutput,
     aux: &CodingBridgeChannelAux,
+    gain_band_count: usize,
 ) -> Result<InitChannelState, CodingBridgeError> {
     check_len(
         "spectra",
@@ -395,6 +401,14 @@ fn assemble_channel(
             channel,
             expected: CODING_BRIDGE_GAIN_BAND_COUNT,
             actual: output.detector_outcomes.len(),
+        });
+    }
+    if gain_band_count > CODING_BRIDGE_GAIN_BAND_COUNT {
+        return Err(CodingBridgeError::ShapeMismatch {
+            field: "detector_outcomes",
+            channel,
+            expected: CODING_BRIDGE_GAIN_BAND_COUNT,
+            actual: gain_band_count,
         });
     }
     check_len("b_9c8", channel, aux.b_9c8.len(), CODING_BRIDGE_SEED_WORDS)?;
@@ -421,7 +435,8 @@ fn assemble_channel(
     // tail — the plane tail IS the native obj+0x8 content. The tail overwrite is
     // the mode_cc==1 prefix path only (trace-fed boundary replay at 352 stays
     // identical).
-    let mut gain_a_records = assemble_gain_a_records(channel, output)?;
+    let mut gain_a_records =
+        assemble_gain_a_records_with_band_count(channel, output, gain_band_count)?;
     if output.final_plane_rows.is_none() {
         for band in 0..CODING_BRIDGE_GAIN_BAND_COUNT {
             let base = band * CODING_BRIDGE_GAIN_RECORD_WORDS;
@@ -497,6 +512,14 @@ pub fn assemble_gain_a_records(
     channel: usize,
     output: &Time2FreqChannelOutput,
 ) -> Result<Vec<u32>, CodingBridgeError> {
+    assemble_gain_a_records_with_band_count(channel, output, output.detector_outcomes.len())
+}
+
+pub(crate) fn assemble_gain_a_records_with_band_count(
+    channel: usize,
+    output: &Time2FreqChannelOutput,
+    detector_band_count: usize,
+) -> Result<Vec<u32>, CodingBridgeError> {
     let mut records = vec![0u32; CODING_BRIDGE_GAIN_BAND_COUNT * CODING_BRIDGE_GAIN_RECORD_WORDS];
     // mode_cc==0 (64/48 kbps `set_gainc_at5` dispatch): the channel output carries
     // the full post-writeback plane rows (native `*(chobj+0x8)`), 16x38 words each.
@@ -526,10 +549,7 @@ pub fn assemble_gain_a_records(
     // (count 0), matching native's untouched tail (init's gain scan bound
     // `+0x1b48c` is band_count, so those records are never classified/packed —
     // docs/13 §3.1). The buffer stays 16-wide.
-    let filled = output
-        .detector_outcomes
-        .len()
-        .min(CODING_BRIDGE_GAIN_BAND_COUNT);
+    let filled = detector_band_count.min(CODING_BRIDGE_GAIN_BAND_COUNT);
     if output.final_records.len() < filled {
         return Err(CodingBridgeError::ShapeMismatch {
             field: "final_records",
@@ -539,8 +559,11 @@ pub fn assemble_gain_a_records(
         });
     }
     for band in 0..filled {
-        let outcome = &output.detector_outcomes[band];
-        if outcome.prune_blocked {
+        if output
+            .detector_outcomes
+            .get(band)
+            .is_some_and(|outcome| outcome.prune_blocked)
+        {
             return Err(CodingBridgeError::PruneBlocked { channel, band });
         }
         let base = band * CODING_BRIDGE_GAIN_RECORD_WORDS;
@@ -683,9 +706,10 @@ pub fn coding_init_aux_from_frontend(roll: &GainRollState) -> Vec<CodingBridgeCh
 /// prefixes with zero tails) and this call's `InitChannelOutput.a_9c8`/`a_a48`,
 /// so the NEXT call reads them as its gainB entry surface.
 ///
-/// `report` supplies the detector outcomes (the point prefixes, via
-/// [`assemble_gain_a_records`] — the exact same assembly the init entry uses, so
-/// the roll carries byte-identical records); `init_out` supplies the A-side
+/// `report` supplies the post-harmonization point prefixes and the live
+/// per-frame gain-band count — the exact same assembly the init entry uses, so
+/// the roll carries byte-identical records even when the lean encoder report
+/// omits detector diagnostics; `init_out` supplies the A-side
 /// `+0x9c8`/`+0xa48` init just wrote. Refuses a `prune_blocked` band (same as
 /// [`assemble_channel`]).
 ///
@@ -707,13 +731,14 @@ pub fn advance_gain_roll(
             aux: roll.channels.len(),
         });
     }
+    let gain_band_count = report.sigproc.writeback.band_count as usize;
     for (channel, ((output, iout), slot)) in channels_t2f
         .iter()
         .zip(&init_out.channels)
         .zip(&mut roll.channels)
         .enumerate()
     {
-        slot.records = assemble_gain_a_records(channel, output)?;
+        slot.records = assemble_gain_a_records_with_band_count(channel, output, gain_band_count)?;
         slot.a_9c8 = iout.a_9c8.clone();
         slot.a_a48 = iout.a_a48.clone();
     }
@@ -1887,4 +1912,60 @@ pub fn assemble_calc_frame_entry_with_init_for_params_at5(
         shared_s_12e: zeroth.totals.extended_total_12e,
     };
     Ok((entry, init_gain_headers, tone_primary_effective))
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use crate::dsp::sigproc::gain_detect_prune_markers_at5;
+    use crate::dsp::time2freq::{TIME2FREQ_BANDS_AT5, TonalityChannel};
+
+    #[test]
+    fn assemble_channel_rejects_detector_outcome_overflow() {
+        let overflow = CODING_BRIDGE_GAIN_BAND_COUNT + 1;
+        let output = Time2FreqChannelOutput {
+            spectra: vec![0.0; CODING_BRIDGE_SPECTRUM_WORDS],
+            delayed_out: vec![0.0; CODING_BRIDGE_SPECTRUM_WORDS],
+            final_records: vec![[0; CODING_BRIDGE_POINT_WORDS]; overflow],
+            tonality: TonalityChannel {
+                flags: [false; TIME2FREQ_BANDS_AT5],
+                tonality: [1.0; TIME2FREQ_BANDS_AT5],
+                scales: [1.0; TIME2FREQ_BANDS_AT5],
+            },
+            band_outcomes: Vec::new(),
+            detector_outcomes: gain_detect_prune_markers_at5(overflow, &vec![true; overflow]),
+            final_plane_rows: None,
+        };
+        let aux = CodingBridgeChannelAux {
+            objside_1c: 0,
+            objside_14: 0,
+            objside_ptr: 0,
+            spec_b_ptr: 0,
+            y_index: 0,
+            b_9c8: vec![0; CODING_BRIDGE_SEED_WORDS],
+            b_a48: vec![0.0; CODING_BRIDGE_SEED_WORDS],
+            gain_a_record_tails: vec![
+                [0; CODING_BRIDGE_GAIN_TAIL_WORDS];
+                CODING_BRIDGE_GAIN_BAND_COUNT
+            ],
+            gain_b_records: vec![
+                0;
+                CODING_BRIDGE_GAIN_BAND_COUNT * CODING_BRIDGE_GAIN_RECORD_WORDS
+            ],
+        };
+
+        let error = match assemble_channel(0, &output, &aux, CODING_BRIDGE_GAIN_BAND_COUNT) {
+            Ok(_) => panic!("detector outcome overflow should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            CodingBridgeError::ShapeMismatch {
+                field: "detector_outcomes",
+                channel: 0,
+                expected: CODING_BRIDGE_GAIN_BAND_COUNT,
+                actual: overflow,
+            }
+        );
+    }
 }
